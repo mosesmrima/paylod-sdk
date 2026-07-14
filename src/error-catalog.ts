@@ -18,6 +18,8 @@ export type DarajaCategory =
   | "credentials"
   | "network"
   | "mpesa_system"
+  /** Not a failure: the STK prompt is still live on the handset. Keep polling. */
+  | "pending"
   | "success";
 
 /** A decoded, human-readable error. Shape matches the `decoded` field on webhook events. */
@@ -132,6 +134,29 @@ export const ERROR_CATALOG: Readonly<Record<string, Omit<DecodedError, "code">>>
     category: "customer",
     retryable: true,
     customerMessage: "That M-Pesa PIN was incorrect. Please try again and enter the right PIN.",
+  },
+  // ── NOT errors: transient "still processing" STK Query states. ───────────────────────
+  // The engine's classifier (`_shared/daraja/stk-outcome.ts`) maps these to `pending`, so a
+  // payment carrying one is still payable and MUST NOT be shown to a customer as failed.
+  // Catalogued so that if one is ever surfaced anyway it decodes honestly instead of hitting
+  // the "Payment failed" fallback. `category: "pending"` is the flag to branch on.
+  "4999": {
+    title: "Still waiting for the customer's PIN",
+    cause:
+      "The STK prompt is live on the customer's phone and they have not entered their M-Pesa PIN yet. This is NOT a failure — the payment can still succeed.",
+    fix: "Keep polling GET /status/:id (or wait for the webhook). Do not tell the customer it failed.",
+    category: "pending",
+    retryable: true,
+    customerMessage: "Waiting for you to enter your M-Pesa PIN.",
+  },
+  "500.001.1001": {
+    title: "Transaction is still being processed",
+    cause:
+      "M-Pesa is still processing this STK Push — the customer may not have entered their PIN yet. This is NOT a failure.",
+    fix: "Keep polling GET /status/:id (or wait for the webhook). Do not tell the customer it failed.",
+    category: "pending",
+    retryable: true,
+    customerMessage: "Waiting for you to enter your M-Pesa PIN.",
   },
   "2028": {
     title: "Payment amount exceeds the M-Pesa limit",

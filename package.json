@@ -1,9 +1,7 @@
 {
   "name": "@paylod/node",
   "version": "0.1.0",
-  "private": true,
-  "_private_note": "Guard against an accidental `npm publish` before review. Remove `private` (and this note) when you actually intend to release.",
-  "description": "Official Node/TypeScript client for the paylod API — M-Pesa collections without the Daraja boilerplate.",
+  "description": "Official Node/TypeScript client for the paylod API — M-Pesa (Safaricom Daraja) STK Push, status polling, signed webhooks and offline error decoding, with zero runtime dependencies.",
   "keywords": [
     "paylod",
     "mpesa",
@@ -14,7 +12,19 @@
     "kenya",
     "stk-push"
   ],
+  "homepage": "https://paylod.dev/docs/sdk",
+  "bugs": {
+    "url": "https://github.com/paylod/node/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paylod/node.git"
+  },
   "license": "MIT",
+  "author": "paylod / Moses Mrima",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=18"
@@ -33,10 +43,12 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
+    "prepublishOnly": "npm run build && npm test",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
