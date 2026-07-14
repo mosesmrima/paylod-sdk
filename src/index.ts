@@ -23,7 +23,7 @@ export {
  *   <p>{outcome.message}</p>
  *   {outcome.retryable && <button>Try again</button>}
  */
-export { toOutcome, type OutcomeStatus, type PaymentOutcome } from "./outcome.js";
+export { toOutcome, pendingOutcome, type OutcomeStatus, type PaymentOutcome } from "./outcome.js";
 
 /**
  * The Daraja code table + classifier. GENERATED from the canonical copy in the paylod monorepo

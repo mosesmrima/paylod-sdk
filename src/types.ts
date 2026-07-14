@@ -20,7 +20,13 @@ export interface CollectParams {
   readonly accountReference?: string;
   /** Shown on the STK prompt. 1–64 chars. Defaults to `Payment`. */
   readonly description?: string;
-  /** Opaque to paylod; echoed back to you on the webhook event. */
+  /**
+   * Opaque to paylod. Stored alongside the payment.
+   *
+   * NOTE: it is NOT currently returned on `GET /status/:id` or on the webhook event — the event
+   * carries `paymentId`, `accountRef` and the M-Pesa fields, and nothing else. Key your own
+   * records on `paymentId` (or `accountReference`) rather than expecting `metadata` back.
+   */
   readonly metadata?: Record<string, unknown>;
   /**
    * Overrides the auto-generated key. Same key + same body → the original 202 is replayed

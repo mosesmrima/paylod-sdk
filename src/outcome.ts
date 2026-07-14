@@ -82,6 +82,39 @@ const WAITING = "Check your phone and enter your M-Pesa PIN to complete this pay
 const CANCELLED_CODE = "1032";
 
 /**
+ * The renderable form of a freshly-sent STK prompt.
+ *
+ * `collect()` hands back an ack, not a payment — but a prompt sitting on a handset IS a pending
+ * payment, and a UI wants to render it the same way it renders every other state. This saves you
+ * from hand-writing a "check your phone" string (and from getting `retryable` wrong on it: a live
+ * prompt is never safe to re-charge).
+ *
+ * ```ts
+ * const ack = await paylod.collect({ amount, phone });
+ * return pendingOutcome(ack.paymentId);   // same shape as check() / wait()
+ * ```
+ */
+export function pendingOutcome(paymentId: string): PaymentOutcome {
+  return {
+    status: "pending",
+    message: WAITING,
+    retryable: false, // the prompt is live — a second charge is exactly what we must not do
+    paid: false,
+    paymentId,
+    receipt: null,
+    code: null,
+    detail: null,
+    payment: {
+      id: paymentId,
+      status: "pending",
+      mpesaReceipt: null,
+      resultCode: null,
+      resultDesc: null,
+    },
+  };
+}
+
+/**
  * Build a renderable outcome from a payment record.
  *
  * The classification is delegated to `classifyStkResult`, the canonical classifier that the
