@@ -153,9 +153,9 @@ export interface PaylodOptions {
    * **Requires a `mp_test_` key** — the constructor throws {@link PaylodSandboxOnlyError}
    * immediately otherwise, so this flag can never point at production, even by accident.
    *
-   * Caveat: the simulator endpoint does not implement idempotency, so in this mode a repeated
-   * `idempotencyKey` creates a *new* simulated payment rather than replaying the first. Assert on
-   * the `Idempotency-Key` header (as the demo's tests do) rather than on live dedupe.
+   * `idempotencyKey` is honoured here exactly as it is in production: the same key returns the
+   * SAME simulated payment (same `paymentId`, no second row), a different key creates a new one.
+   * So a test asserting "a double-click cannot charge twice" tests the real thing.
    */
   readonly simulate?: boolean;
 }

@@ -68,6 +68,13 @@ export interface SimulateCollectParams {
   readonly amount?: number;
   /** Your correlation id, echoed back on the status read and the webhook. 1–32 chars. */
   readonly accountReference?: string;
+  /**
+   * Same meaning as on `collect()`: send the same key twice and you get the SAME simulated payment
+   * back — same `paymentId`, no second row — instead of a new one. The simulator runs the same
+   * idempotency layer production does, which is what lets a "a double-click must not charge twice"
+   * test actually prove something.
+   */
+  readonly idempotencyKey?: string;
 }
 
 /** One outcome the simulator will accept for a given payment, as the backend advertises it. */
@@ -136,6 +143,7 @@ export type SimTransport = <T>(opts: {
   method: "POST";
   path: string;
   body: unknown;
+  idempotencyKey?: string;
   signal?: AbortSignal;
 }) => Promise<T>;
 
@@ -215,6 +223,7 @@ export class Simulator {
       method: "POST",
       path: "/simulate/collect",
       body,
+      ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
     });
 

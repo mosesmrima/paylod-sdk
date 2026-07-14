@@ -261,6 +261,40 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
     expect(ack.idempotencyKey).toBe("order-1042");
   });
 
+  // THE point of the whole simulate surface: a developer's double-click test has to mean something.
+  // The simulator used to ignore `Idempotency-Key`, and the SDK did not even send it here — so a
+  // test that asserted "one payment" against the simulator was asserting a lie. Both ends are fixed:
+  // the header goes out, and the backend replays the first payment.
+  it("simulate mode SENDS the Idempotency-Key header (it used to be dropped)", async () => {
+    const m = mockFetch([{ status: 202, json: SIM_ACK }]);
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
+    expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-1042");
+  });
+
+  it("a double-clicked collect() in simulate mode returns the SAME payment (backend replays)", async () => {
+    // The backend now replays the first response for a repeated key — so both calls see one payment.
+    const m = mockFetch([
+      { status: 202, json: SIM_ACK },
+      { status: 202, json: SIM_ACK },
+    ]);
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+
+    const a = await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
+    const b = await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
+
+    expect(b.paymentId).toBe(a.paymentId);
+    expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-1042");
+    expect(m.calls[1]!.headers["idempotency-key"]).toBe("order-1042");
+  });
+
+  it("simulate.collect() forwards an explicit idempotencyKey", async () => {
+    const m = mockFetch([{ status: 202, json: SIM_ACK }]);
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    await paylod.simulate.collect({ amount: 5, idempotencyKey: "order-7" });
+    expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-7");
+  });
+
   it("without `simulate`, collect() still goes to the real /collect", async () => {
     const m = mockFetch([{ status: 202, json: { paymentId: "p", status: "pending", checkoutRequestId: "c" } }]);
     const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });

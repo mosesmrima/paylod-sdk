@@ -197,6 +197,11 @@ export class Paylod {
         method: opts.method,
         path: opts.path,
         body: opts.body,
+        // The simulator honours `Idempotency-Key` with the SAME semantics as /collect, so the
+        // header has to actually reach it — otherwise `{ simulate: true }` would quietly create a
+        // second payment where production replays the first, and a developer's "a double-click
+        // cannot double-charge" test would pass while proving the opposite.
+        ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
       }),
     );
@@ -356,6 +361,9 @@ export class Paylod {
           ...(params.accountReference !== undefined
             ? { accountReference: params.accountReference }
             : {}),
+          // Forward the key: the simulator dedupes on it exactly as production does, so the same
+          // key really does return the same paymentId here.
+          idempotencyKey,
         },
         options,
       );
