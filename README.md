@@ -21,15 +21,24 @@ Requires **Node 18+** (global `fetch`). **Zero runtime dependencies.**
 ```ts
 import { Paylod } from "@paylod/node";
 
-const paylod = new Paylod(); // reads PAYLOD_API_KEY from the environment
+const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
 
-const result = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
 
-if (result.ok) console.log(`Paid · ${result.receipt}`);
-else           console.log(result.error.customerMessage);
+if (outcome.paid) fulfil(outcome.receipt);   // money moved
+else              toast(outcome.message);    // already decoded, already human
 ```
 
-That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane backoff, and hands you a settled outcome.
+That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
+
+**One argument in, one renderable thing out.** You pass an API key — not a base URL, not a config object, not an OAuth token. You get back a `message` a customer can read and a `retryable` flag you can hang a button off. There is no result-code table in your app:
+
+```tsx
+<p>{outcome.message}</p>
+{outcome.retryable && <button onClick={retry}>Try again</button>}
+```
+
+> **If you find yourself writing `if (code === 1032)`, we've failed.** Decoding M-Pesa's result codes is our job, not yours — see [The outcome](#the-outcome-one-renderable-shape).
 
 ---
 
@@ -53,7 +62,7 @@ This SDK is not here to save you those lines. It's here for the five things that
 | **Async settlement** | `/collect` returns `202 pending`. The customer hasn't typed their PIN yet. People hand-roll a `while (true)` poll, hammer the API every 200 ms, or never handle the case where the customer just walks away. | `collectAndWait()` — jittered backoff (1s → 5s), a deadline, and a distinct, loud `PaylodTimeoutError`. |
 | **Idempotency** | A retry (or a nervous double-click, or a Lambda re-invoke) without an `Idempotency-Key` sends a **second STK push**. The customer pays twice. Most people forget the header entirely. | A key is generated on **every** `collect()`, and reused across internal retries. You cannot accidentally double-charge. |
 | **Webhook signatures** | HMAC over `${timestamp}.${rawBody}`, constant-time compare, timestamp tolerance, and the raw body must survive your JSON middleware. Every one of those is easy to get subtly, silently wrong — and getting it wrong means anyone can forge a "payment succeeded". | `paylod.webhook(handler)` — verified, typed, and it shouts at you if your body parser ate the raw bytes. |
-| **Error decoding** | You end up writing `switch (resultCode) { case 1032: ... case 2001: ... }` from a forum post, with wrong text. (`2001` is a *wrong PIN* — it is **not** a credentials error, despite what the raw `ResultDesc` implies.) | `result.error.customerMessage` — already decoded, server-side, from the same catalog. Ready to hand to `toast.error()`. |
+| **Error decoding** | You end up writing `switch (resultCode) { case 1032: ... case 2001: ... }` from a forum post, with wrong text. (`2001` is a *wrong PIN* — it is **not** a credentials error, despite what the raw `ResultDesc` implies.) | `outcome.message` — already decoded, from the same catalog the API uses. Render it directly. |
 | **Phone formats** | Customers give you `0712…`, `+254712…`, `254712…`, `0712 345 678`. Daraja accepts exactly one of those. | Normalised locally, before the request leaves your process. |
 
 If you only ever need to fire-and-forget an STK push and you already have a webhook consumer you trust, `fetch` is genuinely fine. Use it. The SDK earns its keep the moment you need to *wait* for the money, or *trust* the webhook.
@@ -62,39 +71,56 @@ If you only ever need to fire-and-forget an STK push and you already have a webh
 
 ## Setup
 
+**One environment variable.**
+
 ```bash
 PAYLOD_API_KEY=mp_live_xxxxxxxx
-PAYLOD_WEBHOOK_SECRET=whsec_xxxxxxxx   # only needed if you consume webhooks
-PAYLOD_BASE_URL=https://paylod.dev/functions/v1   # optional; this is the default
 ```
 
-Or pass them explicitly:
+```ts
+const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
+// …or just `new Paylod()` — with no argument it reads PAYLOD_API_KEY itself.
+```
+
+There is no base URL to configure: it is the same for every paylod customer, so it is baked in. There is no OAuth token to fetch, cache, or refresh. There is no callback URL to host.
+
+If you consume webhooks, add the signing secret (shown once when you create the endpoint):
+
+```bash
+PAYLOD_WEBHOOK_SECRET=whsec_xxxxxxxx   # only if you consume webhooks
+```
+
+### Escape hatches (you probably don't need these)
 
 ```ts
-const paylod = new Paylod({
-  apiKey: process.env.PAYLOD_API_KEY,
-  webhookSecret: process.env.PAYLOD_WEBHOOK_SECRET,
-  baseUrl: "https://paylod.dev/functions/v1", // default
-  timeoutMs: 30_000,   // per HTTP request
-  maxRetries: 2,       // for transient failures only (network, 5xx, 429)
+const paylod = new Paylod(key, {
+  baseUrl: "http://localhost:4010", // point at a stub in tests, or self-host
+  timeoutMs: 30_000,                // per HTTP request
+  maxRetries: 2,                    // transient failures only (network, 5xx, 429)
+  fetch: myFetch,                   // inject an instrumented fetch
 });
 ```
 
-### Base URL
-
-The default is **`https://paylod.dev/functions/v1`** — the base that currently routes. Some docs advertise `https://api.paylod.dev/v1`; that hostname is not live yet. When it is, point `baseUrl` (or `PAYLOD_BASE_URL`) at it. Nothing else changes.
+> **Maintainer note:** the docs elsewhere advertise `https://api.paylod.dev/v1`. That hostname **does not route** — it 307s to `/signin`. The working base, and the default here, is `https://paylod.dev/functions/v1`.
 
 ### ⚠️ Server-side only — this is **not** browser-safe
 
-Your `PAYLOD_API_KEY` can move money. Anything shipped to a browser is public: reading it out of a bundle, a network tab, or a source map is trivial. Call this SDK from a server, a serverless function, or an edge worker.
-
-(The paylod *demo* app does put a key in the browser. That is a deliberate, sandbox-keyed exception so the demo can be served from a static file server. Do not copy the pattern.)
+Your `PAYLOD_API_KEY` can move money. Anything shipped to a browser is public: reading it out of a bundle, a network tab, or a source map is trivial. Call this SDK from a server, a serverless function, or an edge worker — never from client-side code.
 
 ---
 
 ## API
 
-### `new Paylod(options?)`
+### `new Paylod(apiKey?, options?)`
+
+```ts
+new Paylod(process.env.PAYLOD_API_KEY!)   // the normal way
+new Paylod()                              // reads PAYLOD_API_KEY from the environment
+new Paylod(key, { timeoutMs: 10_000 })    // with an escape hatch
+new Paylod({ apiKey, fetch })             // everything-in-one-object form, if you prefer
+```
+
+Throws `PaylodConfigError` immediately if there is no key anywhere — a client that would 401 on its first call is not worth handing back.
 
 | Option | Type | Default |
 |---|---|---|
@@ -141,16 +167,20 @@ const p = await paylod.status(ack.paymentId);
 
 ---
 
-### `wait(paymentId, options?) → Promise<PaymentResult>`
+### `check(paymentId) → Promise<PaymentOutcome>`
+
+`status()`, but already decoded and renderable. This is the one you want.
+
+### `wait(paymentId, options?) → Promise<PaymentOutcome>`
 
 Poll an existing payment until it settles.
 
-### `collectAndWait(params, options?) → Promise<PaymentResult>`
+### `collectAndWait(params, options?) → Promise<PaymentOutcome>`
 
 `collect()` + `wait()`.
 
 ```ts
-const result = await paylod.collectAndWait(
+const outcome = await paylod.collectAndWait(
   { amount: 100, phone: "0712345678" },
   {
     timeoutMs: 120_000,                    // default; STK prompts expire around 60s
@@ -162,28 +192,46 @@ const result = await paylod.collectAndWait(
 
 Polling ramps 1s → 1s → 1.5s → 2s → 2.5s → 3s → 4s → 5s (capped), each with ±20% jitter so a fleet of servers doesn't poll in lockstep.
 
+`wait()` decides "has it settled?" using the **classifier**, not the raw `status` field. Daraja reports code `4999` on a row it also marks `failed`, but `4999` means *"the prompt is live and the customer hasn't typed their PIN yet."* So `wait()` keeps polling, instead of reporting a failure for a payment that is about to succeed.
+
 ---
 
-### The result type: a discriminated union, not an exception
+### The outcome: one renderable shape
 
 ```ts
-type PaymentResult =
-  | { ok: true;  receipt: string;       payment: Payment }
-  | { ok: false; error: DecodedError;   payment: Payment };
-```
-
-```ts
-const result = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
-
-if (result.ok) {
-  await fulfilOrder(result.receipt);      // string, narrowed — no null check needed
-} else {
-  toast.error(result.error.customerMessage);
-  if (result.error.retryable) showRetryButton();
+interface PaymentOutcome {
+  status: "succeeded" | "pending" | "cancelled" | "failed";
+  message: string;        // customer-facing, already decoded. RENDER THIS.
+  retryable: boolean;     // SAFE TO CHARGE AGAIN. Gate your retry button on this.
+  paid: boolean;          // the one branch a backend needs: if (paid) fulfil()
+  receipt: string | null; // M-Pesa confirmation code; non-null exactly when `paid`
+  // developer detail — available, never required to render the happy path
+  code: string | null;
+  detail: DecodedError | null;
+  payment: Payment;
 }
 ```
 
-**Why not throw?** Because *a wrong PIN is not an exception — it's an answer.* Cancellations, wrong PINs, and low balances are the single most common thing that happens to a payment request. They are business outcomes, and the type system should force you to handle them, which `try/catch` never does: a forgotten `catch` is invisible, while a forgotten `if (result.ok)` is a compile error. Throwing for routine outcomes is how you end up with a codebase that treats "customer changed their mind" as a 500.
+The entire UI:
+
+```tsx
+<p>{outcome.message}</p>
+{outcome.retryable && <button onClick={retry}>Try again</button>}
+```
+
+The entire backend:
+
+```ts
+if (outcome.paid) await fulfilOrder(outcome.receipt);
+```
+
+**No `switch` on result codes. No catalog in your app.** If you ever write `if (outcome.code === "1032")` to decide what to *show* a human, something has gone wrong — that's what `message` is for. `code` and `detail` are for your logs and your support tooling.
+
+#### Two invariants worth internalising
+
+**1. `retryable` means SAFE TO CHARGE AGAIN.** It does *not* mean "the user is allowed to press a button". A `pending` payment is **never** retryable: codes `4999` / `500.001.1001` mean the STK prompt is live on the handset and the customer simply hasn't entered their PIN yet. Retrying pushes a **second prompt** and can double-charge them. This bug has shipped twice. Gate the retry button on `retryable`, and it cannot happen to you.
+
+**2. A wrong PIN is not an exception — it's an answer.** Cancellations, wrong PINs and low balances are the most common thing that happens to a payment request. They are business outcomes, so they come back as data (`status: "failed"`, with a `message`), not as a thrown error. Throwing for routine outcomes is how you end up with a codebase that treats "customer changed their mind" as a 500.
 
 **So what *does* throw?** Only things that are genuinely exceptional:
 
@@ -195,11 +243,11 @@ if (result.ok) {
 | `PaylodConnectionError` | The network failed after retries. |
 | `PaylodTimeoutError` | Still `pending` at the deadline. |
 
-**`PaylodTimeoutError` deserves a word.** It throws *on purpose*, and it is deliberately **not** folded into the `ok: false` branch. A timeout is not a failed payment — the customer may still be staring at the prompt, and may still pay. If we returned `{ ok: false }` you'd cancel an order that is about to settle, or refund money you never lost. Handle it explicitly:
+**`PaylodTimeoutError` deserves a word.** It throws *on purpose*, and it is deliberately **not** folded into `status: "failed"`. A timeout is not a failed payment — the customer may still be staring at the prompt, and may still pay. If we returned `"failed"` you'd cancel an order that is about to settle. An indeterminate payment is indeterminate; say so. Handle it explicitly:
 
 ```ts
 try {
-  const result = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+  const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
   // ...
 } catch (err) {
   if (err instanceof PaylodTimeoutError) {
@@ -214,6 +262,8 @@ try {
 ### `decodeError(resultCode, rawDesc?) → DecodedError`
 
 Offline. No network, no API call.
+
+You should rarely need this — `check()`, `wait()` and `collectAndWait()` already hand back a decoded, renderable `PaymentOutcome`. It's here for logs, dashboards and support tooling, not for deciding what to show a customer.
 
 ```ts
 paylod.decodeError(1032);
@@ -360,10 +410,15 @@ import {
 } from "@paylod/node";
 
 try {
-  const result = await paylod.collectAndWait({ amount, phone });
+  const outcome = await paylod.collectAndWait({ amount, phone });
 
-  if (result.ok) return { paid: true, receipt: result.receipt };
-  return { paid: false, message: result.error.customerMessage, retry: result.error.retryable };
+  // No branching over result codes. The outcome is already renderable.
+  return {
+    paid: outcome.paid,
+    receipt: outcome.receipt,
+    message: outcome.message,
+    retry: outcome.retryable,
+  };
 
 } catch (err) {
   if (err instanceof PaylodTimeoutError)        return { pending: true, paymentId: err.paymentId };
@@ -397,6 +452,46 @@ And inject a fake `fetch` to test collection flows:
 ```ts
 const paylod = new Paylod({ apiKey: "mp_test_x", fetch: myMockFetch });
 ```
+
+---
+
+## Migrating from 0.1.x
+
+0.2 is a breaking change, and it is a small one. It exists to delete code from *your* app.
+
+```ts
+// 0.1 — you branched, then reached into a decoded error to find a string to show
+const paylod = new Paylod({ apiKey: process.env.PAYLOD_API_KEY });
+const result = await paylod.collectAndWait({ amount, phone });
+if (result.ok) fulfil(result.receipt);
+else {
+  toast(result.error.customerMessage);
+  if (result.error.retryable) showRetry();
+}
+
+// 0.2 — the outcome is already renderable
+const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
+const outcome = await paylod.collectAndWait({ amount, phone });
+if (outcome.paid) fulfil(outcome.receipt);
+else toast(outcome.message);
+if (outcome.retryable) showRetry();
+```
+
+| 0.1 | 0.2 |
+|---|---|
+| `new Paylod({ apiKey })` | `new Paylod(apiKey)` — the object form still works |
+| `PaymentResult` (`{ ok, receipt } \| { ok, error }`) | `PaymentOutcome` — one flat, renderable shape |
+| `result.ok` | `outcome.paid`, or `outcome.status === "succeeded"` |
+| `result.error.customerMessage` | `outcome.message` |
+| `result.error.retryable` | `outcome.retryable` |
+| `result.error` | `outcome.detail` (and `outcome.code`) |
+| — | `paylod.check(id)` — decoded `status()` |
+| — | `status: "cancelled"` is now distinct from `"failed"` |
+
+Two behaviour fixes came with it, both on the safe side:
+
+- **`wait()` no longer reports a pending payment as failed.** It classifies on the result code, so a row marked `failed` carrying `4999` keeps polling instead of telling a paying customer they failed.
+- **An unknown result code is no longer `retryable: true`.** Until 0.2 the SDK carried a hand-maintained fork of the Daraja table whose fallback invited a blind re-charge on a code it could not classify. The table is now generated from the canonical source (`npm run sync-catalog`, with a `--check` drift guard in `prepublishOnly`) and an indeterminate code is never safe to re-charge.
 
 ---
 

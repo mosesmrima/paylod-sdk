@@ -1,8 +1,9 @@
 /**
  * Error taxonomy.
  *
- * DESIGN RULE: a *payment* that fails (wrong PIN, cancelled, low balance) is NOT thrown —
- * it is an expected outcome, returned as `{ ok: false, error }` from `collectAndWait()`.
+ * DESIGN RULE: a *payment* that fails (wrong PIN, cancelled, low balance) is NOT thrown — it is
+ * an expected business outcome, returned as a renderable `PaymentOutcome` from `collectAndWait()`
+ * with `status: "failed"` and a customer-facing `message`.
  * Everything in this file is a *programmer, transport, or indeterminate* problem: the kinds
  * of thing you genuinely want to blow up a request handler.
  */
@@ -70,7 +71,7 @@ export class PaylodConnectionError extends PaylodError {}
 /**
  * `collectAndWait()` gave up before the payment reached a terminal state.
  *
- * This deliberately THROWS rather than returning `{ ok: false }`. A timeout is not a failed
+ * This deliberately THROWS rather than returning `status: "failed"`. A timeout is not a failed
  * payment — the customer may still be staring at the STK prompt, and may still pay. Folding
  * it into the failure branch would let a merchant cancel an order that is about to settle.
  * Handle it explicitly: keep the order pending and let the webhook settle it.

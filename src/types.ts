@@ -5,7 +5,7 @@
  *   webhook body       → supabase/functions/_shared/webhooks/sign.ts (buildEvent)
  */
 
-import type { DecodedError } from "./error-catalog.js";
+import type { DecodedError } from "./daraja-catalog.js";
 
 /** Terminal + non-terminal payment states. NOTE: it is `success`, never `paid`. */
 export type PaymentStatus = "pending" | "success" | "failed";
@@ -48,23 +48,9 @@ export interface Payment {
   readonly resultDesc: string | null;
 }
 
-/**
- * The outcome of a *settled* payment. A discriminated union, not an exception: a wrong PIN
- * is a business outcome, not a crash.
- */
-export type PaymentResult =
-  | {
-      readonly ok: true;
-      /** The M-Pesa confirmation code. Non-null on this branch. */
-      readonly receipt: string;
-      readonly payment: Payment;
-    }
-  | {
-      readonly ok: false;
-      /** Human-readable, already decoded server-side. `error.customerMessage` is UI-safe. */
-      readonly error: DecodedError;
-      readonly payment: Payment;
-    };
+// The settled-payment result type lives in `./outcome.ts` — see `PaymentOutcome`. v0.1's
+// `PaymentResult` discriminated union was removed in 0.2: it forced every integrator to branch
+// before they could show a human anything, which just moved the Daraja code table into their UI.
 
 export type WebhookEventType = "payment.success" | "payment.failed";
 

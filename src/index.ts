@@ -18,12 +18,30 @@ export {
   PaylodTimeoutError,
 } from "./errors.js";
 
+/**
+ * The renderable result. This is the type you build your UI on:
+ *   <p>{outcome.message}</p>
+ *   {outcome.retryable && <button>Try again</button>}
+ */
+export { toOutcome, type OutcomeStatus, type PaymentOutcome } from "./outcome.js";
+
+/**
+ * The Daraja code table + classifier. GENERATED from the canonical copy in the paylod monorepo
+ * (`scripts/sync-daraja-catalog.mjs`) — never hand-edited here. You do not need any of this to
+ * render a payment; it is exposed for logs, dashboards and support tooling.
+ */
 export {
-  decodeError,
+  decodeDarajaResult,
+  decodeDarajaResult as decodeError,
+  classifyStkResult,
   ERROR_CATALOG,
+  ALL_ENTRIES,
+  PENDING_RESULT_CODES,
+  type CatalogEntry,
   type DarajaCategory,
   type DecodedError,
-} from "./error-catalog.js";
+  type StkOutcome,
+} from "./daraja-catalog.js";
 
 export { normalizePhone } from "./phone.js";
 
@@ -41,7 +59,6 @@ export type {
   CollectAck,
   CollectParams,
   Payment,
-  PaymentResult,
   PaymentStatus,
   PaylodOptions,
   WaitOptions,

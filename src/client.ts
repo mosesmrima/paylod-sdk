@@ -6,23 +6,27 @@ import {
   PaylodInvalidRequestError,
   PaylodTimeoutError,
 } from "./errors.js";
-import { decodeError } from "./error-catalog.js";
-import type { DecodedError } from "./error-catalog.js";
+import { decodeDarajaResult } from "./daraja-catalog.js";
+import type { DecodedError } from "./daraja-catalog.js";
+import { toOutcome } from "./outcome.js";
+import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
 import type {
   CollectAck,
   CollectParams,
   Payment,
   PaylodOptions,
-  PaymentResult,
   WaitOptions,
   WebhookEvent,
 } from "./types.js";
 import { SIGNATURE_HEADER, verifyWebhook } from "./webhook.js";
 
 /**
- * The live, working base. The docs advertise `https://api.paylod.dev/v1`, which does not
- * route yet — override with `new Paylod({ baseUrl })` or `PAYLOD_BASE_URL` when it does.
+ * The base URL. It is the same for every paylod customer, so it is baked in — you never pass
+ * it, and there is nothing to configure.
+ *
+ * (Note for maintainers: the docs advertise `https://api.paylod.dev/v1`, which does NOT route —
+ * it 307s to /signin. Do not "fix" this constant to that host until it actually routes.)
  */
 export const DEFAULT_BASE_URL = "https://paylod.dev/functions/v1";
 
@@ -71,10 +75,22 @@ interface RequestOptions {
 /**
  * The paylod API client.
  *
+ * Construction takes an API key and nothing else. The base URL is the same for every customer,
+ * so it is baked in; there is no config object to assemble, no endpoint to look up, and no
+ * OAuth token to fetch and refresh.
+ *
  * ```ts
- * const paylod = new Paylod();                       // reads PAYLOD_API_KEY
- * const r = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+ * const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
+ * // …or just `new Paylod()`, which reads PAYLOD_API_KEY from the environment itself.
+ *
+ * const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+ * if (outcome.paid) fulfil(outcome.receipt);
+ * else              toast(outcome.message);   // already decoded, already human
  * ```
+ *
+ * The second argument exists only for genuine escape hatches — a custom `baseUrl` when you are
+ * testing against a stub, a shorter `timeoutMs`, an injected `fetch`. You should almost never
+ * need it.
  */
 export class Paylod {
   readonly #apiKey: string;
@@ -84,18 +100,37 @@ export class Paylod {
   readonly #maxRetries: number;
   readonly #fetch: typeof globalThis.fetch;
 
-  constructor(options: PaylodOptions = {}) {
+  /**
+   * @param apiKey Your `mp_live_…` / `mp_test_…` key. Omit it to read `PAYLOD_API_KEY` from the
+   *   environment. Throws immediately if there is no key anywhere — a client that would 401 on
+   *   its first call is not worth handing back.
+   * @param options Escape hatches. Rarely needed.
+   */
+  constructor(apiKey?: string, options?: PaylodOptions);
+  /** Everything-in-one-object form. Equivalent; use whichever reads better. */
+  constructor(options: PaylodOptions);
+  constructor(apiKeyOrOptions?: string | PaylodOptions, maybeOptions: PaylodOptions = {}) {
+    const options: PaylodOptions =
+      typeof apiKeyOrOptions === "object" && apiKeyOrOptions !== null
+        ? apiKeyOrOptions
+        : maybeOptions;
+    const apiKey = typeof apiKeyOrOptions === "string" ? apiKeyOrOptions : undefined;
+
     const env: Record<string, string | undefined> =
       typeof process !== "undefined" && process.env ? process.env : {};
 
-    const apiKey = options.apiKey ?? env.PAYLOD_API_KEY;
-    if (!apiKey) {
+    const key = apiKey ?? options.apiKey ?? env.PAYLOD_API_KEY;
+    if (!key || typeof key !== "string" || key.trim() === "") {
       throw new PaylodConfigError(
-        "No paylod API key. Set the PAYLOD_API_KEY environment variable, or pass " +
-          "`new Paylod({ apiKey })`. Never ship this key to a browser.",
+        "No paylod API key. Pass one — `new Paylod(process.env.PAYLOD_API_KEY)` — or set the " +
+          "PAYLOD_API_KEY environment variable. This key can move money: keep it on a server " +
+          "and never ship it to a browser.",
       );
     }
-    this.#apiKey = apiKey;
+    this.#apiKey = key.trim();
+
+    // Baked in. The base URL is identical for every customer, so passing one is pure ceremony.
+    // PAYLOD_BASE_URL / options.baseUrl remain as escape hatches for self-hosting and tests.
     this.#baseUrl = (options.baseUrl ?? env.PAYLOD_BASE_URL ?? DEFAULT_BASE_URL).replace(
       /\/+$/,
       "",
@@ -107,7 +142,7 @@ export class Paylod {
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== "function") {
       throw new PaylodConfigError(
-        "No global fetch available. Use Node 18+, or pass `new Paylod({ fetch })`.",
+        "No global fetch available. Use Node 18+, or pass `new Paylod(key, { fetch })`.",
       );
     }
     this.#fetch = f;
@@ -262,12 +297,31 @@ export class Paylod {
   }
 
   /**
+   * Read a payment and return it already decoded and renderable. This is `status()` for people
+   * who want to show a human what happened, which is almost everybody.
+   *
+   * ```ts
+   * const outcome = await paylod.check(paymentId);
+   * res.json({ message: outcome.message, retryable: outcome.retryable });
+   * ```
+   */
+  async check(paymentId: string, options: { signal?: AbortSignal } = {}): Promise<PaymentOutcome> {
+    return toOutcome(await this.status(paymentId, options));
+  }
+
+  /**
    * Poll an existing payment until it settles, with a backoff ramp (1s → 5s, jittered).
    *
-   * @throws {PaylodTimeoutError} if still `pending` at the deadline — NOT a failure, see the
-   *   note on that class. Everything else resolves to a {@link PaymentResult}.
+   * Note what counts as "settled": the CLASSIFIER decides, not the raw `status` field. A row
+   * marked `failed` that carries result code 4999 means "the prompt is live and the customer
+   * hasn't entered their PIN yet" — so we keep polling instead of returning a failure for a
+   * payment that is about to succeed.
+   *
+   * @throws {PaylodTimeoutError} if still pending at the deadline. That is deliberately NOT a
+   *   `status: "failed"` outcome: we do not know what happened, and telling a merchant "failed"
+   *   when the customer is mid-PIN loses real money. Leave the order open; the webhook settles it.
    */
-  async wait(paymentId: string, options: WaitOptions = {}): Promise<PaymentResult> {
+  async wait(paymentId: string, options: WaitOptions = {}): Promise<PaymentOutcome> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
@@ -277,7 +331,8 @@ export class Paylod {
       const payment = await this.status(paymentId, { signal: options.signal });
       last = payment;
 
-      if (payment.status !== "pending") return toResult(payment);
+      const outcome = toOutcome(payment);
+      if (outcome.status !== "pending") return outcome;
       options.onPoll?.(payment);
 
       const delay = pollDelay(attempt);
@@ -289,18 +344,19 @@ export class Paylod {
   }
 
   /**
-   * `collect()` + `wait()`. The one-liner most integrations actually want.
+   * `collect()` + `wait()`. The one-liner most integrations actually want, and the whole SDK in
+   * a single call: ring the phone, wait for the PIN, hand back something you can render.
    *
    * ```ts
-   * const r = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
-   * if (r.ok) fulfil(r.receipt);
-   * else      toast.error(r.error.customerMessage);
+   * const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+   * if (outcome.paid) fulfil(outcome.receipt);
+   * else              toast(outcome.message);   // no result-code table in sight
    * ```
    */
   async collectAndWait(
     params: CollectParams,
     options: WaitOptions = {},
-  ): Promise<PaymentResult> {
+  ): Promise<PaymentOutcome> {
     const signal = options.signal;
     const ack = await this.collect(params, signal ? { signal } : {});
     return this.wait(ack.paymentId, options);
@@ -309,9 +365,13 @@ export class Paylod {
   /**
    * Decode an M-Pesa result code offline. No network, no API key needed at call time.
    * The strings are identical to the ones the API puts in `event.data.decoded`.
+   *
+   * You should rarely need this: `check()`, `wait()` and `collectAndWait()` already hand back a
+   * decoded, renderable {@link PaymentOutcome}. This is here for logs, dashboards and support
+   * tooling — not for deciding what to show a customer.
    */
   decodeError(resultCode: number | string | null | undefined, rawDesc?: string): DecodedError {
-    return decodeError(resultCode, rawDesc);
+    return decodeDarajaResult(resultCode, rawDesc ?? null);
   }
 
   /**
@@ -431,18 +491,6 @@ export class Paylod {
       res.status(200).json({ received: true });
     };
   }
-}
-
-/** Map a settled payment onto the discriminated union. */
-function toResult(payment: Payment): PaymentResult {
-  if (payment.status === "success" && payment.mpesaReceipt) {
-    return { ok: true, receipt: payment.mpesaReceipt, payment };
-  }
-  return {
-    ok: false,
-    error: decodeError(payment.resultCode, payment.resultDesc ?? undefined),
-    payment,
-  };
 }
 
 // ── Minimal structural types for Express/Connect (no `express` dependency) ────────

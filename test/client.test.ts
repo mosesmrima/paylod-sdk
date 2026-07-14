@@ -42,6 +42,17 @@ afterEach(() => {
 });
 
 describe("construction", () => {
+  it("takes a bare API key — no options object, no base URL, no ceremony", async () => {
+    vi.stubEnv("PAYLOD_API_KEY", "");
+    const m = mockFetch([{ status: 202, json: ACK }]);
+    // The documented form. Everything else is defaulted.
+    const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+    await paylod.collect({ amount: 1, phone: "0712345678" });
+    // The base URL is baked in: the caller never supplied one.
+    expect(m.calls[0]!.url).toBe("https://paylod.dev/functions/v1/collect");
+    expect(m.calls[0]!.headers.authorization).toBe(`Bearer ${KEY}`);
+  });
+
   it("reads PAYLOD_API_KEY from the environment", () => {
     vi.stubEnv("PAYLOD_API_KEY", KEY);
     expect(() => new Paylod()).not.toThrow();
@@ -50,6 +61,12 @@ describe("construction", () => {
   it("throws a config error when no key is available", () => {
     vi.stubEnv("PAYLOD_API_KEY", "");
     expect(() => new Paylod()).toThrow(PaylodConfigError);
+  });
+
+  it("fails loudly at construction rather than handing back a client that will 401", () => {
+    vi.stubEnv("PAYLOD_API_KEY", "");
+    expect(() => new Paylod("   ")).toThrow(PaylodConfigError);
+    expect(() => new Paylod("")).toThrow(PaylodConfigError);
   });
 
   it("defaults to the live base URL and allows an override", async () => {
@@ -198,14 +215,16 @@ describe("collectAndWait", () => {
       paylod.collectAndWait({ amount: 100, phone: "0712345678" }, { onPoll }),
     );
 
-    expect(r.ok).toBe(true);
-    if (!r.ok) throw new Error("unreachable");
+    expect(r.status).toBe("succeeded");
+    expect(r.paid).toBe(true);
     expect(r.receipt).toBe("SFF6XYZ123");
+    // Succeeded is never "safe to charge again" — that would be a second charge.
+    expect(r.retryable).toBe(false);
     expect(r.payment.status).toBe("success");
     expect(onPoll).toHaveBeenCalledTimes(2); // only the pending snapshots
   });
 
-  it("wrong PIN (2001): returns ok:false with the exact server-side customerMessage", async () => {
+  it("wrong PIN (2001): renderable message + a safe retry, no branching required", async () => {
     const m = mockFetch([
       { status: 202, json: ACK },
       {
@@ -221,18 +240,20 @@ describe("collectAndWait", () => {
       paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
     );
 
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error("unreachable");
-    expect(r.error.code).toBe("2001");
-    expect(r.error.title).toBe("Wrong M-Pesa PIN");
-    expect(r.error.category).toBe("customer");
-    expect(r.error.retryable).toBe(true);
-    expect(r.error.customerMessage).toBe(
+    // Everything a UI needs, with no `if` over result codes:
+    expect(r.status).toBe("failed");
+    expect(r.paid).toBe(false);
+    expect(r.message).toBe(
       "That M-Pesa PIN was incorrect. Please try again and enter the right PIN.",
     );
+    expect(r.retryable).toBe(true); // no money moved → a fresh charge is safe
+    // …and the raw detail is still there for developers who want it.
+    expect(r.code).toBe("2001");
+    expect(r.detail?.title).toBe("Wrong M-Pesa PIN");
+    expect(r.detail?.category).toBe("customer");
   });
 
-  it("cancelled (1032): returns ok:false, does not throw", async () => {
+  it("cancelled (1032): its own status, does not throw", async () => {
     const m = mockFetch([
       { status: 202, json: ACK },
       { json: payment({ status: "failed", resultCode: 1032, resultDesc: "Request cancelled by user" }) },
@@ -242,12 +263,56 @@ describe("collectAndWait", () => {
       paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
     );
 
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error("unreachable");
-    expect(r.error.title).toBe("Payment cancelled by the customer");
-    expect(r.error.customerMessage).toBe(
-      "Payment cancelled — you can try again whenever you're ready.",
-    );
+    expect(r.status).toBe("cancelled"); // not lumped in with "failed"
+    expect(r.paid).toBe(false);
+    expect(r.retryable).toBe(true); // the customer chose to cancel; no money moved
+    expect(r.message).toBe("Payment cancelled — you can try again whenever you're ready.");
+    expect(r.detail?.title).toBe("Payment cancelled by the customer");
+  });
+
+  // ── THE REGRESSION THAT SHIPPED TWICE ────────────────────────────────────────────────────
+  // Daraja reports 4999 / 500.001.1001 on a row the API marks `failed`, but they mean "the STK
+  // prompt is live and the customer hasn't typed their PIN yet". Reporting that as a failure
+  // and offering a retry fires a SECOND prompt and double-charges a paying customer.
+  describe.each([
+    [4999, "The transaction is still under processing"],
+    ["500.001.1001", "The transaction is being processed"],
+  ])("pending code %s masquerading as status:failed", (code, desc) => {
+    it("keeps polling instead of returning a failure, then settles on the real outcome", async () => {
+      const m = mockFetch([
+        { status: 202, json: ACK },
+        // The API says "failed" — but the code says "still waiting for the PIN".
+        { json: payment({ status: "failed", resultCode: code as never, resultDesc: desc }) },
+        // …and the customer then pays.
+        { json: payment({ status: "success", resultCode: 0, mpesaReceipt: "SFF6XYZ123" }) },
+      ]);
+      const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+      const r = await withFakeClock(() =>
+        paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
+      );
+
+      // If the SDK had trusted `status: "failed"`, this payment would have been reported as a
+      // failure to a customer who was, at that moment, entering their PIN.
+      expect(r.status).toBe("succeeded");
+      expect(r.paid).toBe(true);
+      expect(r.receipt).toBe("SFF6XYZ123");
+    });
+
+    it("check() reports it as pending and NEVER retryable", async () => {
+      const m = mockFetch([
+        { json: payment({ status: "failed", resultCode: code as never, resultDesc: desc }) },
+      ]);
+      const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+      const r = await paylod.check("pay_123");
+
+      expect(r.status).toBe("pending");
+      expect(r.paid).toBe(false);
+      // The whole ballgame. A live prompt is not safe to charge again.
+      expect(r.retryable).toBe(false);
+      expect(r.message).toBe(
+        "Check your phone and enter your M-Pesa PIN to complete this payment.",
+      );
+    });
   });
 
   it("timeout: THROWS PaylodTimeoutError carrying the still-pending payment", async () => {
@@ -300,7 +365,10 @@ describe("decodeError", () => {
     expect(e.code).toBe("4242");
     expect(e.title).toBe("Payment failed");
     expect(e.cause).toBe("Something odd happened");
-    expect(e.retryable).toBe(true);
+    // An UNKNOWN code is indeterminate — we do not know whether money moved, so a fresh charge
+    // is NOT known to be safe. (Until 0.2 the SDK's forked catalog said `true` here, which
+    // invited a blind re-charge on a code we cannot classify. The canonical table says false.)
+    expect(e.retryable).toBe(false);
   });
 
   it("decodes success (0)", () => {

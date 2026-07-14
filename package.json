@@ -1,6 +1,6 @@
 {
   "name": "@paylod/node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official Node/TypeScript client for the paylod API — M-Pesa (Safaricom Daraja) STK Push, status polling, signed webhooks and offline error decoding, with zero runtime dependencies.",
   "keywords": [
     "paylod",
@@ -48,11 +48,13 @@
   ],
   "scripts": {
     "build": "tsup",
-    "prepublishOnly": "npm run build && npm test",
+    "prepublishOnly": "npm run check-catalog && npm run build && npm test",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "coverage": "vitest run --coverage"
+    "coverage": "vitest run --coverage",
+    "sync-catalog": "node scripts/sync-daraja-catalog.mjs",
+    "check-catalog": "node scripts/sync-daraja-catalog.mjs --check"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
