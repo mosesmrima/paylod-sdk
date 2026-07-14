@@ -1,0 +1,485 @@
+import { randomUUID } from "node:crypto";
+import {
+  PaylodApiError,
+  PaylodConfigError,
+  PaylodConnectionError,
+  PaylodInvalidRequestError,
+  PaylodTimeoutError,
+} from "./errors.js";
+import { decodeError } from "./error-catalog.js";
+import type { DecodedError } from "./error-catalog.js";
+import { normalizePhone } from "./phone.js";
+import type {
+  CollectAck,
+  CollectParams,
+  Payment,
+  PaylodOptions,
+  PaymentResult,
+  WaitOptions,
+  WebhookEvent,
+} from "./types.js";
+import { SIGNATURE_HEADER, verifyWebhook } from "./webhook.js";
+
+/**
+ * The live, working base. The docs advertise `https://api.paylod.dev/v1`, which does not
+ * route yet — override with `new Paylod({ baseUrl })` or `PAYLOD_BASE_URL` when it does.
+ */
+export const DEFAULT_BASE_URL = "https://paylod.dev/functions/v1";
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
+
+/** Ramp: quick first look, then ease off. Capped at 5s. Values in ms. */
+const POLL_SCHEDULE_MS = [1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000] as const;
+
+const MAX_AMOUNT = 150_000;
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(signal?.reason ?? new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** ±20% jitter so a fleet of servers doesn't poll in lockstep. */
+function jitter(ms: number): number {
+  return Math.round(ms * (0.8 + Math.random() * 0.4));
+}
+
+function pollDelay(attempt: number): number {
+  const base = POLL_SCHEDULE_MS[Math.min(attempt, POLL_SCHEDULE_MS.length - 1)] ?? 5_000;
+  return jitter(base);
+}
+
+interface RequestOptions {
+  readonly method: "GET" | "POST";
+  readonly path: string;
+  readonly body?: unknown;
+  readonly idempotencyKey?: string;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * The paylod API client.
+ *
+ * ```ts
+ * const paylod = new Paylod();                       // reads PAYLOD_API_KEY
+ * const r = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+ * ```
+ */
+export class Paylod {
+  readonly #apiKey: string;
+  readonly #baseUrl: string;
+  readonly #webhookSecret: string | undefined;
+  readonly #timeoutMs: number;
+  readonly #maxRetries: number;
+  readonly #fetch: typeof globalThis.fetch;
+
+  constructor(options: PaylodOptions = {}) {
+    const env: Record<string, string | undefined> =
+      typeof process !== "undefined" && process.env ? process.env : {};
+
+    const apiKey = options.apiKey ?? env.PAYLOD_API_KEY;
+    if (!apiKey) {
+      throw new PaylodConfigError(
+        "No paylod API key. Set the PAYLOD_API_KEY environment variable, or pass " +
+          "`new Paylod({ apiKey })`. Never ship this key to a browser.",
+      );
+    }
+    this.#apiKey = apiKey;
+    this.#baseUrl = (options.baseUrl ?? env.PAYLOD_BASE_URL ?? DEFAULT_BASE_URL).replace(
+      /\/+$/,
+      "",
+    );
+    this.#webhookSecret = options.webhookSecret ?? env.PAYLOD_WEBHOOK_SECRET;
+    this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.#maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+
+    const f = options.fetch ?? globalThis.fetch;
+    if (typeof f !== "function") {
+      throw new PaylodConfigError(
+        "No global fetch available. Use Node 18+, or pass `new Paylod({ fetch })`.",
+      );
+    }
+    this.#fetch = f;
+  }
+
+  // ── HTTP ──────────────────────────────────────────────────────────────────────
+
+  async #request<T>(opts: RequestOptions): Promise<T> {
+    const url = `${this.#baseUrl}${opts.path}`;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= this.#maxRetries; attempt++) {
+      if (attempt > 0) await sleep(jitter(250 * 2 ** (attempt - 1)), opts.signal);
+
+      const timer = new AbortController();
+      const to = setTimeout(() => timer.abort(), this.#timeoutMs);
+      const onOuterAbort = () => timer.abort();
+      opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
+
+      let res: Response;
+      try {
+        const headers: Record<string, string> = {
+          authorization: `Bearer ${this.#apiKey}`,
+          accept: "application/json",
+        };
+        if (opts.body !== undefined) headers["content-type"] = "application/json";
+        // Sent on every mutating call — this is what makes a retry safe.
+        if (opts.idempotencyKey) headers["idempotency-key"] = opts.idempotencyKey;
+
+        res = await this.#fetch(url, {
+          method: opts.method,
+          headers,
+          body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+          signal: timer.signal,
+        });
+      } catch (e) {
+        lastError = new PaylodConnectionError(
+          `Could not reach paylod at ${url}: ${e instanceof Error ? e.message : String(e)}`,
+          { cause: e },
+        );
+        if (opts.signal?.aborted) throw lastError;
+        continue; // network blip → retry
+      } finally {
+        clearTimeout(to);
+        opts.signal?.removeEventListener("abort", onOuterAbort);
+      }
+
+      const text = await res.text().catch(() => "");
+      let parsed: unknown;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = text;
+      }
+
+      if (res.ok) return parsed as T;
+
+      const message =
+        (parsed && typeof parsed === "object" && typeof (parsed as { error?: unknown }).error === "string"
+          ? (parsed as { error: string }).error
+          : null) ?? `paylod responded ${res.status}`;
+
+      const apiError = new PaylodApiError(message, res.status, parsed, opts.idempotencyKey);
+
+      // 429 / 5xx are transient. Everything else (400/401/404/409/422) is a real answer —
+      // retrying it just burns time and, for 409, hides a genuine bug.
+      const transient = res.status === 429 || res.status >= 500;
+      if (!transient || attempt === this.#maxRetries) throw apiError;
+
+      const retryAfter = Number(res.headers.get("retry-after"));
+      lastError = apiError;
+      if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        await sleep(Math.min(retryAfter * 1000, 10_000), opts.signal);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new PaylodConnectionError(`Request to ${url} failed`);
+  }
+
+  // ── Validation ────────────────────────────────────────────────────────────────
+
+  /**
+   * Validate + normalise locally so a bad amount or phone fails instantly, in your own
+   * stack trace, instead of coming back as an opaque 422 a network round-trip later.
+   * Bounds mirror `_shared/schemas/collect.ts`.
+   */
+  #buildCollectBody(params: CollectParams): Record<string, unknown> {
+    const { amount } = params;
+    if (typeof amount !== "number" || !Number.isFinite(amount)) {
+      throw new PaylodInvalidRequestError("amount must be a number (whole KES).");
+    }
+    if (!Number.isInteger(amount)) {
+      throw new PaylodInvalidRequestError(
+        `amount must be a whole number of KES — M-Pesa rejects decimals (got ${amount}).`,
+      );
+    }
+    if (amount <= 0 || amount > MAX_AMOUNT) {
+      throw new PaylodInvalidRequestError(
+        `amount must be between 1 and ${MAX_AMOUNT} KES (got ${amount}).`,
+      );
+    }
+    if (params.accountReference !== undefined && params.accountReference.trim().length > 12) {
+      throw new PaylodInvalidRequestError("accountReference must be 12 characters or fewer.");
+    }
+    if (params.description !== undefined && params.description.trim().length > 64) {
+      throw new PaylodInvalidRequestError("description must be 64 characters or fewer.");
+    }
+
+    const body: Record<string, unknown> = {
+      amount,
+      phone: normalizePhone(params.phone),
+    };
+    if (params.accountReference !== undefined) body.accountReference = params.accountReference;
+    if (params.description !== undefined) body.description = params.description;
+    if (params.metadata !== undefined) body.metadata = params.metadata;
+    return body;
+  }
+
+  // ── Public API ────────────────────────────────────────────────────────────────
+
+  /**
+   * Send an STK Push. Resolves as soon as the prompt is on the customer's phone — the payment
+   * is `pending`. Settle it with {@link status}, {@link wait}, or a webhook.
+   *
+   * An `Idempotency-Key` is generated for you unless you pass one, so a retry of this exact
+   * call can never double-charge. Persist `ack.idempotencyKey` if you intend to retry later.
+   */
+  async collect(params: CollectParams, options: { signal?: AbortSignal } = {}): Promise<CollectAck> {
+    const body = this.#buildCollectBody(params);
+    const idempotencyKey = params.idempotencyKey ?? randomUUID();
+
+    const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
+      method: "POST",
+      path: "/collect",
+      body,
+      idempotencyKey,
+      signal: options.signal,
+    });
+    return { ...ack, idempotencyKey };
+  }
+
+  /** Read a payment. `GET /status/:id`. */
+  async status(paymentId: string, options: { signal?: AbortSignal } = {}): Promise<Payment> {
+    if (!paymentId) throw new PaylodInvalidRequestError("paymentId is required.");
+    return this.#request<Payment>({
+      method: "GET",
+      path: `/status/${encodeURIComponent(paymentId)}`,
+      signal: options.signal,
+    });
+  }
+
+  /**
+   * Poll an existing payment until it settles, with a backoff ramp (1s → 5s, jittered).
+   *
+   * @throws {PaylodTimeoutError} if still `pending` at the deadline — NOT a failure, see the
+   *   note on that class. Everything else resolves to a {@link PaymentResult}.
+   */
+  async wait(paymentId: string, options: WaitOptions = {}): Promise<PaymentResult> {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+
+    let last: Payment | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const payment = await this.status(paymentId, { signal: options.signal });
+      last = payment;
+
+      if (payment.status !== "pending") return toResult(payment);
+      options.onPoll?.(payment);
+
+      const delay = pollDelay(attempt);
+      if (Date.now() + delay >= deadline) break;
+      await sleep(delay, options.signal);
+    }
+
+    throw new PaylodTimeoutError(paymentId, last, Date.now() - startedAt);
+  }
+
+  /**
+   * `collect()` + `wait()`. The one-liner most integrations actually want.
+   *
+   * ```ts
+   * const r = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+   * if (r.ok) fulfil(r.receipt);
+   * else      toast.error(r.error.customerMessage);
+   * ```
+   */
+  async collectAndWait(
+    params: CollectParams,
+    options: WaitOptions = {},
+  ): Promise<PaymentResult> {
+    const signal = options.signal;
+    const ack = await this.collect(params, signal ? { signal } : {});
+    return this.wait(ack.paymentId, options);
+  }
+
+  /**
+   * Decode an M-Pesa result code offline. No network, no API key needed at call time.
+   * The strings are identical to the ones the API puts in `event.data.decoded`.
+   */
+  decodeError(resultCode: number | string | null | undefined, rawDesc?: string): DecodedError {
+    return decodeError(resultCode, rawDesc);
+  }
+
+  /**
+   * Verify a raw webhook body + signature header and return the typed event.
+   * Throws {@link PaylodSignatureVerificationError} if it does not check out.
+   */
+  verifyWebhook(params: {
+    payload: string | Buffer | Uint8Array;
+    signature: string | null | undefined;
+    secret?: string;
+    toleranceSec?: number;
+  }): WebhookEvent {
+    const secret = params.secret ?? this.#webhookSecret ?? "";
+    return verifyWebhook({
+      payload: params.payload,
+      signature: params.signature,
+      secret,
+      ...(params.toleranceSec !== undefined ? { toleranceSec: params.toleranceSec } : {}),
+    });
+  }
+
+  /**
+   * A verified webhook handler for the Web `Request`/`Response` world — Next.js route
+   * handlers, Hono, Remix, Cloudflare Workers, Bun, Deno.
+   *
+   * ```ts
+   * // app/api/webhooks/paylod/route.ts
+   * export const POST = paylod.webhookHandler(async (event) => {
+   *   if (event.type === "payment.success") await fulfil(event.data.paymentId);
+   * });
+   * ```
+   * Returns `400` on a bad signature and `200` once your handler resolves. If your handler
+   * throws, it returns `500` so paylod retries the delivery.
+   */
+  webhookHandler(
+    handler: (event: WebhookEvent) => void | Promise<void>,
+    options: { secret?: string; toleranceSec?: number } = {},
+  ): (request: Request) => Promise<Response> {
+    return async (request: Request): Promise<Response> => {
+      const raw = await request.text();
+      let event: WebhookEvent;
+      try {
+        event = this.verifyWebhook({
+          payload: raw,
+          signature: request.headers.get(SIGNATURE_HEADER),
+          ...(options.secret !== undefined ? { secret: options.secret } : {}),
+          ...(options.toleranceSec !== undefined ? { toleranceSec: options.toleranceSec } : {}),
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: e instanceof Error ? e.message : "invalid signature" }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+
+      try {
+        await handler(event);
+      } catch (e) {
+        // Non-2xx → paylod retries. Better a duplicate delivery than a lost payment.
+        return new Response(
+          JSON.stringify({ error: e instanceof Error ? e.message : "handler failed" }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ received: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+  }
+
+  /**
+   * A verified webhook middleware for Express/Connect.
+   *
+   * ```ts
+   * app.post("/webhooks/paylod", paylod.webhook(async (event) => { ... }));
+   * ```
+   *
+   * It reads the raw body itself, so mount it BEFORE any global `express.json()`, or give
+   * the route `express.raw({ type: "application/json" })`. If a JSON parser already turned
+   * the body into an object the raw bytes are gone and verification is impossible — you get
+   * a loud 400 explaining exactly that, rather than a silent security hole.
+   */
+  webhook(
+    handler: (event: WebhookEvent) => void | Promise<void>,
+    options: { secret?: string; toleranceSec?: number } = {},
+  ): (req: ExpressLikeRequest, res: ExpressLikeResponse) => Promise<void> {
+    return async (req: ExpressLikeRequest, res: ExpressLikeResponse): Promise<void> => {
+      let raw: Buffer;
+      try {
+        raw = await readRawBody(req);
+      } catch (e) {
+        res.status(400).json({ error: e instanceof Error ? e.message : "cannot read body" });
+        return;
+      }
+
+      const header = req.headers?.[SIGNATURE_HEADER];
+      let event: WebhookEvent;
+      try {
+        event = this.verifyWebhook({
+          payload: raw,
+          signature: Array.isArray(header) ? header[0] : header,
+          ...(options.secret !== undefined ? { secret: options.secret } : {}),
+          ...(options.toleranceSec !== undefined ? { toleranceSec: options.toleranceSec } : {}),
+        });
+      } catch (e) {
+        res.status(400).json({ error: e instanceof Error ? e.message : "invalid signature" });
+        return;
+      }
+
+      try {
+        await handler(event);
+      } catch (e) {
+        res.status(500).json({ error: e instanceof Error ? e.message : "handler failed" });
+        return;
+      }
+      res.status(200).json({ received: true });
+    };
+  }
+}
+
+/** Map a settled payment onto the discriminated union. */
+function toResult(payment: Payment): PaymentResult {
+  if (payment.status === "success" && payment.mpesaReceipt) {
+    return { ok: true, receipt: payment.mpesaReceipt, payment };
+  }
+  return {
+    ok: false,
+    error: decodeError(payment.resultCode, payment.resultDesc ?? undefined),
+    payment,
+  };
+}
+
+// ── Minimal structural types for Express/Connect (no `express` dependency) ────────
+
+export interface ExpressLikeRequest {
+  headers?: Record<string, string | string[] | undefined>;
+  body?: unknown;
+  rawBody?: unknown;
+  readableEnded?: boolean;
+  [Symbol.asyncIterator]?: () => AsyncIterator<Buffer | Uint8Array | string>;
+}
+
+export interface ExpressLikeResponse {
+  status(code: number): ExpressLikeResponse;
+  json(body: unknown): unknown;
+}
+
+async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
+  // express.raw() / body-parser raw → already a Buffer. Best case.
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === "string") return Buffer.from(req.body, "utf8");
+  // body-parser `verify` hook convention (and Vercel/Firebase runtimes).
+  if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
+  if (typeof req.rawBody === "string") return Buffer.from(req.rawBody, "utf8");
+
+  // Nothing parsed it yet → drain the stream ourselves.
+  if (req.body === undefined && typeof req[Symbol.asyncIterator] === "function") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req as AsyncIterable<Buffer | Uint8Array | string>) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  throw new Error(
+    "Cannot verify a paylod webhook: the request body was already parsed into an object, so " +
+      "the raw bytes are gone. Mount the webhook route BEFORE express.json(), or give it " +
+      'express.raw({ type: "application/json" }).',
+  );
+}

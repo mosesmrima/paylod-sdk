@@ -1,0 +1,52 @@
+{
+  "name": "@paylod/node",
+  "version": "0.1.0",
+  "private": true,
+  "_private_note": "Guard against an accidental `npm publish` before review. Remove `private` (and this note) when you actually intend to release.",
+  "description": "Official Node/TypeScript client for the paylod API — M-Pesa collections without the Daraja boilerplate.",
+  "keywords": [
+    "paylod",
+    "mpesa",
+    "m-pesa",
+    "daraja",
+    "safaricom",
+    "payments",
+    "kenya",
+    "stk-push"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
