@@ -140,23 +140,26 @@ export const ERROR_CATALOG: Readonly<Record<string, Omit<DecodedError, "code">>>
   // payment carrying one is still payable and MUST NOT be shown to a customer as failed.
   // Catalogued so that if one is ever surfaced anyway it decodes honestly instead of hitting
   // the "Payment failed" fallback. `category: "pending"` is the flag to branch on.
+  // NOTE `retryable: false`. A pending payment is NOT retryable: retrying pushes a SECOND
+  // prompt and can double-charge the customer. "Retryable" means "a fresh charge is safe",
+  // which is exactly what it is not while the first prompt is still live.
   "4999": {
     title: "Still waiting for the customer's PIN",
     cause:
-      "The STK prompt is live on the customer's phone and they have not entered their M-Pesa PIN yet. This is NOT a failure — the payment can still succeed.",
-    fix: "Keep polling GET /status/:id (or wait for the webhook). Do not tell the customer it failed.",
+      "The STK prompt is live on the customer's phone and they have not entered their M-Pesa PIN yet. This is NOT a failure — the payment is still in flight and can still succeed. Retrying now would push a SECOND prompt and can double-charge the customer.",
+    fix: "Keep polling GET /status/:id (or wait for the webhook). Do NOT retry the charge and do NOT tell the customer it failed — this payment is still live and can still succeed.",
     category: "pending",
-    retryable: true,
-    customerMessage: "Waiting for you to enter your M-Pesa PIN.",
+    retryable: false,
+    customerMessage: "Check your phone and enter your M-Pesa PIN to complete this payment.",
   },
   "500.001.1001": {
     title: "Transaction is still being processed",
     cause:
       "M-Pesa is still processing this STK Push — the customer may not have entered their PIN yet. This is NOT a failure.",
-    fix: "Keep polling GET /status/:id (or wait for the webhook). Do not tell the customer it failed.",
+    fix: "Keep polling GET /status/:id (or wait for the webhook). Do NOT retry the charge and do NOT tell the customer it failed — this payment is still live and can still succeed.",
     category: "pending",
-    retryable: true,
-    customerMessage: "Waiting for you to enter your M-Pesa PIN.",
+    retryable: false,
+    customerMessage: "Check your phone and enter your M-Pesa PIN to complete this payment.",
   },
   "2028": {
     title: "Payment amount exceeds the M-Pesa limit",
