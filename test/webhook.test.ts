@@ -219,7 +219,8 @@ describe("failed events carry the decoded error", () => {
       nowSec: NOW,
     });
     expect(event.data.decoded?.customerMessage).toBe(
-      "We couldn't reach your phone. Check your signal and try again.",
+      "The M-Pesa prompt expired before it was answered. Check your phone is on, then try again " +
+        "and enter your PIN when it appears.",
     );
   });
 });

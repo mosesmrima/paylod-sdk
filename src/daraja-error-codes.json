@@ -74,7 +74,7 @@
       "code": "1019",
       "family": "stk_result",
       "title": "Transaction expired",
-      "cause": "The transaction exceeded its allowed processing window because the customer took too long to act on the prompt.",
+      "cause": "The transaction exceeded its allowed processing window and M-Pesa expired it. Daraja says only 'Transaction expired.' and does not say why, so we do not guess — the usual reason is the customer taking too long to act on the prompt. Terminal: no money moved.",
       "fix": "Let the customer re-initiate the payment and prompt them to approve promptly.",
       "category": "customer",
       "retryable": true,
@@ -129,22 +129,23 @@
     {
       "code": "1037",
       "family": "stk_result",
-      "title": "Timeout — the customer could not be reached",
-      "cause": "The STK prompt could not reach the phone or the customer did not respond within the timeout (~60s). Common reasons: the phone is off, out of coverage, or the customer never entered their PIN.",
-      "fix": "Ask the customer to confirm their phone is on with Safaricom network, then retry. Confirm the number is a registered Safaricom line.",
-      "category": "network",
+      "title": "The M-Pesa prompt went unanswered",
+      "cause": "M-Pesa sent the STK prompt but received no answer before it expired (~60s). Daraja reports this as 'DS timeout user cannot be reached', and has been OBSERVED live returning ResultDesc 'No response from user.' — the code covers BOTH the customer simply not acting on the prompt (the common case: they ignored, missed or dismissed it) AND a genuinely unreachable handset (phone off, out of coverage). Daraja does not tell us which, so neither do we. Terminal: no money moved.",
+      "fix": "Nothing is wrong with your setup. Offer a retry and ask the customer to keep their phone to hand and enter their PIN when the prompt appears. Only if the SAME number fails this way repeatedly is it worth checking that the line is a reachable Safaricom number.",
+      "category": "customer",
       "retryable": true,
-      "customerMessage": "We couldn't reach your phone. Check your signal and try again.",
+      "customerMessage": "The M-Pesa prompt expired before it was answered. Check your phone is on, then try again and enter your PIN when it appears.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
-        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
+        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
+        "observed-live: ResultCode 1037 + ResultDesc 'No response from user.' on a real STK push the customer deliberately ignored (2026-07-14)"
       ]
     },
     {
       "code": "2001",
       "family": "stk_result",
       "title": "Wrong M-Pesa PIN",
-      "cause": "The customer entered the wrong M-Pesa PIN when approving the STK prompt. This is a customer input problem, NOT an issue with your credentials or configuration.",
+      "cause": "The customer entered the wrong M-Pesa PIN when approving the STK prompt. This is a customer input problem, NOT an issue with your credentials or configuration. NOTE Daraja words this confusingly: on an STK callback it sends ResultDesc 'The initiator information is invalid.' — that wording is about the CUSTOMER's PIN, not your initiator credentials. (The same numeric code on a B2C/C2B result genuinely IS an initiator-credential failure; that is a separate entry in this table, disambiguated by family.)",
       "fix": "Nothing to change on your side — ask the customer to retry and enter their correct M-Pesa PIN.",
       "category": "customer",
       "retryable": true,

@@ -20,7 +20,14 @@ export interface CollectParams {
    * Your correlation id (invoice/order number), returned as `accountRef` on the status read
    * and on the webhook. Shown to the payer only on a Paybill, where it is the account number
    * they are paying into; a Till (Buy Goods) never displays it — the payer sees just your
-   * business name and the amount. 1–12 chars. Defaults to `collect`.
+   * business name and the amount. 1–12 chars.
+   *
+   * Defaults to a short prefix of the `paymentId`, so an omitted reference is still unique and
+   * still correlatable back to the payment.
+   *
+   * NOTE: this is a *label*, not a lock. It does not deduplicate anything — putting your order id
+   * here does not stop a second charge. {@link idempotencyKey} is what does that. Passing your
+   * order id to both is a good idea.
    */
   readonly accountReference?: string;
   /** Shown on the STK prompt. 1–64 chars. Defaults to `Payment`. */
@@ -34,8 +41,26 @@ export interface CollectParams {
    */
   readonly metadata?: Record<string, unknown>;
   /**
-   * Overrides the auto-generated key. Same key + same body → the original 202 is replayed
-   * instead of charging twice. Same key + *different* body → 409 (a bug on your side).
+   * **The thing that stops you charging a customer twice.** Pass the id of what is being paid
+   * for — an order id, an invoice number — not a fresh random value:
+   *
+   * ```ts
+   * await paylod.collectAndWait({ phone, amount, idempotencyKey: order.id });
+   * ```
+   *
+   * Send the same key twice and the second call returns the *original* payment — same
+   * `paymentId`, same `checkoutRequestId` — rather than firing a second STK prompt. So a
+   * double-clicked Pay button, a refreshed tab, or a retried request charges once.
+   * Same key + a *different* body → `409` (that means two different charges collided on one key:
+   * a bug on your side).
+   *
+   * Only you can supply this: paylod cannot know that a retry of order 1042 is the same charge
+   * rather than the customer deliberately buying again.
+   *
+   * **If you omit it**, the SDK generates a fresh key for each call. That makes an internal
+   * network retry of one call safe, but it does NOT stop your application from sending the same
+   * logical charge twice — which is the common way customers get double-charged. The SDK emits a
+   * one-time `console.warn` in that case.
    */
   readonly idempotencyKey?: string;
 }
@@ -45,7 +70,11 @@ export interface CollectAck {
   readonly paymentId: string;
   readonly status: "pending";
   readonly checkoutRequestId: string;
-  /** The `Idempotency-Key` that was sent — persist it if you plan to retry this charge. */
+  /**
+   * The `Idempotency-Key` that was actually sent: the one you passed, or the random one the SDK
+   * generated because you did not. Replaying this exact key returns this exact payment instead of
+   * charging again — so if you generated nothing, persist this before you retry.
+   */
   readonly idempotencyKey: string;
 }
 

@@ -6,7 +6,7 @@ import {
   PaylodInvalidRequestError,
   PaylodTimeoutError,
 } from "../src/index.js";
-import { ACK, mockFetch, payment } from "./helpers.js";
+import { ACK, mockFetch, payment, type Step } from "./helpers.js";
 
 const KEY = "mp_test_abc123";
 
@@ -184,6 +184,68 @@ describe("idempotency", () => {
     expect(err.isIdempotencyConflict).toBe(true);
     expect(err.idempotencyKey).toBe("order-42");
     expect(m.count).toBe(1);
+  });
+});
+
+/**
+ * The double-charge guard. An omitted `idempotencyKey` means the application can send the same
+ * logical charge twice — the single most expensive mistake this SDK can let you make — so it has
+ * to be audible. The warning is module-level "once per process" state, hence the fresh import.
+ */
+describe("missing-idempotencyKey warning", () => {
+  async function freshClient(steps: Step[]) {
+    vi.resetModules();
+    const { Paylod: Fresh } = await import("../src/client.js");
+    const m = mockFetch(steps);
+    return { m, paylod: new Fresh({ apiKey: KEY, fetch: m.fetch }) };
+  }
+
+  it("warns when collect() is called with no idempotencyKey", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
+
+    await paylod.collect({ amount: 100, phone: "0712345678" });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = String(warn.mock.calls[0]![0]);
+    expect(msg).toContain("idempotencyKey");
+    expect(msg).toContain("charge your customer twice");
+    warn.mockRestore();
+  });
+
+  it("warns only ONCE, however many unprotected calls follow", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
+
+    await paylod.collect({ amount: 100, phone: "0712345678" });
+    await paylod.collect({ amount: 100, phone: "0712345678" });
+    await paylod.collect({ amount: 100, phone: "0712345678" });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("stays silent when the caller supplies a key", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
+
+    await paylod.collect({ amount: 100, phone: "0712345678", idempotencyKey: "order-1042" });
+
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("warns via collectAndWait() too — it is the call most people actually make", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { paylod } = await freshClient([
+      { status: 202, json: ACK },
+      { status: 200, json: payment({ status: "success", mpesaReceipt: "UG1F3A1U7J" }) },
+    ]);
+
+    await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });
 

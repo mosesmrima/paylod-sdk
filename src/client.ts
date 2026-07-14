@@ -39,6 +39,28 @@ const POLL_SCHEDULE_MS = [1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000
 
 const MAX_AMOUNT = 150_000;
 
+/**
+ * Warn at most once per process. A double-charge is a money bug, so it earns a loud warning —
+ * but one that fires on every call in a hot checkout path would just be noise people filter out.
+ */
+let warnedMissingIdempotencyKey = false;
+
+function warnMissingIdempotencyKey(): void {
+  if (warnedMissingIdempotencyKey) return;
+  warnedMissingIdempotencyKey = true;
+  console.warn(
+    "[paylod] collect() was called without an `idempotencyKey`, so this charge is not protected " +
+      "against being sent twice.\n" +
+      "         A double-clicked Pay button, a refreshed tab, or a retried request will fire a " +
+      "SECOND STK prompt and can charge your customer twice.\n" +
+      "         Pass the id of the thing being paid for — it is the only value that knows a retry " +
+      "of order 1042 is the same charge, not a new one:\n" +
+      "             paylod.collectAndWait({ phone, amount, idempotencyKey: order.id })\n" +
+      "         Same key + same body → the original payment is returned, and no second prompt is " +
+      "ever sent. https://paylod.dev/docs/sdk#idempotency",
+  );
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
@@ -269,11 +291,26 @@ export class Paylod {
    * Send an STK Push. Resolves as soon as the prompt is on the customer's phone — the payment
    * is `pending`. Settle it with {@link status}, {@link wait}, or a webhook.
    *
-   * An `Idempotency-Key` is generated for you unless you pass one, so a retry of this exact
-   * call can never double-charge. Persist `ack.idempotencyKey` if you intend to retry later.
+   * **Pass `idempotencyKey` and a double-click can never charge twice.** Use the id of the thing
+   * being paid for — an order id, an invoice number:
+   *
+   * ```ts
+   * const ack = await paylod.collect({ amount: 100, phone, idempotencyKey: order.id });
+   * ```
+   *
+   * Send the same key twice and the second call returns the *original* payment — same
+   * `paymentId`, same `checkoutRequestId` — instead of firing a second STK prompt. Only you know
+   * that a retry of order 1042 is the same charge and not a new one, which is why this cannot be
+   * generated for you.
+   *
+   * Omit it and the SDK generates a fresh key per call. That still makes an internal *network*
+   * retry of this one call safe, but it does nothing about your application sending the same
+   * logical charge twice — a double-clicked button, a refreshed tab, a retried job — which is by
+   * far the more common way a customer gets charged twice. The SDK warns once if you omit it.
    */
   async collect(params: CollectParams, options: { signal?: AbortSignal } = {}): Promise<CollectAck> {
     const body = this.#buildCollectBody(params);
+    if (params.idempotencyKey === undefined) warnMissingIdempotencyKey();
     const idempotencyKey = params.idempotencyKey ?? randomUUID();
 
     const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
@@ -348,10 +385,16 @@ export class Paylod {
    * a single call: ring the phone, wait for the PIN, hand back something you can render.
    *
    * ```ts
-   * const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+   * const outcome = await paylod.collectAndWait({
+   *   amount: 100,
+   *   phone: "0712345678",
+   *   idempotencyKey: order.id,   // ← pass your order id; a double-click cannot charge twice
+   * });
    * if (outcome.paid) fulfil(outcome.receipt);
    * else              toast(outcome.message);   // no result-code table in sight
    * ```
+   *
+   * See {@link collect} for what `idempotencyKey` does and what happens if you leave it out.
    */
   async collectAndWait(
     params: CollectParams,

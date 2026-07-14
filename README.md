@@ -23,13 +23,26 @@ import { Paylod } from "@paylod/node";
 
 const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
 
-const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+const outcome = await paylod.collectAndWait({
+  amount: 100,
+  phone: "0712345678",
+  idempotencyKey: order.id,   // ← your order id. A double-click can now never charge twice.
+});
 
 if (outcome.paid) fulfil(outcome.receipt);   // money moved
 else              toast(outcome.message);    // already decoded, already human
 ```
 
 That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
+
+> [!WARNING]
+> **Pass `idempotencyKey`, and pass your own order id.** Send the same key twice and the second
+> call returns the *original* payment instead of firing a second STK prompt — so a double-clicked
+> Pay button, a refreshed tab or a retried request charges the customer **once**.
+>
+> Leave it out and every call is a new charge: two clicks, two prompts, two debits. Only you know
+> that a retry of order 1042 is the same charge and not a new one, which is why paylod cannot
+> generate this for you. See [Idempotency](#idempotency).
 
 **One argument in, one renderable thing out.** You pass an API key — not a base URL, not a config object, not an OAuth token. You get back a `message` a customer can read and a `retryable` flag you can hang a button off. There is no result-code table in your app:
 
@@ -143,12 +156,17 @@ Fire the STK push and return as soon as the prompt is on the phone.
 const ack = await paylod.collect({
   amount: 100,                    // positive INTEGER KES, ≤ 150000 (M-Pesa rejects decimals)
   phone: "0712345678",            // any Kenyan format
+  idempotencyKey: "order-42",     // PASS THIS. Your order id. Replaying it returns the original
+                                  //   payment instead of sending a second STK prompt — this is
+                                  //   what stops a double-click charging twice. Omit it and the
+                                  //   SDK warns, because every call then becomes a new charge.
   accountReference: "order-42",   // optional, ≤ 12 chars — your correlation id, returned as
                                   //   `accountRef`. Shown to the payer only on a Paybill
                                   //   (it is the account number); a Till never displays it.
+                                  //   Defaults to a short prefix of the paymentId.
+                                  //   A LABEL, not a lock — it does not deduplicate anything.
   description: "Coffee",          // optional, ≤ 64 chars — shown on the prompt
   metadata: { orderId: "42" },    // optional, stored — NOT returned on /status or the webhook
-  idempotencyKey: "order-42",     // optional — one is generated if you omit it
 });
 
 // { paymentId, status: "pending", checkoutRequestId, idempotencyKey }
@@ -384,22 +402,45 @@ interface WebhookEvent {
 
 ## Idempotency
 
-Every `collect()` sends an `Idempotency-Key`. If you don't supply one, a UUID is generated and returned on the ack.
+**This is the section that stops you charging a customer twice. Read it.**
+
+Pass `idempotencyKey`, and pass **the id of the thing being paid for** — an order id, an invoice number. Not a random value.
+
+```ts
+await paylod.collectAndWait({ amount, phone, idempotencyKey: order.id });
+```
+
+- **Same key + same body** → paylod returns the **original payment** — same `paymentId`, same `checkoutRequestId`. No second STK prompt. No double charge.
+- **Same key + different body** → `409`, surfaced as `PaylodApiError` with `.isIdempotencyConflict === true`. Always a bug on your side (you changed the amount but kept the key).
+- **Internal retries** (network blip, 5xx, 429) reuse the *same* key, which is what makes retrying a `POST` safe.
+
+### Why you have to supply it
+
+Only your application knows that a retry of order 1042 is **the same charge**, and not the customer deliberately buying a second coffee. paylod cannot infer that, so it cannot generate this for you.
+
+### What happens if you omit it
+
+The SDK generates a fresh UUID per call and returns it on the ack:
 
 ```ts
 const ack = await paylod.collect({ amount: 100, phone: "0712345678" });
-ack.idempotencyKey; // persist this if you might retry this exact charge
+ack.idempotencyKey; // persist this before you retry, or the retry is a NEW charge
 ```
 
-- **Same key + same body** → paylod replays the original `202`. No second STK prompt. No double charge.
-- **Same key + different body** → `409`, surfaced as `PaylodApiError` with `.isIdempotencyConflict === true`. That is always a bug on your side (you changed the amount but kept the key).
-- **Internal retries** (network blip, 5xx, 429) reuse the *same* key, which is precisely what makes retrying a `POST` safe.
+That protects an internal *network* retry of that one call. It does **nothing** about your application sending the same logical charge twice:
 
-For a charge tied to a business object, pass a stable key — then a retry of your whole handler is free:
+| What the user does | With `idempotencyKey: order.id` | Without |
+| --- | --- | --- |
+| Double-clicks **Pay** | 1 prompt, 1 charge | **2 prompts, 2 charges** |
+| Refreshes the tab and re-submits | 1 prompt, 1 charge | **2 prompts, 2 charges** |
+| Your job queue retries the handler | 1 prompt, 1 charge | **2 prompts, 2 charges** |
 
-```ts
-await paylod.collect({ amount, phone, idempotencyKey: `order-${orderId}` });
-```
+A double-clicked button is by far the most common way a real customer gets double-charged, so the SDK emits a one-time `console.warn` when you call `collect()` / `collectAndWait()` without a key. The only way to silence it is to pass a real one.
+
+> [!WARNING]
+> Do **not** silence the warning with `idempotencyKey: crypto.randomUUID()` or `Date.now()`. A key
+> that is different on every call is exactly equivalent to having no key at all — it just hides the
+> warning telling you you're exposed.
 
 ---
 
