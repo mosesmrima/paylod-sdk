@@ -132,6 +132,32 @@ export interface PaylodOptions {
   readonly maxRetries?: number;
   /** Inject a fetch implementation (tests, proxies, instrumentation). */
   readonly fetch?: typeof globalThis.fetch;
+  /**
+   * **Simulator mode — for tests.** `collect()` and `collectAndWait()` create a *simulated*
+   * payment instead of ringing a phone. Nothing else changes: a real sandbox payment row, real
+   * Daraja result codes, a real signed webhook, and `status()` / `check()` / `wait()` behave
+   * exactly as they always do.
+   *
+   * This is what makes your own charge path testable. Build the client this way in your test
+   * setup, leave your `/api/pay` handler and your UI completely unchanged, and force the result
+   * from the test:
+   *
+   * ```ts
+   * const paylod = new Paylod(process.env.PAYLOD_TEST_KEY!, { simulate: true });
+   *
+   * const view = await startCheckout(order.id, "0712345678", attemptId);  // your code, unchanged
+   * await paylod.simulate.outcome(view.paymentId!, "wrong_pin");          // no handset involved
+   * expect((await readCheckout(view.paymentId!)).message).toMatch(/PIN/); // your code, unchanged
+   * ```
+   *
+   * **Requires a `mp_test_` key** — the constructor throws {@link PaylodSandboxOnlyError}
+   * immediately otherwise, so this flag can never point at production, even by accident.
+   *
+   * Caveat: the simulator endpoint does not implement idempotency, so in this mode a repeated
+   * `idempotencyKey` creates a *new* simulated payment rather than replaying the first. Assert on
+   * the `Idempotency-Key` header (as the demo's tests do) rather than on live dedupe.
+   */
+  readonly simulate?: boolean;
 }
 
 export interface WaitOptions {

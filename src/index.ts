@@ -14,9 +14,26 @@ export {
   PaylodConfigError,
   PaylodConnectionError,
   PaylodInvalidRequestError,
+  PaylodSandboxOnlyError,
   PaylodSignatureVerificationError,
   PaylodTimeoutError,
 } from "./errors.js";
+
+/**
+ * The sandbox simulator — `paylod.simulate`. Drive a payment to any of the five outcomes
+ * (approve / wrong PIN / insufficient funds / cancelled / timeout) from a test file, with no
+ * phone. Real payment row, real Daraja codes, real signed webhook; only the handset is fiction.
+ * Sandbox (`mp_test_`) keys only, enforced locally.
+ */
+export {
+  Simulator,
+  SIM_OUTCOMES,
+  type SimOutcomeId,
+  type SimOutcomeChoice,
+  type SimulateCollectParams,
+  type SimulatedOutcome,
+  type SimulatedPayment,
+} from "./simulate.js";
 
 /**
  * The renderable result. This is the type you build your UI on:

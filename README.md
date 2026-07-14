@@ -304,6 +304,58 @@ Also exported standalone: `import { decodeError, ERROR_CATALOG } from "@paylod/n
 
 ---
 
+## Test your checkout without a phone
+
+Your failure paths are where payment bugs live, and testing them used to mean finding a handset and deliberately typing a wrong PIN. `paylod.simulate` removes the handset — and nothing else. A real payment row, the real Daraja result codes, the real settlement path, a real signed webhook to your endpoint. Only the phone is fiction.
+
+```ts
+const paylod = new Paylod(process.env.PAYLOD_TEST_KEY!);   // mp_test_… key
+
+const outcome = await paylod.simulate.pay({ outcome: "wrong_pin" });
+
+outcome.status;     // "failed"
+outcome.message;    // "That M-Pesa PIN was incorrect. Please try again and enter the right PIN."
+outcome.retryable;  // true — no money moved, so a fresh charge is safe
+```
+
+That is an ordinary `PaymentOutcome` — the identical object `check()` and `wait()` return. No "simulated" type, no special branch: the code you are testing is the code that runs in production.
+
+| `outcome` | `status` | Result code |
+| --- | --- | --- |
+| `approve` | `succeeded` | `0` |
+| `wrong_pin` | `failed` | `2001` |
+| `insufficient_funds` | `failed` | `1` |
+| `user_cancelled` | `cancelled` | `1032` |
+| `timeout` | `failed` | `1037` |
+
+`paylod.simulate.outcomes` (also exported as `SIM_OUTCOMES`) is the whole list, typed — a typo is a compile error, not a `422` you find in CI.
+
+### Testing *your* code
+
+Split it in two and put your handler in the middle. The payment id is a real one, so your poller, webhook route and UI all run unchanged:
+
+```ts
+const sim = await paylod.simulate.collect({ amount: 250 });
+await paylod.simulate.outcome(sim.paymentId, "insufficient_funds");
+
+const view = await readCheckout(sim.paymentId);   // ← your code, verbatim
+```
+
+And to exercise your own `collect()` call, build the client with `simulate: true` — `collect()` then creates a simulated payment instead of ringing a phone, so your `/api/pay` handler runs completely unchanged:
+
+```ts
+const paylod = new Paylod(process.env.PAYLOD_TEST_KEY!, { simulate: true });
+
+const view = await startCheckout(order.id, "0712345678", attemptId);  // your handler, verbatim
+await paylod.simulate.outcome(view.paymentId!, "user_cancelled");
+```
+
+**Sandbox only, structurally.** Every simulator call refuses a `mp_live_…` key *locally*, before a byte leaves the process (`PaylodSandboxOnlyError`), and `{ simulate: true }` throws from the constructor. A simulator that could touch production is not a feature.
+
+> `timeout` is Daraja's `1037` — "we could not reach the handset" — a **settled** failure. It is not `PaylodTimeoutError`, which is what `wait()` throws when a payment is still pending at your deadline. An indeterminate payment is not a failed payment.
+
+---
+
 ## Webhooks
 
 paylod POSTs a signed JSON body to your endpoint when a payment settles.

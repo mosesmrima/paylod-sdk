@@ -11,6 +11,7 @@ import type { DecodedError } from "./daraja-catalog.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
+import { assertSandboxKey, Simulator } from "./simulate.js";
 import type {
   CollectAck,
   CollectParams,
@@ -121,6 +122,19 @@ export class Paylod {
   readonly #timeoutMs: number;
   readonly #maxRetries: number;
   readonly #fetch: typeof globalThis.fetch;
+  readonly #simulate: boolean;
+
+  /**
+   * The sandbox simulator: drive a payment to any of the five outcomes from a test file, with no
+   * phone. See {@link Simulator}.
+   *
+   * ```ts
+   * const outcome = await paylod.simulate.pay({ outcome: "insufficient_funds" });
+   * ```
+   *
+   * Every method on it refuses a `mp_live_` key locally, before a byte leaves the process.
+   */
+  readonly simulate: Simulator;
 
   /**
    * @param apiKey Your `mp_live_…` / `mp_test_…` key. Omit it to read `PAYLOD_API_KEY` from the
@@ -168,6 +182,24 @@ export class Paylod {
       );
     }
     this.#fetch = f;
+
+    // Simulator mode is a TEST posture, so it is fenced off from production at CONSTRUCTION time.
+    // A client that could simulate with a live key must never come into existence — failing here
+    // means the mistake surfaces in your test setup, not as a 403 halfway through a suite (or,
+    // far worse, as a real STK prompt on a customer's phone).
+    this.#simulate = options.simulate === true;
+    if (this.#simulate) {
+      assertSandboxKey(this.#apiKey, "new Paylod({ simulate: true })");
+    }
+
+    this.simulate = new Simulator(this.#apiKey, (opts) =>
+      this.#request({
+        method: opts.method,
+        path: opts.path,
+        body: opts.body,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      }),
+    );
   }
 
   // ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -312,6 +344,28 @@ export class Paylod {
     const body = this.#buildCollectBody(params);
     if (params.idempotencyKey === undefined) warnMissingIdempotencyKey();
     const idempotencyKey = params.idempotencyKey ?? randomUUID();
+
+    // Simulator mode (`new Paylod(testKey, { simulate: true })`): same call, same ack, no handset.
+    // Your charge path runs UNCHANGED — which is the only way to actually test it. The key was
+    // proven to be a sandbox key in the constructor, so this branch cannot reach production.
+    if (this.#simulate) {
+      const created = await this.simulate.collect(
+        {
+          phone: params.phone,
+          amount: params.amount,
+          ...(params.accountReference !== undefined
+            ? { accountReference: params.accountReference }
+            : {}),
+        },
+        options,
+      );
+      return {
+        paymentId: created.paymentId,
+        status: "pending",
+        checkoutRequestId: created.checkoutRequestId,
+        idempotencyKey,
+      };
+    }
 
     const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
       method: "POST",

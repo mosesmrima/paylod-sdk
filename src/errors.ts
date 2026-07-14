@@ -25,6 +25,18 @@ export class PaylodInvalidRequestError extends PaylodError {}
 /** Configuration problem — e.g. no API key supplied and `PAYLOD_API_KEY` is unset. */
 export class PaylodConfigError extends PaylodError {}
 
+/**
+ * A simulator call was made with a key that is not a sandbox (`mp_test_`) key.
+ *
+ * Thrown LOCALLY, before any request leaves the process — the key's own prefix is enough to know.
+ * The backend refuses a live key too, but a "simulate" call that can even *attempt* to reach
+ * production is a footgun; this makes it structurally impossible.
+ *
+ * It extends {@link PaylodConfigError} because that is what it is: the wrong credential, not a
+ * transient failure. Retrying will never help.
+ */
+export class PaylodSandboxOnlyError extends PaylodConfigError {}
+
 /** The API returned a non-2xx response. */
 export class PaylodApiError extends PaylodError {
   /** HTTP status code. */
