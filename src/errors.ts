@@ -68,12 +68,43 @@ export class PaylodApiError extends PaylodError {
     return this.status === 429;
   }
 
-  /**
-   * 409 — the same `Idempotency-Key` was reused with a *different* body. This is always a
-   * bug in your code (you changed the amount or phone but kept the key).
-   */
+  /** Any 409. Every 409 on a money-moving route comes from the idempotency layer. */
   get isIdempotencyConflict(): boolean {
     return this.status === 409;
+  }
+
+  /**
+   * `409` **indeterminate** — a previous request under this key died while the call to Daraja was
+   * in flight, so it may or may not have moved money. paylod refuses to re-dispatch it: a timeout
+   * is not evidence the money did not move, and for money at-most-once beats at-least-once.
+   *
+   * **This is a STOP signal, not a retry signal.** Read the payment status first
+   * (`paylod.check(paymentId)`, `GET /status/:id`, or your webhook). If it settled, you are done.
+   * If nothing happened, open a NEW attempt with a NEW key. Retrying under the spent key returns
+   * this same `409` forever.
+   */
+  get isIdempotencyIndeterminate(): boolean {
+    return this.status === 409 && /interrupted while the provider call was/i.test(this.message);
+  }
+
+  /**
+   * `409` **in progress** — the first request under this key is still running. Honour
+   * `Retry-After` and retry the *same* key: you will get the winner's answer. (For a plain
+   * double-click the SDK usually never surfaces this — the duplicate simply waits.)
+   */
+  get isIdempotencyInProgress(): boolean {
+    return this.status === 409 && /already in progress/i.test(this.message);
+  }
+
+  /**
+   * `409` **body conflict** — the same `Idempotency-Key` was reused with a *different* body. This
+   * is always a bug in your code (you changed the amount or the phone but kept the key): two
+   * different charges collided on one key.
+   */
+  get isIdempotencyBodyConflict(): boolean {
+    return (
+      this.status === 409 && !this.isIdempotencyIndeterminate && !this.isIdempotencyInProgress
+    );
   }
 }
 

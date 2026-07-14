@@ -52,13 +52,20 @@ function warnMissingIdempotencyKey(): void {
   console.warn(
     "[paylod] collect() was called without an `idempotencyKey`, so this charge is not protected " +
       "against being sent twice.\n" +
-      "         A double-clicked Pay button, a refreshed tab, or a retried request will fire a " +
+      "         A double-clicked Pay button, a refreshed tab, or a redelivered job will fire a " +
       "SECOND STK prompt and can charge your customer twice.\n" +
-      "         Pass the id of the thing being paid for — it is the only value that knows a retry " +
-      "of order 1042 is the same charge, not a new one:\n" +
-      "             paylod.collectAndWait({ phone, amount, idempotencyKey: order.id })\n" +
-      "         Same key + same body → the original payment is returned, and no second prompt is " +
-      "ever sent. https://paylod.dev/docs/sdk#idempotency",
+      "         Pass ONE KEY PER PAYMENT ATTEMPT — an id you mint when the customer presses Pay, " +
+      "and persist on that attempt:\n" +
+      "             const attempt = await db.attempts.create({ orderId: order.id });\n" +
+      "             paylod.collectAndWait({ phone, amount, idempotencyKey: attempt.id })\n" +
+      "         Do NOT key on the order or the product. An order id is stable but never fresh: a " +
+      "retry after a wrong PIN replays the FAILED attempt, so that order can never be paid. A " +
+      "product id is worse — every customer after the first replays the first-ever payment, and " +
+      "nobody after customer one is charged at all.\n" +
+      "         Do NOT generate the key inside the call either (`crypto.randomUUID()` at the call " +
+      "site is exactly equivalent to passing nothing — it just hides this warning).\n" +
+      "         Duplicates of one attempt collapse into one payment and one prompt. A genuine " +
+      "retry is a NEW attempt and needs a NEW key. https://paylod.dev/docs/sdk#idempotency",
   );
 }
 
@@ -328,22 +335,42 @@ export class Paylod {
    * Send an STK Push. Resolves as soon as the prompt is on the customer's phone — the payment
    * is `pending`. Settle it with {@link status}, {@link wait}, or a webhook.
    *
-   * **Pass `idempotencyKey` and a double-click can never charge twice.** Use the id of the thing
-   * being paid for — an order id, an invoice number:
+   * **Pass `idempotencyKey`, and mint ONE KEY PER PAYMENT ATTEMPT.** An attempt is one press of
+   * Pay — not an order, and never a product:
    *
    * ```ts
-   * const ack = await paylod.collect({ amount: 100, phone, idempotencyKey: order.id });
+   * const attempt = await db.attempts.create({ orderId: order.id });   // a row per press of Pay
+   * const ack = await paylod.collect({ amount: 100, phone, idempotencyKey: attempt.id });
    * ```
    *
-   * Send the same key twice and the second call returns the *original* payment — same
-   * `paymentId`, same `checkoutRequestId` — instead of firing a second STK prompt. Only you know
-   * that a retry of order 1042 is the same charge and not a new one, which is why this cannot be
-   * generated for you.
+   * The key must be **stable across duplicates of one attempt** and **fresh for a genuinely new
+   * charge**. That is what rules out the two keys people reach for first:
    *
-   * Omit it and the SDK generates a fresh key per call. That still makes an internal *network*
-   * retry of this one call safe, but it does nothing about your application sending the same
-   * logical charge twice — a double-clicked button, a refreshed tab, a retried job — which is by
-   * far the more common way a customer gets charged twice. The SDK warns once if you omit it.
+   * - An **order id** is stable but never fresh. The customer mistypes their PIN, you retry the
+   *   same order — and paylod replays the *failed* first attempt instead of charging them. That
+   *   order can never be paid.
+   * - A **product id** (any value reused across purchases) is catastrophic: every customer after
+   *   the first replays the *first-ever* payment for that product. Nobody after customer one is
+   *   charged at all.
+   * - `crypto.randomUUID()` **at the call site** is equivalent to passing nothing: a double-click
+   *   is two keys, two prompts, two charges. Mint the key once per attempt and persist it.
+   *
+   * **A concurrent double-click cannot double-charge, unconditionally.** The key is reserved
+   * before Daraja is called, so ten simultaneous requests with the same key produce exactly ONE
+   * payment and ONE STK push; all ten come back with the same `paymentId`.
+   *
+   * **The one case where the same key is not a safe retry.** If an earlier request under that key
+   * died mid-flight against Daraja, the key is *spent*: paylod refuses to re-dispatch it and
+   * returns a `409` **indeterminate** ({@link PaylodApiError.isIdempotencyIndeterminate}). A
+   * timeout is not evidence the money did not move, so that `409` is a **stop** signal, not a
+   * retry signal — read the payment status ({@link check}), and only if nothing happened start a
+   * new attempt with a **new** key. For money, at-most-once beats at-least-once.
+   *
+   * Omit the key and the SDK generates a fresh one per call. That still makes an internal
+   * *network* retry of this one call safe, but it does nothing about your application sending the
+   * same logical charge twice — a double-clicked button, a refreshed tab, a redelivered job —
+   * which is by far the more common way a customer gets charged twice. The SDK warns once if you
+   * omit it.
    */
   async collect(params: CollectParams, options: { signal?: AbortSignal } = {}): Promise<CollectAck> {
     const body = this.#buildCollectBody(params);
@@ -356,11 +383,19 @@ export class Paylod {
     if (this.#simulate) {
       const created = await this.simulate.collect(
         {
+          // Forward the WHOLE body, not a subset. The idempotency layer fingerprints the request
+          // body, so a field the simulator never sees is a field it cannot fingerprint: a reused
+          // key with changed `metadata` (or `description`) would 409 in production and silently
+          // REPLAY here. That is the exact false confidence the simulator exists to remove — a
+          // test asserting "a reused key with a different body is rejected" must not go green
+          // against a simulator that would let it through.
           phone: params.phone,
           amount: params.amount,
           ...(params.accountReference !== undefined
             ? { accountReference: params.accountReference }
             : {}),
+          ...(params.description !== undefined ? { description: params.description } : {}),
+          ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
           // Forward the key: the simulator dedupes on it exactly as production does, so the same
           // key really does return the same paymentId here.
           idempotencyKey,
@@ -447,16 +482,23 @@ export class Paylod {
    * a single call: ring the phone, wait for the PIN, hand back something you can render.
    *
    * ```ts
+   * const attempt = await db.attempts.create({ orderId: order.id });   // a row per press of Pay
+   *
    * const outcome = await paylod.collectAndWait({
    *   amount: 100,
    *   phone: "0712345678",
-   *   idempotencyKey: order.id,   // ← pass your order id; a double-click cannot charge twice
+   *   idempotencyKey: attempt.id,   // ← ONE key per payment ATTEMPT. Not the order. Not the product.
    * });
    * if (outcome.paid) fulfil(outcome.receipt);
    * else              toast(outcome.message);   // no result-code table in sight
    * ```
    *
-   * See {@link collect} for what `idempotencyKey` does and what happens if you leave it out.
+   * Duplicates of that one attempt — a double-click, a refreshed tab, a redelivered job — collapse
+   * into one payment and one STK prompt. A retry after a wrong PIN is a *new* attempt and needs a
+   * *new* key: replaying the old one replays the failure.
+   *
+   * See {@link collect} for the full rules — including the `409` **indeterminate**, which is a
+   * stop-and-read-the-status signal, never a retry signal.
    */
   async collectAndWait(
     params: CollectParams,

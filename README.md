@@ -23,10 +23,12 @@ import { Paylod } from "@paylod/node";
 
 const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
 
+const attempt = await db.attempts.create({ orderId: order.id });   // a row per press of Pay
+
 const outcome = await paylod.collectAndWait({
   amount: 100,
   phone: "0712345678",
-  idempotencyKey: order.id,   // ← your order id. A double-click can now never charge twice.
+  idempotencyKey: attempt.id,   // ← one key per payment ATTEMPT. A double-click cannot charge twice.
 });
 
 if (outcome.paid) fulfil(outcome.receipt);   // money moved
@@ -36,13 +38,13 @@ else              toast(outcome.message);    // already decoded, already human
 That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
 
 > [!WARNING]
-> **Pass `idempotencyKey`, and pass your own order id.** Send the same key twice and the second
-> call returns the *original* payment instead of firing a second STK prompt — so a double-clicked
-> Pay button, a refreshed tab or a retried request charges the customer **once**.
+> **Pass `idempotencyKey`, and mint one per payment attempt.** Duplicates of that attempt — a
+> double-clicked Pay button, a refreshed tab, a redelivered job — collapse into **one** prompt and
+> **one** charge. Omit it and every call is a new charge: two clicks, two prompts, two debits.
 >
-> Leave it out and every call is a new charge: two clicks, two prompts, two debits. Only you know
-> that a retry of order 1042 is the same charge and not a new one, which is why paylod cannot
-> generate this for you. See [Idempotency](#idempotency).
+> Do **not** key on the order or the product: that replays an old payment instead of making a new
+> one. A retry after a wrong PIN is a new charge and needs a **new** key.
+> See [Idempotency](#idempotency).
 
 **One argument in, one renderable thing out.** You pass an API key — not a base URL, not a config object, not an OAuth token. You get back a `message` a customer can read and a `retryable` flag you can hang a button off. There is no result-code table in your app:
 
@@ -73,7 +75,7 @@ This SDK is not here to save you those lines. It's here for the five things that
 | The thing | What goes wrong with hand-rolled `fetch` | What you get here |
 |---|---|---|
 | **Async settlement** | `/collect` returns `202 pending`. The customer hasn't typed their PIN yet. People hand-roll a `while (true)` poll, hammer the API every 200 ms, or never handle the case where the customer just walks away. | `collectAndWait()` — jittered backoff (1s → 5s), a deadline, and a distinct, loud `PaylodTimeoutError`. |
-| **Idempotency** | A retry (or a nervous double-click, or a Lambda re-invoke) without an `Idempotency-Key` sends a **second STK push**. The customer pays twice. Most people forget the header entirely. | A key is generated on **every** `collect()`, and reused across internal retries. You cannot accidentally double-charge. |
+| **Idempotency** | A retry (or a nervous double-click, or a Lambda re-invoke) without an `Idempotency-Key` sends a **second STK push**. The customer pays twice. Most people forget the header entirely. | A key is sent on **every** `collect()` and reused across internal retries. Pass one per payment attempt and duplicates of that attempt — double-click, refresh, redelivered job — collapse into one charge and one prompt. |
 | **Webhook signatures** | HMAC over `${timestamp}.${rawBody}`, constant-time compare, timestamp tolerance, and the raw body must survive your JSON middleware. Every one of those is easy to get subtly, silently wrong — and getting it wrong means anyone can forge a "payment succeeded". | `paylod.webhook(handler)` — verified, typed, and it shouts at you if your body parser ate the raw bytes. |
 | **Error decoding** | You end up writing `switch (resultCode) { case 1032: ... case 2001: ... }` from a forum post, with wrong text. (`2001` is a *wrong PIN* — it is **not** a credentials error, despite what the raw `ResultDesc` implies.) | `outcome.message` — already decoded, from the same catalog the API uses. Render it directly. |
 | **Phone formats** | Customers give you `0712…`, `+254712…`, `254712…`, `0712 345 678`. Daraja accepts exactly one of those. | Normalised locally, before the request leaves your process. |
@@ -156,10 +158,11 @@ Fire the STK push and return as soon as the prompt is on the phone.
 const ack = await paylod.collect({
   amount: 100,                    // positive INTEGER KES, ≤ 150000 (M-Pesa rejects decimals)
   phone: "0712345678",            // any Kenyan format
-  idempotencyKey: "order-42",     // PASS THIS. Your order id. Replaying it returns the original
-                                  //   payment instead of sending a second STK prompt — this is
-                                  //   what stops a double-click charging twice. Omit it and the
-                                  //   SDK warns, because every call then becomes a new charge.
+  idempotencyKey: attempt.id,     // PASS THIS. One key per payment ATTEMPT — not the order, and
+                                  //   never the product. Duplicates of that attempt collapse into
+                                  //   one payment and one prompt. A retry after a wrong PIN is a
+                                  //   NEW attempt and needs a NEW key. Omit it and the SDK warns,
+                                  //   because every call then becomes a new charge.
   accountReference: "order-42",   // optional, ≤ 12 chars — your correlation id, returned as
                                   //   `accountRef`. Shown to the payer only on a Paybill
                                   //   (it is the account number); a Till never displays it.
@@ -259,7 +262,7 @@ if (outcome.paid) await fulfilOrder(outcome.receipt);
 |---|---|
 | `PaylodInvalidRequestError` | You passed a bad amount/phone. A bug in your code. |
 | `PaylodConfigError` | No API key. A bug in your deploy. |
-| `PaylodApiError` | Non-2xx from paylod (`.status`, `.isAuthError`, `.isRateLimited`, `.isIdempotencyConflict`). |
+| `PaylodApiError` | Non-2xx from paylod (`.status`, `.isAuthError`, `.isRateLimited`, `.isIdempotencyConflict` — and `.isIdempotencyIndeterminate` / `.isIdempotencyInProgress` / `.isIdempotencyBodyConflict` to tell the three `409`s apart. **Indeterminate is a stop signal**: read the status, then retry with a NEW key). |
 | `PaylodConnectionError` | The network failed after retries. |
 | `PaylodTimeoutError` | Still `pending` at the deadline. |
 
@@ -456,19 +459,57 @@ interface WebhookEvent {
 
 **This is the section that stops you charging a customer twice. Read it.**
 
-Pass `idempotencyKey`, and pass **the id of the thing being paid for** — an order id, an invoice number. Not a random value.
+An idempotency key names **one payment attempt**. Duplicate deliveries of that one attempt — a double-click, a refreshed tab, a job-queue redelivery, an internal network retry — collapse into a single charge. That is the guarantee, and it is narrower than "reusing a key is always a safe retry".
 
 ```ts
-await paylod.collectAndWait({ amount, phone, idempotencyKey: order.id });
+const attempt = await db.attempts.create({ orderId: order.id });   // a row per press of Pay
+await paylod.collectAndWait({ amount, phone, idempotencyKey: attempt.id });
 ```
 
-- **Same key + same body** → paylod returns the **original payment** — same `paymentId`, same `checkoutRequestId`. No second STK prompt. No double charge.
-- **Same key + different body** → `409`, surfaced as `PaylodApiError` with `.isIdempotencyConflict === true`. Always a bug on your side (you changed the amount but kept the key).
-- **Internal retries** (network blip, 5xx, 429) reuse the *same* key, which is what makes retrying a `POST` safe.
+### Pass a key per attempt — not per order, and not per product
 
-### Why you have to supply it
+The key must be **stable across duplicates of one attempt** and **fresh for a genuinely new charge**. An order id is stable, but it is not fresh — and a product id is neither:
 
-Only your application knows that a retry of order 1042 is **the same charge**, and not the customer deliberately buying a second coffee. paylod cannot infer that, so it cannot generate this for you.
+| Key you pass | What happens |
+| --- | --- |
+| An id minted per **payment attempt** | Correct. Duplicates of that attempt collapse; a new attempt is a new charge. |
+| Your **order id** | The customer mistypes their PIN, you retry the same order — and paylod replays the **failed** first attempt instead of charging them. The order never gets paid. |
+| A **product id** (or any value reused across purchases) | Catastrophic. Every customer after the first replays the **first-ever** payment for that product. Nobody after customer one is charged at all. |
+| `crypto.randomUUID()` **per call** | Equivalent to no key: a double-click is two keys, two prompts, two charges. |
+
+The rule that resolves all four: **mint the key when a payment attempt begins, persist it on that attempt, and never reuse it for a different charge.** A retry after a wrong PIN, a cancelled prompt or a timeout is a *new attempt* — new row, new key.
+
+### A concurrent double-click cannot double-charge
+
+This part is unconditional. Fire ten simultaneous requests with the same `Idempotency-Key` and you get **one** payment and **one** STK push: the key is reserved before the provider is called, so exactly one request wins and the others replay its answer. All ten come back with the same `paymentId`.
+
+### The one case where the same key is *not* a safe retry
+
+If a request dies mid-flight against Daraja — after paylod handed the call to the provider, before an answer came back — that key is **spent**. A retry under it is not silently re-dispatched. It returns `409` **indeterminate**:
+
+```text
+A previous request with this Idempotency-Key was interrupted while the provider call was
+in flight, so it may or may not have completed. We will not repeat it — that could charge
+or pay twice. Check the payment/disbursement status; if nothing happened, retry with a NEW key.
+```
+
+A timeout is not evidence that the money did not move; it is the absence of evidence. So paylod refuses to guess. **For money, at-most-once beats at-least-once** — we would rather make you check than charge someone twice.
+
+> [!WARNING]
+> **The indeterminate `409` is a STOP signal, not a retry signal.** Read the payment status first
+> — `paylod.check(paymentId)`, `GET /status/:id`, or your webhook — and only then decide. If the
+> payment settled, you are done. If nothing happened, start a **new attempt with a new key**.
+> Retrying under the spent key returns the same `409`, forever.
+
+### The rules
+
+- **Same key + same body, already settled** → the original payment is replayed. Same `paymentId`, same `checkoutRequestId`. No second prompt, no second debit.
+- **Same key + same body, first request still in flight** → `409` with a `Retry-After` (`.isIdempotencyInProgress`), or — for a plain double-click — the SDK simply waits for the winner and hands you its response.
+- **Same key + different body** → `409` (`.isIdempotencyBodyConflict`). Always a bug on your side: two different charges collided on one key (you changed the amount but kept the key).
+- **Same key, previous attempt interrupted against the provider** → `409` **indeterminate** (`.isIdempotencyIndeterminate`). Check status; retry with a **new** key. Never re-dispatched.
+- **Internal retries** (network blip, `5xx`, `429`) reuse the same key automatically — which is what makes retrying a `POST` safe in the first place. If the interruption happened against Daraja, that retry surfaces the indeterminate `409` rather than charging again.
+
+All four are `PaylodApiError` with `.isIdempotencyConflict === true`; the three getters above tell you *which* `409` you have, and only one of them is your bug.
 
 ### What happens if you omit it
 
@@ -476,12 +517,13 @@ The SDK generates a fresh UUID per call and returns it on the ack:
 
 ```ts
 const ack = await paylod.collect({ amount: 100, phone: "0712345678" });
-ack.idempotencyKey; // persist this before you retry, or the retry is a NEW charge
+ack.idempotencyKey; // persist it on the attempt — retrying THAT attempt with THAT key collapses
+                    // into the original payment. A genuinely new attempt needs a new key.
 ```
 
 That protects an internal *network* retry of that one call. It does **nothing** about your application sending the same logical charge twice:
 
-| What the user does | With `idempotencyKey: order.id` | Without |
+| What the user does | With a per-attempt key | Without |
 | --- | --- | --- |
 | Double-clicks **Pay** | 1 prompt, 1 charge | **2 prompts, 2 charges** |
 | Refreshes the tab and re-submits | 1 prompt, 1 charge | **2 prompts, 2 charges** |
@@ -490,9 +532,10 @@ That protects an internal *network* retry of that one call. It does **nothing** 
 A double-clicked button is by far the most common way a real customer gets double-charged, so the SDK emits a one-time `console.warn` when you call `collect()` / `collectAndWait()` without a key. The only way to silence it is to pass a real one.
 
 > [!WARNING]
-> Do **not** silence the warning with `idempotencyKey: crypto.randomUUID()` or `Date.now()`. A key
-> that is different on every call is exactly equivalent to having no key at all — it just hides the
-> warning telling you you're exposed.
+> Do **not** silence the warning with `idempotencyKey: crypto.randomUUID()` or `Date.now()` **at
+> the call site**. A key that changes on every call is exactly equivalent to having no key at all
+> — it just hides the warning telling you the customer is exposed. A random UUID is a perfectly
+> good key; it just has to be minted **once per attempt** and stored, not generated inside the call.
 
 ---
 

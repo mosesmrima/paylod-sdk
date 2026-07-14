@@ -26,8 +26,9 @@ export interface CollectParams {
    * still correlatable back to the payment.
    *
    * NOTE: this is a *label*, not a lock. It does not deduplicate anything — putting your order id
-   * here does not stop a second charge. {@link idempotencyKey} is what does that. Passing your
-   * order id to both is a good idea.
+   * here does not stop a second charge. {@link idempotencyKey} is what does that, and it is a
+   * different job: the order id belongs HERE, while `idempotencyKey` must be a per-ATTEMPT id.
+   * Never pass the same value to both.
    */
   readonly accountReference?: string;
   /** Shown on the STK prompt. 1–64 chars. Defaults to `Payment`. */
@@ -41,21 +42,34 @@ export interface CollectParams {
    */
   readonly metadata?: Record<string, unknown>;
   /**
-   * **The thing that stops you charging a customer twice.** Pass the id of what is being paid
-   * for — an order id, an invoice number — not a fresh random value:
+   * **The thing that stops you charging a customer twice.** It names ONE PAYMENT ATTEMPT — one
+   * press of Pay. Mint it when the attempt begins, persist it on that attempt, and never reuse it
+   * for a different charge:
    *
    * ```ts
-   * await paylod.collectAndWait({ phone, amount, idempotencyKey: order.id });
+   * const attempt = await db.attempts.create({ orderId: order.id });
+   * await paylod.collectAndWait({ phone, amount, idempotencyKey: attempt.id });
    * ```
    *
-   * Send the same key twice and the second call returns the *original* payment — same
-   * `paymentId`, same `checkoutRequestId` — rather than firing a second STK prompt. So a
-   * double-clicked Pay button, a refreshed tab, or a retried request charges once.
-   * Same key + a *different* body → `409` (that means two different charges collided on one key:
-   * a bug on your side).
+   * The key must be **stable across duplicates of one attempt** and **fresh for a genuinely new
+   * charge**:
    *
-   * Only you can supply this: paylod cannot know that a retry of order 1042 is the same charge
-   * rather than the customer deliberately buying again.
+   * | Key you pass | What happens |
+   * | --- | --- |
+   * | An id minted per **payment attempt** | Correct. Duplicates collapse; a new attempt is a new charge. |
+   * | Your **order id** | Stable, but never fresh. A retry after a wrong PIN replays the FAILED attempt — that order can never be paid. |
+   * | A **product id** (reused across purchases) | Catastrophic. Every customer after the first replays the first-ever payment. Nobody after customer one is charged. |
+   * | `crypto.randomUUID()` at the call site | Equivalent to no key: a double-click is two keys, two prompts, two charges. |
+   *
+   * **Concurrency is unconditionally safe.** The key is reserved before Daraja is called, so ten
+   * simultaneous requests with the same key produce ONE payment and ONE STK push.
+   *
+   * **A `409` indeterminate is a STOP signal, not a retry signal.** If an earlier request under
+   * this key died mid-flight against Daraja, the key is spent: paylod will not re-dispatch it,
+   * because a timeout is not evidence the money did not move. Read the payment status first
+   * (`paylod.check(paymentId)`); only if nothing happened, start a new attempt with a NEW key.
+   * For money, at-most-once beats at-least-once. Same key + a *different* body is a different
+   * `409` — two charges collided on one key, always a bug on your side.
    *
    * **If you omit it**, the SDK generates a fresh key for each call. That makes an internal
    * network retry of one call safe, but it does NOT stop your application from sending the same
@@ -154,7 +168,10 @@ export interface PaylodOptions {
    * immediately otherwise, so this flag can never point at production, even by accident.
    *
    * `idempotencyKey` is honoured here exactly as it is in production: the same key returns the
-   * SAME simulated payment (same `paymentId`, no second row), a different key creates a new one.
+   * SAME simulated payment (same `paymentId`, no second row), concurrent duplicates collapse into
+   * one, a different key creates a new payment, and the same key with a *different body* is
+   * rejected. The whole body — `description` and `metadata` included — is forwarded, so the
+   * fingerprint the simulator computes is the one production computes.
    * So a test asserting "a double-click cannot charge twice" tests the real thing.
    */
   readonly simulate?: boolean;

@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   Paylod,
+  PaylodApiError,
   PaylodSandboxOnlyError,
   PaylodInvalidRequestError,
   SIM_OUTCOMES,
@@ -286,6 +287,58 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
     expect(b.paymentId).toBe(a.paymentId);
     expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-1042");
     expect(m.calls[1]!.headers["idempotency-key"]).toBe("order-1042");
+  });
+
+  // The idempotency layer fingerprints the request BODY. So any field the simulator never sees is
+  // a field it cannot fingerprint — and a reused key with changed `metadata` would 409 in
+  // production while silently REPLAYING here. That is precisely the false confidence the simulator
+  // exists to remove: a developer's test asserting "a reused key with a changed body is rejected"
+  // would go green against the simulator and be WRONG in production.
+  //
+  // These two fail against 0.3.0, which forwarded only { phone, amount, accountReference, key }.
+  it("simulate mode forwards the FULL body — `description` and `metadata` included", async () => {
+    const m = mockFetch([{ status: 202, json: SIM_ACK }]);
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+
+    await paylod.collect({
+      amount: 250,
+      phone: "0712345678",
+      accountReference: "INV-2041",
+      description: "Order #2041",
+      metadata: { attemptId: "a1" },
+      idempotencyKey: "attempt-1",
+    });
+
+    const body = m.calls[0]!.body as Record<string, unknown>;
+    expect(body.description).toBe("Order #2041");
+    expect(body.metadata).toEqual({ attemptId: "a1" });
+    expect(body.accountRef).toBe("INV-2041");
+    expect(body.amount).toBe(250);
+  });
+
+  it("a reused key with only `metadata` changed reaches the backend as a DIFFERENT body → 409", async () => {
+    const m = mockFetch([
+      { status: 202, json: SIM_ACK },
+      { status: 409, json: { error: "Idempotency-Key was reused with a different request body" } },
+    ]);
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+
+    const base = { amount: 250, phone: "0712345678", idempotencyKey: "attempt-1" } as const;
+    await paylod.collect({ ...base, metadata: { attemptId: "a1" } });
+
+    const err = await paylod
+      .collect({ ...base, metadata: { attemptId: "a2" } })
+      .catch((e: unknown) => e as PaylodApiError);
+
+    // The bodies the SDK actually put on the wire must DIFFER — otherwise the backend has nothing
+    // to 409 on, and the simulator replays where production rejects.
+    expect((m.calls[0]!.body as Record<string, unknown>).metadata).toEqual({ attemptId: "a1" });
+    expect((m.calls[1]!.body as Record<string, unknown>).metadata).toEqual({ attemptId: "a2" });
+
+    expect(err).toBeInstanceOf(PaylodApiError);
+    expect((err as PaylodApiError).status).toBe(409);
+    expect((err as PaylodApiError).isIdempotencyBodyConflict).toBe(true);
+    expect((err as PaylodApiError).isIdempotencyIndeterminate).toBe(false);
   });
 
   it("simulate.collect() forwards an explicit idempotencyKey", async () => {

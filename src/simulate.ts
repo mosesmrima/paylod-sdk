@@ -68,11 +68,19 @@ export interface SimulateCollectParams {
   readonly amount?: number;
   /** Your correlation id, echoed back on the status read and the webhook. 1–32 chars. */
   readonly accountReference?: string;
+  /** Same meaning as on `collect()`. Part of the idempotency fingerprint, so it is forwarded. */
+  readonly description?: string;
+  /** Same meaning as on `collect()`. Part of the idempotency fingerprint, so it is forwarded. */
+  readonly metadata?: Record<string, unknown>;
   /**
-   * Same meaning as on `collect()`: send the same key twice and you get the SAME simulated payment
-   * back — same `paymentId`, no second row — instead of a new one. The simulator runs the same
-   * idempotency layer production does, which is what lets a "a double-click must not charge twice"
-   * test actually prove something.
+   * Same meaning as on `collect()`: one key per payment ATTEMPT. Send the same key twice and you
+   * get the SAME simulated payment back — same `paymentId`, no second row. Concurrent duplicates
+   * collapse into one. Reuse it with a *different body* and you get the same `409` production
+   * gives you — which is why every body field, `description` and `metadata` included, is
+   * forwarded here rather than dropped.
+   *
+   * The simulator runs the same idempotency layer production does, which is what lets a "a
+   * double-click must not charge twice" test actually prove something.
    */
   readonly idempotencyKey?: string;
 }
@@ -213,6 +221,12 @@ export class Simulator {
     // The backend calls this field `accountRef`; the rest of the SDK calls it `accountReference`.
     // Speak the SDK's language to the caller and the backend's language on the wire.
     if (params.accountReference !== undefined) body.accountRef = params.accountReference;
+    // Send the FULL body. The idempotency layer fingerprints the request body, so any field we
+    // drop here is a field the simulator cannot fingerprint — and a reused key with changed
+    // `description`/`metadata` would 409 in production while silently REPLAYING in the simulator.
+    // A simulator that certifies the opposite of production is worse than no simulator.
+    if (params.description !== undefined) body.description = params.description;
+    if (params.metadata !== undefined) body.metadata = params.metadata;
 
     const ack = await this.#request<{
       paymentId: string;
