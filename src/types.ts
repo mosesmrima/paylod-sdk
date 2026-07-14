@@ -16,7 +16,12 @@ export interface CollectParams {
   readonly amount: number;
   /** Any Kenyan format: `0712345678`, `+254712345678`, `254712345678`, `712345678`. */
   readonly phone: string;
-  /** Shown on the customer's handset and statement. 1–12 chars. Defaults to `collect`. */
+  /**
+   * Your correlation id (invoice/order number), returned as `accountRef` on the status read
+   * and on the webhook. Shown to the payer only on a Paybill, where it is the account number
+   * they are paying into; a Till (Buy Goods) never displays it — the payer sees just your
+   * business name and the amount. 1–12 chars. Defaults to `collect`.
+   */
   readonly accountReference?: string;
   /** Shown on the STK prompt. 1–64 chars. Defaults to `Payment`. */
   readonly description?: string;

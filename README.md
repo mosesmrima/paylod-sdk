@@ -143,9 +143,11 @@ Fire the STK push and return as soon as the prompt is on the phone.
 const ack = await paylod.collect({
   amount: 100,                    // positive INTEGER KES, ≤ 150000 (M-Pesa rejects decimals)
   phone: "0712345678",            // any Kenyan format
-  accountReference: "order-42",   // optional, ≤ 12 chars — shown on the handset
+  accountReference: "order-42",   // optional, ≤ 12 chars — your correlation id, returned as
+                                  //   `accountRef`. Shown to the payer only on a Paybill
+                                  //   (it is the account number); a Till never displays it.
   description: "Coffee",          // optional, ≤ 64 chars — shown on the prompt
-  metadata: { orderId: "42" },    // optional, echoed back on the webhook
+  metadata: { orderId: "42" },    // optional, stored — NOT returned on /status or the webhook
   idempotencyKey: "order-42",     // optional — one is generated if you omit it
 });
 
