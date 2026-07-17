@@ -60,7 +60,7 @@ export {
   type StkOutcome,
 } from "./daraja-catalog.js";
 
-export { normalizePhone } from "./phone.js";
+export { normalizePhone, normalizeMsisdn, isValidMsisdn, MSISDN_INPUT_RE } from "./phone.js";
 
 export {
   verifyWebhook,

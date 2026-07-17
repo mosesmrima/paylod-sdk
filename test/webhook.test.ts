@@ -48,6 +48,30 @@ describe("signature scheme parity with the backend", () => {
   it("uses the x-webhook-signature header name", () => {
     expect(SIGNATURE_HEADER).toBe("x-webhook-signature");
   });
+
+  // SHARED GOLDEN VECTOR — the SAME secret+timestamp+body+expected-hex is pinned, byte-for-byte,
+  // in paylod-cli (src/lib/webhook.test.ts) and mirrors the backend signer
+  // (supabase/functions/_shared/webhooks/sign.ts). If any of the three signing/verifying impls
+  // drifts, its copy of this vector fails — that is the guard against silent cross-repo drift.
+  // DO NOT edit these literals to "fix" a failure: a mismatch means the scheme itself changed.
+  it("matches the shared golden vector (cross-repo drift guard)", () => {
+    const GOLDEN_SECRET = "whsec_golden_vector_v1";
+    const GOLDEN_T = 1_700_000_000;
+    const GOLDEN_BODY =
+      '{"type":"payment.success","created":1700000000,"data":{"paymentId":"pay_golden","amount":100,"phone":"254712345678"}}';
+    const GOLDEN_HEADER =
+      "t=1700000000,v1=3afe38e4c11734c84fad70dd16bbaeec6057ca998236f253be6bfa09ad2c2eb7";
+
+    expect(signWebhook(GOLDEN_BODY, GOLDEN_SECRET, GOLDEN_T)).toBe(GOLDEN_HEADER);
+    // And the verifier accepts its own signer's golden output (freshness disabled — t is fixed).
+    const event = verifyWebhook({
+      payload: GOLDEN_BODY,
+      signature: GOLDEN_HEADER,
+      secret: GOLDEN_SECRET,
+      toleranceSec: 0,
+    });
+    expect(event.data.paymentId).toBe("pay_golden");
+  });
 });
 
 describe("verifyWebhook", () => {
