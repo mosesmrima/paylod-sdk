@@ -14,11 +14,11 @@
   ],
   "homepage": "https://paylod.dev/docs/sdk",
   "bugs": {
-    "url": "https://github.com/paylod/node/issues"
+    "url": "https://github.com/mosesmrima/paylod-sdk/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/paylod/node.git"
+    "url": "git+https://github.com/mosesmrima/paylod-sdk.git"
   },
   "license": "MIT",
   "author": "paylod / Moses Mrima",
