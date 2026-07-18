@@ -27,13 +27,38 @@
  * That is the difference between a protection and a suggestion.
  */
 
-import { PaylodConfigError, PaylodConnectionError } from "./errors.js";
+import {
+  PaylodConfigError,
+  PaylodConnectionError,
+  PaylodResponseTooLargeError,
+  PaylodSecurityError,
+} from "./errors.js";
 
 /** The one origin family a paylod key may ever be addressed to. */
 export const ALLOWED_HOSTS = new Set(["paylod.dev", "api.paylod.dev"]);
 
 /** Ports we accept on the canonical origin. Anything else is a redirect to somebody's listener. */
 export const ALLOWED_PORTS = new Set(["", "443"]);
+
+/**
+ * Hard ceiling on a response body we will buffer, in bytes.
+ *
+ * A paylod response is a few hundred bytes; the largest legitimate one is a decoded error and is
+ * still under a kilobyte. 1 MiB is three orders of magnitude of headroom and still far below
+ * anything that threatens a process.
+ *
+ * The per-request timeout bounds how LONG a response may take. Nothing bounded how BIG it could
+ * be, and the two are independent: a body that streams fast and never ends stays inside the
+ * timeout the whole way to an OOM. Losing the process to OOM after `POST /collect` loses the
+ * idempotency key for a charge that may be live on a customer's handset — the exact handle the
+ * rest of this SDK works to preserve.
+ */
+export const MAX_RESPONSE_BYTES = 1_048_576;
+
+/** UTF-8 byte length without allocating a Buffer copy of the whole string. */
+function byteLengthOf(s: string): number {
+  return new TextEncoder().encode(s).byteLength;
+}
 
 /**
  * A monotonic millisecond clock.
@@ -283,7 +308,7 @@ export class Transport {
 
       this.#assertNotRedirected(res, url);
 
-      // THE BODY IS READ INSIDE THE TIMEOUT WINDOW.
+      // THE BODY IS READ INSIDE THE TIMEOUT WINDOW, AND UNDER A BYTE CAP.
       //
       // Previously the abort listener was detached and the timer cleared in a `finally` that ran
       // before `res.text()` was called. A server (or a proxy) that sent headers promptly and
@@ -291,7 +316,13 @@ export class Transport {
       // so a request with a 30s timeout could hang indefinitely, and a `wait()` with a deadline
       // could overrun it without limit. Reading here, before the `finally`, keeps the whole
       // exchange under the one deadline the caller asked for.
-      const text = await res.text().catch(() => "");
+      //
+      // The timeout bounds the TIME. It does not bound the MEMORY: a body that arrives quickly
+      // and never stops arriving is buffered in full by `res.text()`, and the process dies of
+      // OOM. After a `POST /collect` that is the worst possible moment to die, because the
+      // idempotency key dies with the process and the charge may already be live on a handset.
+      // So the read is incremental and capped.
+      const text = await this.#readCapped(res);
 
       return {
         status: res.status,
@@ -310,17 +341,84 @@ export class Transport {
     return this.#origin;
   }
 
+  /**
+   * Read a response body incrementally, refusing it once it passes {@link MAX_RESPONSE_BYTES}.
+   *
+   * `res.text()` is all-or-nothing: by the time it resolves the whole body is already resident, so
+   * checking `text.length` afterwards checks a limit that has already been exceeded. The stream is
+   * consumed chunk by chunk instead and abandoned the moment the budget is gone — the point of the
+   * cap is that the bytes are never allocated, not that they are measured.
+   *
+   * A body we could not fully read is INDETERMINATE, never an empty success: returning `""` here
+   * would hand `#request` a body it would parse as `null` and, on a 2xx, run the validators
+   * against — turning "the response was too big to read" into "the server sent an empty ack".
+   *
+   * The `body === null` fallback covers a synthesised `Response` with no stream (the common shape
+   * in tests) and any runtime that does not expose one; `res.text()` is bounded in that case by
+   * the same cap applied after the fact, which is all that is available.
+   */
+  async #readCapped(res: Response): Promise<string> {
+    const body = res.body as ReadableStream<Uint8Array> | null | undefined;
+
+    if (!body || typeof body.getReader !== "function") {
+      const text = await res.text().catch(() => "");
+      if (byteLengthOf(text) > MAX_RESPONSE_BYTES) throw this.#tooLarge();
+      return text;
+    }
+
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > MAX_RESPONSE_BYTES) throw this.#tooLarge();
+        chunks.push(value);
+      }
+    } catch (e) {
+      if (e instanceof PaylodResponseTooLargeError) throw e;
+      // A truncated / aborted read is a transport failure, not a body. Empty string lets the
+      // caller's normal non-2xx and validator paths decide, exactly as before this change.
+      return "";
+    } finally {
+      // Release the socket rather than leaving a half-read stream pinned open.
+      reader.cancel().catch(() => {});
+    }
+
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const c of chunks) {
+      joined.set(c, at);
+      at += c.byteLength;
+    }
+    return new TextDecoder().decode(joined);
+  }
+
+  #tooLarge(): PaylodResponseTooLargeError {
+    return new PaylodResponseTooLargeError(
+      this.#redact(
+        `paylod's response exceeded ${MAX_RESPONSE_BYTES} bytes and was refused before it was ` +
+          `buffered. The request DID reach paylod, so the state of anything it may have changed ` +
+          `is INDETERMINATE — read the payment rather than retrying, and never mint a fresh ` +
+          `idempotency key on the strength of this error.`,
+      ),
+    );
+  }
+
   #assertOnOrigin(candidate: string, what: string): void {
     let origin: string;
     try {
       origin = new URL(candidate).origin;
     } catch {
-      throw new PaylodConnectionError(
+      throw new PaylodSecurityError(
         this.#redact(`${what} is not a valid URL (${safeUrl(candidate)}).`),
       );
     }
     if (origin !== this.#origin) {
-      throw new PaylodConnectionError(
+      throw new PaylodSecurityError(
         this.#redact(
           `Refusing a request that is not addressed to the pinned paylod origin: ${what} ` +
             `resolves to "${origin}", but this client is pinned to "${this.#origin}". Your API ` +
@@ -350,7 +448,7 @@ export class Transport {
    */
   #assertNotRedirected(res: Response, requested: string): void {
     if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
-      throw new PaylodConnectionError(
+      throw new PaylodSecurityError(
         this.#redact(
           `paylod returned an unexpected redirect (HTTP ${res.status || "opaque"}) from ${requested}. ` +
             `Refusing to follow it — a cross-origin redirect could leak your Authorization header ` +
@@ -360,7 +458,7 @@ export class Transport {
     }
 
     if (res.redirected === true) {
-      throw new PaylodConnectionError(
+      throw new PaylodSecurityError(
         this.#redact(
           `The fetch implementation FOLLOWED a redirect even though this SDK requested ` +
             `redirect: "manual". Your Authorization header may already have been replayed to ` +

@@ -132,6 +132,21 @@ const PENDING_DESC_RE =
   /\b(?:still\s+under\s+processing|is\s+being\s+processed|still\s+processing|being\s+processed)\b/i;
 
 /**
+ * The ONLY form a Daraja numeric result code is ever written in: bare decimal digits, no sign, no
+ * leading zeros, no exponent, no radix prefix, no fractional part.
+ *
+ * This exists because `Number()` is not a format check. `Number("0e999")`, `Number("+0")`,
+ * `Number("00")`, `Number("0.0")`, `Number("-0")` and `Number("0x0")` are all `0`, so classifying
+ * success with `Number(raw) === 0` accepted six spellings of "I succeeded" that Daraja never
+ * emits — and whoever controls the response body controls that string. The sibling PHP SDK
+ * shipped precisely this and accepted `"0e999"`, `"+0"` and `"00"` as result-code zero.
+ *
+ * Anything failing this test is a code whose FORM we do not recognise. It is neither a success nor
+ * a proven failure; it falls through to the ambiguity rule, which is `pending`.
+ */
+const CANONICAL_CODE_RE = /^(?:0|[1-9][0-9]*)$/;
+
+/**
  * `500.001.1001` is an overloaded Daraja business-error bucket. Under the SAME code it also
  * returns hard, terminal configuration errors. Polling forever on those would be wrong, so a
  * 500.* whose message matches one of these is NOT treated as pending.
@@ -164,9 +179,12 @@ export function classifyStkResult(
 
   if (PENDING_RESULT_CODES.has(raw)) return "pending";
 
-  const n = Number(raw);
-  if (raw !== "" && Number.isFinite(n)) {
-    if (n === 0) return "success";
+  // SUCCESS IS RECOGNISED BY EXACT FORM, NOT BY COERCION. Only the two representations the schema
+  // permits — the number `0` and the string `"0"` — reach here as the normalized `"0"`. See
+  // CANONICAL_CODE_RE for why `Number(raw) === 0` was a "declare yourself paid" primitive.
+  if (raw === "0") return "success";
+
+  if (CANONICAL_CODE_RE.test(raw)) {
     // A known-numeric, non-zero code is terminal — UNLESS the description says otherwise
     // (guards against a new "still processing" code we haven't catalogued yet).
     return PENDING_DESC_RE.test(desc) ? "pending" : "failed";

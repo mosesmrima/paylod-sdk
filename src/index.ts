@@ -5,7 +5,8 @@
  * from a server, a serverless function, or an edge worker — never from client-side code.
  */
 
-export { Paylod, DEFAULT_BASE_URL } from "./client.js";
+export { Paylod, DEFAULT_BASE_URL, MAX_JSON_DEPTH, MAX_WEBHOOK_BODY_BYTES } from "./client.js";
+export { MAX_RESPONSE_BYTES } from "./transport.js";
 export type { ExpressLikeRequest, ExpressLikeResponse } from "./client.js";
 
 export {
@@ -14,7 +15,10 @@ export {
   PaylodConfigError,
   PaylodConnectionError,
   PaylodInvalidRequestError,
+  PaylodResponseTooLargeError,
   PaylodSandboxOnlyError,
+  PaylodSecurityError,
+  PaylodTerminalTransportError,
   PaylodSignatureVerificationError,
   PaylodTimeoutError,
 } from "./errors.js";
@@ -70,8 +74,23 @@ export {
   EVENT_ID_HEADER,
   EVENT_TYPE_HEADER,
   DEFAULT_TOLERANCE_SEC,
+  MAX_TOLERANCE_SEC,
   type VerifyParams,
 } from "./webhook.js";
+
+/**
+ * The semantic model — the ONE total (claim x evidence) table every verdict comes from. Exposed
+ * so the sibling SDKs and their conformance tests can assert against the same rules.
+ */
+export {
+  judge,
+  evidenceFor,
+  hasReceipt,
+  hasResultCode,
+  type PaymentEvidence,
+  type PaymentJudgement,
+  type PaymentVerdict,
+} from "./semantics.js";
 
 export type {
   CollectAck,

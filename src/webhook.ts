@@ -17,6 +17,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodSignatureVerificationError } from "./errors.js";
+import { decodeDarajaResult } from "./daraja-catalog.js";
 import { judge } from "./semantics.js";
 import { asPaymentStatus, PAYMENT_STATUSES } from "./validate.js";
 import type { WebhookEvent } from "./types.js";
@@ -27,6 +28,21 @@ export const EVENT_TYPE_HEADER = "x-webhook-event";
 
 /** Default anti-replay window, seconds. Mirrors the server's `maxSkewSeconds`. */
 export const DEFAULT_TOLERANCE_SEC = 300;
+
+/**
+ * The widest replay window this SDK will accept, in seconds (24 hours).
+ *
+ * A lower bound alone does not protect anything. `toleranceSec` was required to be a positive
+ * integer, which `86_400_000` satisfies — and at that value every captured webhook stays valid for
+ * three thousand years, i.e. replay protection is off while every check still reads as enabled.
+ * That is worse than no check, because it looks like one.
+ *
+ * A day is already far beyond any legitimate need: paylod signs with the event's own `created`
+ * timestamp and gives up redelivering long before then, so a tolerance wider than this cannot be
+ * accepting anything but an attack or a badly wrong clock. Callers verifying a genuinely ancient
+ * fixed vector should pin `nowSec` instead of widening the window — that is what it is for.
+ */
+export const MAX_TOLERANCE_SEC = 86_400;
 
 export interface VerifyParams {
   /** The EXACT bytes of the request body. Never a re-serialised object. */
@@ -159,13 +175,16 @@ export function verifyWebhookSignature(params: VerifyParams): unknown {
   // verifier with replay protection switched off. `Infinity` was accepted too, which is the same
   // hole spelled differently — an infinite window. Fixed-vector tests do not need the hatch: they
   // can pin `nowSec` at the vector's own `t` and pass a normal positive tolerance.
-  if (!Number.isInteger(toleranceSec) || toleranceSec <= 0) {
+  if (!Number.isInteger(toleranceSec) || toleranceSec <= 0 || toleranceSec > MAX_TOLERANCE_SEC) {
     throw new PaylodSignatureVerificationError(
       "insecure_tolerance",
-      `toleranceSec must be a finite positive integer number of seconds (got ${toleranceSec}). ` +
-        "Zero, negative, fractional, and non-finite values are refused: there is no way to " +
-        "disable webhook replay protection. To verify a fixed/ancient vector, pin the clock with " +
-        "`nowSec` and keep a normal tolerance such as the 300s default.",
+      `toleranceSec must be a finite positive integer number of seconds, no greater than ` +
+        `${MAX_TOLERANCE_SEC} (got ${toleranceSec}). ` +
+        `Zero, negative, fractional, and non-finite values are refused: ` +
+        "there is no way to disable webhook replay protection. An ENORMOUS tolerance is refused " +
+        "for the same reason spelled differently — a window of years is not a freshness check, " +
+        "it is the absence of one wearing a check's clothes. To verify a fixed/ancient vector, " +
+        "pin the clock with `nowSec` and keep a normal tolerance such as the 300s default.",
     );
   }
 
@@ -343,7 +362,35 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
     );
   }
 
-  return body as WebhookEvent;
+  // 4. THE DECODED BLOCK IS RECOMPUTED, NEVER TRUSTED.
+  //
+  // `data.decoded` arrives inside the signed body, and it carries `retryable` — the one boolean in
+  // this SDK that means SAFE TO CHARGE AGAIN. Passing it through as sent gives whoever produced
+  // the payload a direct vote on whether the merchant charges the customer a second time: a block
+  // claiming `retryable: true` beside result code 4999 (the customer is mid-PIN, the prompt is
+  // LIVE) is an instruction to double-charge, and it would have been handed to the handler with a
+  // valid signature on it. The sibling JVM SDK trusted this block.
+  //
+  // A signature proves WHO sent the body. It does not make the body's opinions correct, and the
+  // signing key is exactly what a compromise takes first. So the block is rebuilt here from the
+  // canonical catalog, keyed on the fields we DID validate (`resultCode` / `resultDesc`) — the
+  // same call `decodeError()` and `check()` make. The payload's own block is discarded.
+  //
+  // Null in, null out: the contract is that `decoded` is populated on `payment.failed` and null on
+  // `payment.success`, and recomputing must not start inventing a block where the schema says
+  // there is none.
+  const decoded =
+    d.decoded === null || d.decoded === undefined
+      ? null
+      : decodeDarajaResult(
+          (d.resultCode ?? null) as number | string | null,
+          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        );
+
+  // Rebuilt rather than mutated: the caller owns the object they parsed, and a verifier that
+  // silently edits its input is a surprise nobody needs. Every other field is passed through
+  // exactly as validated.
+  return { ...e, data: { ...d, decoded } } as unknown as WebhookEvent;
 }
 
 /**

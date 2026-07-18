@@ -5,6 +5,8 @@ import {
   PaylodConnectionError,
   PaylodError,
   PaylodInvalidRequestError,
+  PaylodResponseTooLargeError,
+  PaylodTerminalTransportError,
   PaylodTimeoutError,
 } from "./errors.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
@@ -189,6 +191,60 @@ export function parseRetryAfterMs(raw: string | null | undefined, now: number = 
 }
 
 /**
+ * The deepest JSON nesting this SDK will walk in a response body.
+ *
+ * A paylod body is three levels at most (`{ data: { decoded: { … } } }`). Depth matters
+ * independently of size: `[[[[…]]]]` is one byte per level, so a body well inside
+ * `MAX_RESPONSE_BYTES` can still nest tens of thousands deep. `JSON.parse` is recursive, and a
+ * document like that blows the V8 stack — and every consumer that walks the result afterwards
+ * (`#redactDeep`, a logger, an error reporter) blows it again. A RangeError from a stack overflow
+ * is not catchable in a way that preserves the process's footing, and losing the process here
+ * loses the idempotency key for a charge that may already be live.
+ *
+ * 64 is ~20x the deepest real body and still shallow enough that no runtime is troubled by it.
+ */
+export const MAX_JSON_DEPTH = 64;
+
+/**
+ * `JSON.parse` with a depth budget enforced BEFORE the parser recurses.
+ *
+ * The check is a scan of the raw text rather than a walk of the parsed value, which is the whole
+ * point: by the time there is a value to walk, `JSON.parse` has already recursed to the bottom of
+ * the document and the stack has already been consumed. Only structural brackets count — braces
+ * inside string literals are skipped, with escape handling, so a body whose *content* is full of
+ * JSON text is not mistaken for deep nesting.
+ */
+export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === "{" || c === "[") {
+      depth++;
+      if (depth > maxDepth) {
+        throw new PaylodResponseTooLargeError(
+          `paylod's response nests more than ${maxDepth} levels deep and was refused before it ` +
+            `was parsed. The request DID reach paylod, so the state of anything it may have ` +
+            `changed is INDETERMINATE — read the payment rather than retrying, and never mint a ` +
+            `fresh idempotency key on the strength of this error.`,
+        );
+      }
+    } else if (c === "}" || c === "]") depth--;
+  }
+
+  return JSON.parse(text);
+}
+
+/**
  * Guarantee that whatever escapes a money-moving call CARRIES THE EFFECTIVE IDEMPOTENCY KEY.
  *
  * This is the single most important field on a failed charge: it is what lets a caller retry the
@@ -209,18 +265,28 @@ export function parseRetryAfterMs(raw: string | null | undefined, now: number = 
  * An error that already carries the key (the common case: `PaylodApiError` built with it) is
  * returned untouched, so nothing is re-wrapped needlessly and `instanceof` checks keep working.
  */
-function withIdempotencyKey(err: unknown, key: string, redact: (s: string) => string): unknown {
-  // Already correct — the overwhelmingly common path. Never clobber a key an error already set.
-  if (err instanceof PaylodError && err.idempotencyKey !== undefined) return err;
-
+function withIdempotencyKey(
+  err: unknown,
+  key: string,
+  redact: (s: string) => string,
+  paymentId?: string,
+): unknown {
   if (err instanceof PaylodError) {
-    // One of ours, but raised before the key was known. Try the cheap in-place assignment; if the
-    // object is frozen, fall through to wrapping rather than silently losing the key.
+    // One of ours. Fill in whichever half of the handle is missing, in place where we can. Never
+    // clobber a value the error already set — the site that raised it knew more than we do.
+    //
+    // Both halves matter and they do different jobs: the KEY lets the caller replay the same
+    // attempt instead of minting a fresh one (which double-charges), and the PAYMENT ID lets them
+    // READ it. The sibling JVM SDK lost both when a non-`Exception` `Error` escaped after the
+    // acknowledgement, leaving a caller holding a possibly-live charge with no handle on it at all.
     try {
-      err.idempotencyKey = key;
-      if (err.idempotencyKey === key) return err;
+      if (err.idempotencyKey === undefined) err.idempotencyKey = key;
+      if (paymentId !== undefined && err.paymentId === undefined) err.paymentId = paymentId;
+      const keyOk = err.idempotencyKey !== undefined;
+      const idOk = paymentId === undefined || err.paymentId !== undefined;
+      if (keyOk && idOk) return err;
     } catch {
-      /* frozen — wrap below */
+      /* frozen / read-only — wrap below */
     }
   }
 
@@ -236,6 +302,7 @@ function withIdempotencyKey(err: unknown, key: string, redact: (s: string) => st
       "key, which risks charging the customer a second time.",
   );
   wrapped.idempotencyKey = key;
+  if (paymentId !== undefined) wrapped.paymentId = paymentId;
   return wrapped;
 }
 
@@ -517,11 +584,18 @@ export class Paylod {
           ...(opts.signal ? { signal: opts.signal } : {}),
         });
       } catch (e) {
-        // A redirect / origin refusal is a security decision, not a network blip. Retrying it
-        // would just re-send the credential at the same wrong place.
-        if (e instanceof PaylodConnectionError && /redirect|pinned paylod origin/i.test(e.message)) {
-          throw e;
-        }
+        // A redirect / origin refusal is a security decision, not a network blip: the bearer
+        // token may ALREADY have been replayed to another host, so re-dispatching would send it
+        // there again. An over-sized / too-deep response is terminal for a different reason —
+        // the request reached paylod, so the state is INDETERMINATE and a retry would re-charge.
+        //
+        // This used to be a REGEX OVER THE MESSAGE. That made a credential-critical control
+        // depend on prose: reword a message, or have the redactor rewrite part of one, and the
+        // protection silently switched off with no test able to see it. The sibling JVM SDK's
+        // version of this defect was worse still — it raised the detection as a plain connection
+        // error, its retry loop caught it like any blip, and it replayed the leaking credential
+        // twice more. `terminal` is a structural fact about the error, not a description of it.
+        if (e instanceof PaylodTerminalTransportError) throw e;
         lastError = new PaylodConnectionError(
           this.#redact(
             `Could not reach paylod at ${url}: ${e instanceof Error ? e.message : String(e)}`,
@@ -542,8 +616,14 @@ export class Paylod {
       const text = res.text;
       let parsed: unknown;
       try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
+        parsed = text ? parseBounded(text) : null;
+      } catch (e) {
+        // A DEPTH violation is not a parse failure and must not degrade to `parsed = text`: on a
+        // 2xx that would hand the validators a string, which they reject as "not an object" — the
+        // right outcome by luck rather than by rule, and the wrong one on any path that reads the
+        // body more leniently. It is terminal and indeterminate, and it is re-thrown so the
+        // caller's key/payment-id attachment can ride it out.
+        if (e instanceof PaylodResponseTooLargeError) throw e;
         parsed = text;
       }
 
@@ -858,7 +938,7 @@ export class Paylod {
       // catching that error has a charge that is very possibly LIVE and no key to read it with —
       // so the natural recovery is to mint a fresh key and call again, which is a second STK
       // prompt for a payment that may already be settling. The key must ride the error out.
-      throw withIdempotencyKey(err, ack.idempotencyKey, (m) => this.#redact(m));
+      throw withIdempotencyKey(err, ack.idempotencyKey, (m) => this.#redact(m), ack.paymentId);
     }
   }
 

@@ -153,101 +153,125 @@ export function evidenceFor(payment: Payment): PaymentEvidence {
  *     means the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure
  *     is the revenue-losing bug this codebase already shipped twice.
  */
+/** One resolved cell: the verdict, and the one sentence that explains it. */
+type Cell = readonly [PaymentVerdict, string];
+
+/**
+ * A shared reason, used by every `conflict` cell. The two witnesses disagree with EACH OTHER, so
+ * the claim cannot break the tie no matter what it says.
+ */
+const CONFLICT_REASON =
+  "the record carries an M-Pesa receipt alongside a result code that is not a success — " +
+  "the receipt proves money moved and the code denies it, so neither can be trusted";
+
+/**
+ * THE TABLE. Every (claim, evidence) pair, written out.
+ *
+ * ── Why this is a table and not a switch ──────────────────────────────────────────────────
+ * The previous version was a nested `switch` whose arms all returned, plus a trailing
+ * `return of("indeterminate", …)` that TypeScript demands and that nothing could reach. That
+ * shape is exactly what the sibling SDKs got caught by twice: a switch with a reachable tail is
+ * one missing `case` away from silently resolving a claim on the strength of its evidence, and
+ * the tail hides the omission instead of surfacing it. Python "fixed" precisely this hole in an
+ * earlier round and STILL let `pending` + result code 0 resolve to PAID, because the fix was
+ * another branch rather than a structure that cannot have a gap.
+ *
+ * As a mapped type over `Payment["status"] x PaymentEvidence` there is no tail and no default:
+ * omitting a single cell is a COMPILE ERROR, and adding a status or an evidence kind breaks the
+ * build until every new pair has been decided deliberately. `test/semantics.test.ts` asserts the
+ * full 3 x 5 cross-product, so a wrong cell fails a test rather than defaulting quietly.
+ *
+ * The rules the cells encode:
+ *   • Success evidence beside a non-success claim is never paid and never failed — the two
+ *     signals contradict, so it is indeterminate (L3 + L4).
+ *   • A success claim needs evidence to be believed (L2).
+ *   • A failure claim is believed on failure evidence or on silence: proving a payment did NOT
+ *     happen is not something we require evidence for, because the safe action (do not ship,
+ *     do not capture) is the same either way.
+ *   • In-flight evidence outranks a terminal `failed` claim: a `failed` row carrying 4999
+ *     means the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure
+ *     is the revenue-losing bug this codebase already shipped twice.
+ *   • `conflict` is indeterminate under every claim — the claim never gets a vote.
+ */
+const VERDICTS: {
+  readonly [Claim in Payment["status"]]: { readonly [E in PaymentEvidence]: Cell };
+} = {
+  success: {
+    success: ["paid", "status is success and it is backed by a receipt or result code 0"],
+    // L2. This is the "a stubbed endpoint / truncated row / cached proxy envelope can write six
+    // characters of JSON" case. A claim with nothing behind it is not money.
+    none: [
+      "indeterminate",
+      "status claims success but the record carries neither a receipt nor a result code, " +
+        "so there is no evidence the payment actually settled",
+    ],
+    failure: ["indeterminate", "status claims success but the result code is a terminal failure"],
+    in_flight: [
+      "indeterminate",
+      "status claims success but the result code says the payment is still in flight",
+    ],
+    conflict: ["indeterminate", CONFLICT_REASON],
+  },
+
+  pending: {
+    // THE named hole. `{ status: "pending", resultCode: 0 }` used to come back paid, with a null
+    // receipt. A record that simultaneously says "not finished" and "succeeded" is not a success
+    // we may act on — it is a record mid-write, or one we are misreading.
+    success: [
+      "indeterminate",
+      "status says pending while the evidence says the payment succeeded — a pending " +
+        "record must never be reported as paid",
+    ],
+    none: ["in_flight", "the payment is still on the handset"],
+    failure: ["indeterminate", "status says pending while the result code is a terminal failure"],
+    in_flight: ["in_flight", "the payment is still on the handset"],
+    conflict: ["indeterminate", CONFLICT_REASON],
+  },
+
+  failed: {
+    // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
+    // `cancelled, retryable: true` — an explicit invitation to charge twice.
+    success: [
+      "indeterminate",
+      "status claims failed but the evidence proves the payment succeeded — refusing to " +
+        "report a payment that carries proof of settlement as a failure",
+    ],
+    none: ["failed", "the payment failed terminally"],
+    failure: ["failed", "the payment failed terminally"],
+    in_flight: [
+      "in_flight",
+      "status says failed but the result code means the prompt is still live and the " +
+        "customer has not entered their PIN yet",
+    ],
+    conflict: ["indeterminate", CONFLICT_REASON],
+  },
+};
+
 export function judge(payment: Payment): PaymentJudgement {
   const evidence = evidenceFor(payment);
   const claimed = payment.status;
-  const of = (verdict: PaymentVerdict, reason: string): PaymentJudgement => ({
-    verdict,
-    evidence,
-    claimed,
-    reason,
-  });
 
-  // L3/L4: the two witnesses disagree with each other. Nothing else matters.
-  if (evidence === "conflict") {
-    return of(
-      "indeterminate",
-      "the record carries an M-Pesa receipt alongside a result code that is not a success — " +
-        "the receipt proves money moved and the code denies it, so neither can be trusted",
-    );
+  // The claim is INPUT, and input is validated before it is looked up — it is not resolved by a
+  // default. `assertPaymentBody` / `verifyWebhook` already reject a status outside the union, so
+  // this is only reachable when `judge` is called directly with an unchecked record. An
+  // unrecognised claim is not evidence of anything, so the answer is "we do not know" — never a
+  // verdict derived from the evidence alone, which is the substitution this whole module exists
+  // to forbid.
+  const row = Object.prototype.hasOwnProperty.call(VERDICTS, claimed)
+    ? VERDICTS[claimed]
+    : undefined;
+  if (row === undefined) {
+    return {
+      verdict: "indeterminate",
+      evidence,
+      claimed,
+      reason:
+        `the record's status field is ${JSON.stringify(claimed)}, which is not a payment status ` +
+        "this SDK recognises — an unreadable claim is resolved as indeterminate, never by " +
+        "falling back to the evidence",
+    };
   }
 
-  switch (claimed) {
-    case "success":
-      switch (evidence) {
-        case "success":
-          return of("paid", "status is success and it is backed by a receipt or result code 0");
-        case "none":
-          // L2. This is the "a stubbed endpoint / truncated row / cached proxy envelope can
-          // write six characters of JSON" case. A claim with nothing behind it is not money.
-          return of(
-            "indeterminate",
-            "status claims success but the record carries neither a receipt nor a result code, " +
-              "so there is no evidence the payment actually settled",
-          );
-        case "failure":
-          return of(
-            "indeterminate",
-            "status claims success but the result code is a terminal failure",
-          );
-        case "in_flight":
-          return of(
-            "indeterminate",
-            "status claims success but the result code says the payment is still in flight",
-          );
-      }
-      break;
-
-    case "pending":
-      switch (evidence) {
-        case "success":
-          // THE named hole. `{ status: "pending", resultCode: 0 }` used to come back paid, with
-          // a null receipt. A record that simultaneously says "not finished" and "succeeded" is
-          // not a success we may act on — it is a record mid-write, or one we are misreading.
-          return of(
-            "indeterminate",
-            "status says pending while the evidence says the payment succeeded — a pending " +
-              "record must never be reported as paid",
-          );
-        case "failure":
-          return of(
-            "indeterminate",
-            "status says pending while the result code is a terminal failure",
-          );
-        case "none":
-        case "in_flight":
-          return of("in_flight", "the payment is still on the handset");
-      }
-      break;
-
-    case "failed":
-      switch (evidence) {
-        case "success":
-          // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
-          // `cancelled, retryable: true` — an explicit invitation to charge twice.
-          return of(
-            "indeterminate",
-            "status claims failed but the evidence proves the payment succeeded — refusing to " +
-              "report a payment that carries proof of settlement as a failure",
-          );
-        case "in_flight":
-          return of(
-            "in_flight",
-            "status says failed but the result code means the prompt is still live and the " +
-              "customer has not entered their PIN yet",
-          );
-        case "none":
-        case "failure":
-          return of("failed", "the payment failed terminally");
-      }
-      break;
-  }
-
-  /* c8 ignore next 5 -- unreachable: the switches above are total over the union. Kept as a
-     structural backstop so a future status/evidence member cannot silently fall through to a
-     permissive default; the safe answer is always "we do not know". */
-  return of(
-    "indeterminate",
-    `unrecognised payment state (status ${JSON.stringify(claimed)}, evidence ${evidence})`,
-  );
+  const [verdict, reason] = row[evidence];
+  return { verdict, evidence, claimed, reason };
 }

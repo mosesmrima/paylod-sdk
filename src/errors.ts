@@ -26,6 +26,20 @@ export class PaylodError extends Error {
    */
   idempotencyKey?: string | undefined;
 
+  /**
+   * The payment id in effect when this error was raised, when one was known.
+   *
+   * DECLARED alongside {@link idempotencyKey} because after an acknowledgement the two together
+   * are the complete handle on a live charge: the key lets you replay the same attempt, and the
+   * id lets you READ it. The sibling JVM SDK carried neither when a non-`Exception` `Error`
+   * escaped after the ack, so a caller holding a charge that may already be settling had no way
+   * to look it up and no safe way to retry.
+   *
+   * Optional: errors raised before a payment exists (config, validation, the collect call itself)
+   * will not carry one.
+   */
+  paymentId?: string | undefined;
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = new.target.name;
@@ -134,6 +148,49 @@ export class PaylodApiError extends PaylodError {
 export class PaylodConnectionError extends PaylodError {}
 
 /**
+ * A CREDENTIAL-SAFETY violation was detected on a dispatch: the request was addressed off the
+ * pinned origin, a redirect was returned, or the dispatch implementation FOLLOWED a redirect and
+ * handed back a final response from somewhere else.
+ *
+ * ── Why this is its own class ─────────────────────────────────────────────────────────────
+ * It extends {@link PaylodConnectionError} so existing `catch (e instanceof PaylodConnectionError)`
+ * handlers keep working, but it is a distinct type for one reason: IT MUST NEVER BE RETRIED.
+ *
+ * These detections mean the bearer token may ALREADY have been replayed to another host. The
+ * sibling JVM SDK raised exactly this condition as an ordinary connection error, its retry loop
+ * caught it like any other network blip, and it re-sent the request — replaying a credential it
+ * had just concluded was leaking, two more times. A retry cannot help here by construction: a
+ * redirect or an off-origin response is a configuration fault or an attack, never a transient
+ * one, so the second attempt goes to the same wrong place.
+ *
+ * The retry loop previously recognised this case by REGEX-MATCHING the error message. That worked,
+ * but it made a money-and-credential-critical control depend on prose: any rewording of a message
+ * — or the redactor rewriting part of one — silently turned the protection off with no test able
+ * to notice. {@link terminal} is a structural fact about the error instead.
+ */
+export class PaylodTerminalTransportError extends PaylodConnectionError {
+  /** Always `true`. Read by the retry loop; a terminal error is re-thrown, never re-dispatched. */
+  readonly terminal = true;
+}
+
+export class PaylodSecurityError extends PaylodTerminalTransportError {}
+
+/**
+ * The response exceeded the byte or JSON-depth budget, so it was never fully read or parsed.
+ *
+ * This is INDETERMINATE, not a failure: the request reached paylod and may well have moved money —
+ * we simply refused to buffer or walk the answer. Retrying re-sends the charge, so it is terminal,
+ * and the escaping error carries the idempotency key and payment id so the caller can READ the
+ * payment instead of guessing.
+ *
+ * The failure mode this closes is an OOM. A body with no size cap, or a JSON document nested
+ * deeply enough to blow the parser's stack, kills the process AFTER the charge has been
+ * dispatched — which is the single worst moment to lose the handle on it, because the key dies
+ * with the process and the only record of the attempt is gone.
+ */
+export class PaylodResponseTooLargeError extends PaylodTerminalTransportError {}
+
+/**
  * `collectAndWait()` gave up before the payment reached a terminal state.
  *
  * This deliberately THROWS rather than returning `status: "failed"`. A timeout is not a failed
@@ -142,7 +199,8 @@ export class PaylodConnectionError extends PaylodError {}
  * Handle it explicitly: keep the order pending and let the webhook settle it.
  */
 export class PaylodTimeoutError extends PaylodError {
-  readonly paymentId: string;
+  /** Always set here: a timeout is only reachable once a payment exists to time out on. */
+  override readonly paymentId: string;
   /** The last `pending` snapshot we read before giving up. */
   readonly payment: Payment;
   readonly waitedMs: number;
