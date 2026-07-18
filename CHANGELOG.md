@@ -3,6 +3,95 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.5.0
+
+Second-round fixes from a codex **re-verification** of the 0.4.0 security review. The 0.4.0 pass
+was directionally right but incomplete: several of its guards could still be walked around. This
+release closes those gaps.
+
+Signing is still unchanged — the shared golden webhook vector (`whsec_golden_vector_v1` →
+`3afe38e4…2c2eb7`) still passes, byte for byte. Only validation got stricter.
+
+**Minor, not patch:** two of these fixes can reject input that 0.4.0 accepted (see *Breaking*).
+
+### Money-correctness
+
+- **Family-aware decoding is now actually family-aware.** 0.4.0 selected a non-STK entry but still
+  fell back to *any* entry for the code — so a code that exists only under `stk_result` (notably
+  **4999**) decoded as the STK **pending** entry when the caller explicitly asked for `api_error`
+  or `b2c_c2b_result`. That reports a terminal API/result failure as a payment still in flight:
+  the same "false pending" shape as the original 4999 double-charge bug, reached from the other
+  direction. A non-STK family now resolves only to the requested entry or another non-STK entry,
+  and otherwise returns the terminal, non-retryable fallback. An STK pending entry can never be
+  returned for a non-STK surface. (`src/daraja-catalog.ts`, canonical in the paylod monorepo)
+
+### Webhooks
+
+- **Replay protection can no longer be disabled.** `toleranceSec` must be a **finite positive
+  integer**, unconditionally. 0.4.0 rejected a non-positive tolerance only when no clock was
+  injected — so passing a fixed `nowSec` re-opened the bypass — and accepted `Infinity`, which is
+  an infinite freshness window. `0`, negatives, `Infinity`, `NaN` and non-integers are all
+  rejected now, and the freshness check always runs. An injected `nowSec` is validated as a finite
+  non-negative integer for the same reason. (`src/webhook.ts`)
+- **Strict signature timestamp parsing.** `t` is validated lexically as decimal digits only.
+  `Number()` had been accepting `1e3`, `+1000` and hex. (`src/webhook.ts`)
+- **The Express adapter rejects duplicate signature headers.** It previously verified only
+  `header[0]` of a duplicated `paylod-signature`, contradicting the strict duplicate-rejection
+  rule — verifying the first while a downstream hop honours the last is how signature-confusion
+  attacks work. Duplicates are now a flat `400`. (`src/client.ts`)
+
+### Credential safety
+
+- **`baseUrl` is an allowlist, not just an HTTPS check.** HTTPS proves the transport is encrypted,
+  not *who* is on the other end, so 0.4.0 would still send a live bearer key to any `https://`
+  host reachable via a bad env var or a typo. Only **`paylod.dev`** and **`api.paylod.dev`**, over
+  HTTPS on port 443, are accepted. URLs carrying userinfo (`https://user:pass@host`), no host, a
+  non-default port, a query string, a fragment, or a raw/private/loopback/link-local IP are
+  rejected. The explicit test-only loopback exception remains, and is still never permitted with
+  an `mp_live_` key — including over `https://`. (`src/client.ts`)
+- **Idempotency key charset closed.** The 0.4.0 check covered C0 and DEL but let the **C1** block
+  through — including U+0085 (NEL), a line terminator some proxies fold into a newline, i.e. a
+  header-injection vector. The full Unicode control ranges are now rejected, along with Unicode
+  whitespace and zero-width/BOM characters (invisible in logs, so two visually identical keys can
+  silently be different keys — one double charge). Length is bounded by **UTF-8 bytes** (≤255)
+  rather than UTF-16 code units. (`src/client.ts`)
+
+### Cross-SDK standardization
+
+`@paylod/node` is canonical; the PHP and JVM SDKs mirror these shapes.
+
+- **Origin allowlist shape is fixed across SDKs:** exact-match set of `paylod.dev` and
+  `api.paylod.dev` (never a suffix match), port 443 only. `api.paylod.dev` does not route today —
+  an unreachable but owner-controlled host in the allowlist is harmless, and including it avoids a
+  future lockout where published SDKs would reject a legitimate migration until every package is
+  re-released.
+- **Loopback is uniform across schemes.** `https://` loopback now requires the same explicit
+  test-only opt-in as `http://` loopback, and is likewise never permitted with an `mp_live_` key.
+  A local listener holding a valid certificate is still not paylod, so TLS alone must not buy it a
+  pass. (Raised by the PHP SDK agent, where https loopback was slipping through unchecked.)
+- **Any sleep without a deadline is ceilinged at 60s** (`MAX_UNBOUNDED_SLEEP_MS`). A bare
+  `collect()` has no polling budget, so a hostile or buggy `Retry-After: 86400` would otherwise
+  park the caller for a day inside what they believe is one request. When an absolute deadline
+  exists it still wins, being the tighter caller-chosen bound. (Node additionally clamps
+  `Retry-After` itself to 10s, so this is defence in depth here; the ceiling exists so every SDK
+  agrees on the worst case.) (`src/client.ts`)
+
+### Types
+
+- **`idempotencyKey` is declared on the error types.** It was attached as an undeclared ad-hoc
+  property, so it existed at runtime but TypeScript consumers could not read it without a cast —
+  pushing them toward minting a fresh key, which is exactly the double-charge path. It is now a
+  declared optional field on `PaylodError`, inherited by every subclass. (`src/errors.ts`)
+
+### Breaking
+
+- `toleranceSec: 0` (or any non-positive / non-finite value) now **throws** instead of disabling
+  the freshness check. If you were disabling replay protection for a fixed-vector test, pass a
+  normal positive window alongside your pinned `nowSec`.
+- A `baseUrl` pointing anywhere other than `paylod.dev` / `api.paylod.dev` (or opted-in loopback)
+  now **throws** `PaylodConfigError`. `baseUrl` was never a self-hosting hook; it is a stub/test
+  pointer, and that is now enforced rather than documented.
+
 ## 0.4.0
 
 Security- and money-correctness hardening from a codex security review. `@paylod/node` is the

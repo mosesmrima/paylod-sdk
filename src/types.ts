@@ -136,6 +136,12 @@ export interface PaylodOptions {
   /**
    * Defaults to `process.env.PAYLOD_BASE_URL` or `https://paylod.dev/functions/v1`.
    * (`api.paylod.dev/v1` is advertised in the docs but does not route yet.)
+   *
+   * **Allowlisted.** Only `paylod.dev` and `api.paylod.dev` over HTTPS on port 443 are accepted —
+   * plus loopback under {@link allowInsecureBaseUrl}. HTTPS on its own proves the transport is
+   * encrypted, not who is on the other end, so an arbitrary `https://` host would still receive
+   * your bearer key. URLs carrying userinfo, a non-default port, a query string, a fragment, or a
+   * raw/private IP are rejected too.
    */
   readonly baseUrl?: string;
   /** Defaults to `process.env.PAYLOD_WEBHOOK_SECRET`. Only needed for `webhook()`/`verify()`. */

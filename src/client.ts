@@ -35,6 +35,15 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 
+/**
+ * Hard ceiling for any sleep that has no absolute deadline bounding it.
+ *
+ * A bare `collect()` carries no polling budget, so before this the only limit on a `Retry-After`
+ * pause was the server's own honesty — `Retry-After: 86400` would block the caller for a day.
+ * Shared with the other paylod SDKs so every client agrees on the worst case.
+ */
+const MAX_UNBOUNDED_SLEEP_MS = 60_000;
+
 /** Ramp: quick first look, then ease off. Capped at 5s. Values in ms. */
 const POLL_SCHEDULE_MS = [1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000] as const;
 
@@ -137,14 +146,31 @@ function assertValidIdempotencyKey(key: string): void {
         "double-charge protection.",
     );
   }
-  // Control chars (C0 range + DEL): invalid in HTTP header values and a sign of a bad key.
-  if (/[\u0000-\u001f\u007f]/.test(key)) {
+  // The COMPLETE Unicode control set - C0 (U+0000-U+001F), DEL (U+007F) and C1 (U+0080-U+009F).
+  // C1 was the hole: U+0085 (NEL) is a line terminator that several proxies and header parsers
+  // fold into a newline, so it is a header-injection vector the old C0+DEL check waved through.
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(key)) {
     throw new PaylodInvalidRequestError(
-      "idempotencyKey must not contain control characters (tabs, newlines, NULs, etc.).",
+      "idempotencyKey must not contain control characters (tabs, newlines, NULs, C1 controls).",
     );
   }
-  if (key.length > 255) {
-    throw new PaylodInvalidRequestError("idempotencyKey must be 255 characters or fewer.");
+  // Unicode-only whitespace, plus the zero-width / BOM formatting characters. `key.trim()` above
+  // does not catch these in the MIDDLE of a key, and they are invisible: two keys that look
+  // identical in a log but differ by one U+00A0 are two different keys - i.e. one double charge.
+  if (
+    /[\u00a0\u1680\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff]/.test(key)
+  ) {
+    throw new PaylodInvalidRequestError(
+      "idempotencyKey must not contain Unicode whitespace or zero-width characters - they are " +
+        "invisible in logs, so two visually identical keys can silently be different keys.",
+    );
+  }
+  // Bound the BYTE length, not the UTF-16 code-unit count: the key goes out as bytes in a header,
+  // and 255 astral characters is 1020 bytes on the wire.
+  if (Buffer.byteLength(key, "utf8") > 255) {
+    throw new PaylodInvalidRequestError(
+      "idempotencyKey must be 255 bytes or fewer (UTF-8).",
+    );
   }
 }
 
@@ -168,9 +194,47 @@ function attachIdempotencyKey(err: unknown, key: string): void {
 }
 
 /**
- * Enforce a secure origin for `baseUrl`. HTTPS is required so the API key is never sent in the
- * clear and a hostile redirect target can't be substituted. Loopback HTTP is permitted ONLY
- * behind an explicit test-only opt-in, and NEVER with a live (`mp_live_`) key.
+ * The ONE origin a paylod key may ever be sent to.
+ *
+ * HTTPS alone is NOT enough. `https://` proves only that the transport is encrypted — it says
+ * nothing about WHO is on the other end, so any `https://evil.example` baseUrl (from a bad env
+ * var, a typo, a poisoned config, a copy-pasted "staging" URL) would happily receive a live
+ * bearer key over a perfectly valid TLS connection. An allowlist is what makes the key
+ * un-exfiltratable by configuration.
+ */
+const ALLOWED_HOSTS = new Set(["paylod.dev", "api.paylod.dev"]);
+
+/** Ports we accept on the canonical origin. Anything else is a redirect to somebody's listener. */
+const ALLOWED_PORTS = new Set(["", "443"]);
+
+/** RFC1918 / link-local / CGNAT / loopback literals — never a legitimate paylod origin. */
+function isPrivateOrLoopbackHost(host: string): boolean {
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "::1" || host === "[::1]") return true;
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10), in bracketed or bare form.
+  const bare = host.replace(/^\[|\]$/g, "");
+  if (/^f[cd][0-9a-f]{2}:/i.test(bare) || /^fe[89ab][0-9a-f]:/i.test(bare)) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(bare);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  if (a === 10 || a === 127 || a === 0) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 169 && b === 254) return true; // link-local / cloud metadata (169.254.169.254)
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return true; // any other bare IPv4 literal: the canonical origin is a NAME, never an IP
+}
+
+/**
+ * Enforce that `baseUrl` is the canonical paylod origin.
+ *
+ * Checks, in order: parseable; no embedded credentials (`https://user:pass@host` — userinfo is
+ * both a credential leak and a classic host-confusion trick); a real host; no query or fragment
+ * (a baseUrl is a prefix, and a trailing `?x=` silently corrupts every path built on it); an
+ * allowlisted host on an expected port; and no private/loopback address.
+ *
+ * The single exception is the explicit, test-only loopback opt-in — which remains forbidden with
+ * a live (`mp_live_`) key, so a production credential can never reach a local listener either.
  */
 function assertSecureBaseUrl(baseUrl: string, apiKey: string, allowInsecure: boolean): void {
   let parsed: URL;
@@ -180,20 +244,64 @@ function assertSecureBaseUrl(baseUrl: string, apiKey: string, allowInsecure: boo
     throw new PaylodConfigError(`baseUrl is not a valid URL: "${baseUrl}".`);
   }
 
-  if (parsed.protocol === "https:") return;
-
+  const isLive = apiKey.startsWith("mp_live_");
   const host = parsed.hostname.toLowerCase();
+
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new PaylodConfigError(
+      `baseUrl must not embed credentials (got "${baseUrl}"). A "user:pass@host" URL leaks those ` +
+        `credentials into logs and is a standard host-confusion trick.`,
+    );
+  }
+  if (host === "") {
+    throw new PaylodConfigError(`baseUrl has no host: "${baseUrl}".`);
+  }
+  if (parsed.search !== "" || parsed.hash !== "") {
+    throw new PaylodConfigError(
+      `baseUrl must not carry a query string or fragment (got "${baseUrl}"). It is a path prefix; ` +
+        `a trailing "?..." would corrupt every request path built from it.`,
+    );
+  }
+
+  // Test-only escape hatch: loopback — over http OR https — explicitly opted into, and NEVER with
+  // a live key. https loopback needs the same opt-in as http: a local listener holding a valid
+  // certificate is still not paylod, so TLS alone must not buy it a pass.
   const isLoopback =
     host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
-  const isLive = apiKey.startsWith("mp_live_");
+  if (isLoopback) {
+    if (allowInsecure && !isLive) return;
+    throw new PaylodConfigError(
+      `baseUrl points at loopback ("${baseUrl}"). That is allowed ONLY with ` +
+        `{ allowInsecureBaseUrl: true }, and NEVER with an mp_live_ key — a production ` +
+        `credential must never be addressed to a local listener.`,
+    );
+  }
 
-  if (parsed.protocol === "http:" && isLoopback && allowInsecure && !isLive) return;
+  if (parsed.protocol !== "https:") {
+    throw new PaylodConfigError(
+      `baseUrl must use https:// (got "${baseUrl}"). Plaintext HTTP would transmit your API key ` +
+        `in the clear. Loopback HTTP (localhost, 127.0.0.1) is allowed ONLY with ` +
+        `{ allowInsecureBaseUrl: true } and NEVER with an mp_live_ key.`,
+    );
+  }
 
-  throw new PaylodConfigError(
-    `baseUrl must use https:// (got "${baseUrl}"). Plaintext HTTP would transmit your API key in ` +
-      `the clear and opens you to SSRF / redirection. Loopback HTTP (localhost, 127.0.0.1) is ` +
-      `allowed ONLY with { allowInsecureBaseUrl: true } and NEVER with an mp_live_ key.`,
-  );
+  if (!ALLOWED_HOSTS.has(host)) {
+    throw new PaylodConfigError(
+      `baseUrl host "${host}" is not a paylod origin (got "${baseUrl}"). Your API key is a bearer ` +
+        `credential: it is sent on every request, so it may only ever be addressed to ` +
+        `${[...ALLOWED_HOSTS].join(" or ")}. HTTPS alone does not make an arbitrary host safe.`,
+    );
+  }
+  if (!ALLOWED_PORTS.has(parsed.port)) {
+    throw new PaylodConfigError(
+      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${baseUrl}").`,
+    );
+  }
+  if (isPrivateOrLoopbackHost(host)) {
+    throw new PaylodConfigError(
+      `baseUrl must not point at a private, loopback or link-local address (got "${baseUrl}").`,
+    );
+  }
 }
 
 /**
@@ -267,7 +375,10 @@ export class Paylod {
     this.#apiKey = key.trim();
 
     // Baked in. The base URL is identical for every customer, so passing one is pure ceremony.
-    // PAYLOD_BASE_URL / options.baseUrl remain as escape hatches for self-hosting and tests.
+    // PAYLOD_BASE_URL / options.baseUrl still let you point at a stub or a loopback mock, but
+    // they are NOT a self-hosting hook: whatever they resolve to must still pass the origin
+    // allowlist below, because an API key is a bearer credential and may only ever be addressed
+    // to an origin paylod controls.
     this.#baseUrl = (options.baseUrl ?? env.PAYLOD_BASE_URL ?? DEFAULT_BASE_URL).replace(
       /\/+$/,
       "",
@@ -326,11 +437,20 @@ export class Paylod {
     return deadlineMs === undefined ? undefined : deadlineMs - nowMs();
   }
 
-  /** A sleep clamped to the operation deadline, so a backoff can never push past `wait()`'s cap. */
+  /**
+   * A sleep clamped to the operation deadline, so a backoff can never push past `wait()`'s cap.
+   *
+   * When there is NO deadline to clamp against — a bare `collect()`, which has no polling budget —
+   * the sleep is ceilinged at {@link MAX_UNBOUNDED_SLEEP_MS} instead. Otherwise a hostile or
+   * simply broken `Retry-After: 86400` would park the caller for a day inside what they believe
+   * is a single request. A deadline, when present, still wins: it is the tighter, caller-chosen
+   * bound and the ceiling must never extend it.
+   */
   async #boundedSleep(ms: number, deadlineMs: number | undefined, signal?: AbortSignal): Promise<void> {
     let capped = ms;
     const remaining = this.#remaining(deadlineMs);
     if (remaining !== undefined) capped = Math.min(capped, Math.max(0, remaining));
+    else capped = Math.min(capped, MAX_UNBOUNDED_SLEEP_MS);
     if (capped > 0) await sleep(capped, signal);
   }
 
@@ -816,12 +936,26 @@ export class Paylod {
         return;
       }
 
+      // A DUPLICATE signature header is not a header to choose from — it is an attack shape.
+      // Taking `header[0]` let an attacker append a second `paylod-signature` and rely on the
+      // proxy, the framework and this SDK disagreeing about which one counts; verifying the
+      // first while a downstream hop honours the last is exactly how signature-confusion works.
+      // There is only ever one legitimate signature, so more than one is a hard reject.
       const header = req.headers?.[SIGNATURE_HEADER];
+      if (Array.isArray(header)) {
+        res.status(400).json({
+          error:
+            `Multiple ${SIGNATURE_HEADER} headers on one request. A signed webhook carries ` +
+            `exactly one signature; duplicates are rejected rather than guessed at.`,
+        });
+        return;
+      }
+
       let event: WebhookEvent;
       try {
         event = this.verifyWebhook({
           payload: raw,
-          signature: Array.isArray(header) ? header[0] : header,
+          signature: header,
           ...(options.secret !== undefined ? { secret: options.secret } : {}),
           ...(options.toleranceSec !== undefined ? { toleranceSec: options.toleranceSec } : {}),
         });

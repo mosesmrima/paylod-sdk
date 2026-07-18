@@ -317,12 +317,19 @@ export function decodeDarajaResult(
     return failedFallback(code || "unknown", rawDesc);
   }
 
-  // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
-  // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+  // Terminal (api_error / b2c_c2b_result): no STK pending semantics, EVER. Select only the entry
+  // for the requested family, or — failing that — another NON-STK entry for the same code.
+  //
+  // Falling back to `matches[0]` here was a live bug: a code that exists ONLY under `stk_result`
+  // (e.g. 4999, "still waiting for the customer's PIN") would, when explicitly decoded as
+  // `api_error` or `b2c_c2b_result`, come back as the STK *pending* entry — telling the caller a
+  // terminal API/result failure was a payment still in flight. That is the exact "false pending"
+  // shape of the 4999 double-charge bug, just reached from the other direction. An STK entry can
+  // never describe a non-STK surface, so when no non-STK entry exists we return the terminal,
+  // non-retryable fallback instead.
   const entry =
     matches.find((e) => e.family === effectiveFamily) ??
-    matches.find((e) => e.family !== "stk_result") ??
-    matches[0];
+    matches.find((e) => e.family !== "stk_result");
   if (entry) return decodedFrom(code, entry);
   return failedFallback(code || "unknown", rawDesc);
 }

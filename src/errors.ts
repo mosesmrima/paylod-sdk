@@ -12,6 +12,20 @@ import type { Payment } from "./types.js";
 
 /** Base class — `err instanceof PaylodError` catches every error this SDK throws. */
 export class PaylodError extends Error {
+  /**
+   * The `Idempotency-Key` in effect when this error was raised, when one was.
+   *
+   * DECLARED here — not bolted on ad hoc — because it is the single most important field on a
+   * failed money-moving call: it is what lets you retry the SAME attempt instead of minting a
+   * fresh key and double-charging. The client attaches it to whatever error escapes a collect,
+   * which can be any subclass (connection, timeout, API). Previously it was assigned as an
+   * undeclared property, so it existed at runtime but was invisible to TypeScript: a consumer
+   * writing `err.idempotencyKey` got a compile error and was pushed toward the unsafe path.
+   *
+   * Optional: errors raised before a key is chosen (config, validation) will not carry one.
+   */
+  idempotencyKey?: string | undefined;
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = new.target.name;
@@ -44,7 +58,7 @@ export class PaylodApiError extends PaylodError {
   /** The parsed JSON body, when the response had one. */
   readonly body: unknown;
   /** `Idempotency-Key` sent with the offending request, if any — useful for support tickets. */
-  readonly idempotencyKey?: string | undefined;
+  override readonly idempotencyKey?: string | undefined;
   /**
    * `true` when the money state cannot be proven either way. Set for a malformed 2xx (a success
    * response with no `paymentId`): the charge may or may not have been raised, so this is a STOP

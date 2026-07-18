@@ -64,13 +64,13 @@ describe("signature scheme parity with the backend", () => {
 
     expect(signWebhook(GOLDEN_BODY, GOLDEN_SECRET, GOLDEN_T)).toBe(GOLDEN_HEADER);
     // And the verifier accepts its own signer's golden output. The fixed vector pins the clock via
-    // `nowSec` (the freshness window is deterministic), which is the sanctioned way to verify an
-    // ancient fixture — a non-positive `toleranceSec` alone is now refused in production.
+    // `nowSec` at the vector's own `t` and runs a NORMAL 300s window — that is the only sanctioned
+    // way to verify an ancient fixture, because the freshness check can no longer be disabled.
     const event = verifyWebhook({
       payload: GOLDEN_BODY,
       signature: GOLDEN_HEADER,
       secret: GOLDEN_SECRET,
-      toleranceSec: 0,
+      toleranceSec: 300,
       nowSec: GOLDEN_T,
     });
     expect(event.data.paymentId).toBe("pay_golden");
@@ -241,10 +241,10 @@ describe("verifyWebhook", () => {
     });
   });
 
-  it("verifies an ancient fixture by pinning the clock with nowSec (toleranceSec: 0 + fixed clock)", () => {
+  it("verifies an ancient fixture by pinning the clock with nowSec at the fixture's own t", () => {
     const header = signWebhook(RAW, SECRET, 1); // ancient
     expect(() =>
-      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: 0, nowSec: 1 }),
+      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: 300, nowSec: 1 }),
     ).not.toThrow();
   });
 
@@ -262,15 +262,15 @@ describe("verifyWebhook", () => {
     expect(err.reason).toBe("insecure_tolerance");
   });
 
-  it("REFUSES a negative tolerance too, unless a fixed nowSec is injected", () => {
+  it("REFUSES a negative tolerance — an injected nowSec is NOT an escape hatch", () => {
     const header = signWebhook(RAW, SECRET, NOW);
     expect(() =>
       verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: -5 }),
     ).toThrow(/tolerance/i);
-    // …but with a pinned clock (a fixed-vector test) it is allowed.
+    // …and pinning the clock does NOT buy an exemption; the escape hatch is gone entirely.
     expect(() =>
       verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: -5, nowSec: NOW }),
-    ).not.toThrow();
+    ).toThrow(/tolerance/i);
   });
 
   it("verifies a Buffer payload identically to a string", () => {
