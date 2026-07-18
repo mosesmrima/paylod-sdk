@@ -3,6 +3,112 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.0
+
+Sixth independent review, conducted against the threat model in `SECURITY.md`. One Critical, three
+High and two Medium, plus a re-verification of the sibling findings from round 5.
+
+The theme of the round is **ORDERING**. Every previous round answered a finding by adding a stricter
+predicate. This round is about the layer BENEATH the predicate quietly repairing its input first, so
+the strict check was handed a laundered impostor and answered — correctly — about the wrong value.
+
+Signing is unchanged — the shared golden webhook vector (`whsec_golden_vector_v1` →
+`3afe38e4…2c2eb7`) still passes byte for byte, and its literals are untouched.
+
+### Critical
+
+- **Result codes are assessed by exact type and exact bytes; normalization no longer runs before
+  validation.** `normalizeCode` did `String(resultCode).trim()`, which maps the number `-0` and the
+  strings `" 0"`, `"0 "`, `"\t0\t"` and `"\n0\n"` onto the canonical `"0"`. The strict `raw === "0"`
+  success check added in 0.8.0 was therefore never reached by an impostor — it was handed a value
+  that had already been repaired into the genuine article. Whoever controls the response body
+  controls those bytes, so the SDK shipped a "declare yourself paid" primitive sitting one layer
+  beneath the check written to stop exactly that.
+
+  The same laundering ran in the failure direction and cost the same money: `" 1032"` trimmed to
+  `"1032"`, whose catalog entry is `retryable: true` (cancelled by the customer). A padded code
+  became a confident, RETRYABLE terminal failure — an instruction to charge again — for a payment
+  whose real state nobody knew.
+
+  `canonicalCodeForm` now preserves the original type and bytes and classifies the FORM first:
+  a number must be a non-negative safe integer and is tested with `Object.is(x, -0)` **before**
+  anything stringifies it (`-0 === 0` is true and `String(-0)` is `"0"`, so no check written
+  against either could ever have seen it); a string must match a canonical Daraja spelling exactly
+  as it arrived, with no trimming. An ambiguous code is **never** success and **never** a confident
+  terminal failure — the classifier returns `pending` (which ships nothing and invites no retry,
+  and is never `retryable`) and the decoder returns a new explicitly indeterminate block rather
+  than the catalog hit normalization used to manufacture.
+
+### High
+
+- **The Web `Request` webhook adapter no longer buffers an unauthenticated body without a limit.**
+  It called `await request.text()` before any signature check — all-or-nothing and unbounded — so
+  an anonymous remote caller who could reach the route could stream gigabytes into the heap and OOM
+  the process before a single check ran. The body is now read incrementally under
+  `MAX_WEBHOOK_BODY_BYTES` and the producer is cancelled the moment the budget is gone. The cap is
+  also applied to every PRE-BUFFERED form on the Express path (`req.body`, `req.rawBody`, Buffer and
+  string alike) — those branches returned unconditionally, so the advertised limit only ever bound
+  the one path where this SDK did the reading, and any deployment using `express.raw({ limit: … })`
+  or a Vercel/Firebase `rawBody` got no cap at all. An oversized `Content-Length` is refused before
+  the stream is touched, while the actual bytes are still counted regardless.
+
+- **Attacker-controlled response values no longer reach exception messages.** The malformed-2xx
+  validators quoted the offending value back for diagnostic value. A response whose `status` field,
+  or whose mismatched `id`, was set to the bearer key put that key verbatim into the exception
+  message and its stack — logged, shipped to an error reporter, rendered in a dashboard. The `body`
+  field on the error was carefully deep-redacted; the message beside it was not, so the redaction
+  protected the field nobody reads and missed the one everybody does. Every interpolated value now
+  goes through one `sanitizeForMessage` (JSON-rendered so a hostile `toString` cannot run,
+  truncated, then passed through the same key/secret redactor the body gets).
+
+- **An already-aborted `AbortSignal` stops the dispatch instead of merely being subscribed to.**
+  The abort was wired up only via `addEventListener("abort", …)`, which fires only for an abort
+  that happens LATER — a signal already aborted on arrival raised no event, so nothing linked it to
+  the inner controller and the request went out anyway. Against `POST /collect` the caller had
+  cancelled and the SDK charged the customer regardless, returning an acknowledgement that looked
+  like an ordinary success. Now checked before the controller and before `fetch`, so the guarantee
+  is "no request was dispatched" rather than "a request was dispatched and then abandoned".
+
+### Medium
+
+- **The webhook event schema is enforced completely.** `amount` was checked only for finiteness, so
+  `-100`, `100.5` and `1e15` all reached a handler typed as a plain `number`; it must now be a whole
+  number of KES between 1 and 150,000, matching the client-side charge limit. `applicationId`, `env`
+  and `phone` were treated as optional and then cast into a `WebhookEvent` that types them as
+  required — so a handler routing on `applicationId`, or refusing sandbox events with an `env`
+  check, was reading `undefined` through a type that promised a string. All three are now required
+  and non-blank.
+
+- **`resultDesc` is validated on a status read.** It was the one field on the record nothing
+  checked, and it is not inert — the classifier reads it as a corroborating signal. An
+  object-valued `resultDesc` passed the validator, reached `classifyStkResult`, and threw a raw
+  `TypeError` out of `.trim()`, so `check()` and `wait()` died with an internal stack trace instead
+  of raising the indeterminate-response error callers know how to handle. A crash is not a safe
+  failure here: it happens after a charge may already be live, and no `catch (e instanceof
+  PaylodError)` recovers from it. The classifier is independently hardened to treat a non-string
+  description as no signal rather than as a fault.
+
+### Sibling findings — re-verified, not assumed
+
+- The webhook `decoded` block was already rebuilt entirely from the canonical catalog (0.8.0), and
+  a `payment.failed` whose data assesses as pending/indeterminate was already rejected. Both
+  confirmed still holding, with tests.
+- **One gap remained**: a MISSING `decoded` block was mirrored as `null` rather than synthesised.
+  Omitting the block from a `payment.failed` produced `decoded: null`, and every handler rendering
+  `decoded.customerMessage` or gating a retry on `decoded.retryable` hit a null it was typed to
+  believe could not be there — the same defect as a block that lies, reached by omission instead of
+  assertion. The block's presence is now derived from the event type: `payment.failed` always
+  carries one, synthesised from the catalog; `payment.success` never does.
+
+### Non-vacuity
+
+`scripts/non-vacuity.mjs` grew 13 new cases (43 total, all CAUGHT). The harness itself was fixed:
+multiple edits to the SAME file now compose in memory instead of the second silently overwriting
+the first, which is the one way a multi-part mutation could degrade into a single-part one — and
+therefore into exactly the vacuous result the harness exists to detect. `D2-coerce` became such a
+case: the round-6 ordering gate stops a non-canonical code reaching the strict predicate at all, so
+reverting the predicate alone is now a no-op, and the mutation must remove BOTH.
+
 ## 0.8.0
 
 Fifth independent review. The review of THIS repo was cut off by a content filter before it emitted
