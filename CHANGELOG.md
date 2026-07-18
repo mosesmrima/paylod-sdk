@@ -3,6 +3,116 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.0
+
+Third-round codex review. This SDK came back with only **Low**-severity findings — the cleanest of
+the paylod clients — but two of them were **vacuous tests**, which matter more than their severity
+suggests: a test that passes whether or not the behaviour exists is not a regression test, it is a
+false receipt. Both have been rewritten to genuinely fail when the behaviour is reverted, and every
+fix in this release was verified the same way (revert the behaviour, confirm the suite goes red,
+restore).
+
+The remaining changes come from auditing this SDK for the issues codex found as **Critical/High in
+the sibling paylod SDKs**. Several were genuinely present here.
+
+Signing is unchanged — the shared golden webhook vector (`whsec_golden_vector_v1` →
+`3afe38e4…2c2eb7`) still passes byte for byte.
+
+**Minor, not patch:** the evidence requirement and the stricter option validation can reject or
+reclassify input 0.5.0 accepted (see *Breaking*).
+
+### Security
+
+- **The loopback opt-in no longer unlocks arbitrary protocols.** `allowInsecureBaseUrl` returned
+  from the loopback branch *before* the protocol check ran, so it relaxed not just the origin rule
+  but the scheme rule: `ftp://127.0.0.1`, `ws://localhost` and `gopher://[::1]` were all accepted
+  as base URLs. The protocol is now validated **first** — https, or http only under the explicit
+  test-only opt-in with a non-live key — and the loopback rules apply after.
+  (`src/client.ts`, `assertSecureBaseUrl`)
+- **A `baseUrl` password is no longer echoed by the check that rejects it.** The credential-in-URL
+  rejection interpolated the whole `baseUrl` into its message, so `https://user:hunter2@host` put
+  `hunter2` into the exception message and every stack and error tracker downstream. Userinfo is
+  stripped before interpolation. (`src/client.ts`, `safeUrl`)
+- **Response bodies echoed into an error are redacted.** `PaylodApiError.body` carried the raw
+  server response, so an API (or proxy, or debug envelope) reflecting the request back on a 4xx put
+  the bearer key straight into the error object — and `message` redaction did not cover it. Strings
+  anywhere in the body, keys included, are now scrubbed. (`src/client.ts`, `#redactDeep`)
+
+### Money-correctness
+
+- **`collectAndWait()` attaches the idempotency key to EVERY post-acknowledgement failure.** It
+  previously attached it only to failures inside `collect()`. Once the ack came back the key lived
+  only on the resolved value, so a wait timeout, a transport drop, a 5xx on a poll or a malformed
+  status body all threw bare — leaving the caller with a possibly-live charge and no key to read it
+  with, whose natural recovery (mint a fresh key, call again) is a second STK prompt.
+  (`src/client.ts`)
+- **Reporting `paid` now requires EVIDENCE.** A body of `{"id":"…","status":"success"}` with no
+  receipt and no result code is a claim with nothing behind it. It is now treated as
+  **indeterminate** — never `paid`, never `retryable`, surfaced as `pending` so `wait()` keeps
+  polling and the receipt or webhook settles it — instead of being reported as a completed payment
+  a merchant would fulfil against. Evidence is an M-Pesa receipt or result code 0. (`src/outcome.ts`)
+- **The collect ack is validated as a complete schema.** Validation checked `paymentId` only; it now
+  covers `checkoutRequestId` and `status` as well. A 2xx we cannot fully read means the charge state
+  is INDETERMINATE, raised with the key attached. (`src/validate.ts`)
+- **Status bodies are validated as a complete schema** — id, a `status` inside the known set, and
+  the types of `mpesaReceipt` / `resultCode` — and a malformed 2xx raises an indeterminate error
+  rather than being coerced into a `Payment` for the classifier to guess at. (`src/validate.ts`)
+
+### Correctness
+
+- **`Retry-After` is parsed in both RFC 9110 forms.** The HTTP-date form (common behind CDNs) fell
+  through `Number()` as `NaN` and was silently discarded, so that backpressure was ignored entirely.
+  Delta-seconds is now strict — `"5.5"`, `"-3"` and `""` are treated as absent rather than coerced
+  into a bogus pause — and the header name matches case-insensitively. (`src/client.ts`,
+  `parseRetryAfterMs`)
+- **One bound, in one place.** The independent 10s clamp on `Retry-After` has been removed. It
+  shadowed `MAX_UNBOUNDED_SLEEP_MS` and made the ceiling dead code — which is exactly why the test
+  covering the ceiling was vacuous. Bounding now happens only in `#boundedSleep`: the operation
+  deadline when there is one, the 60s ceiling when there is not.
+- **Timeouts are validated as finite whole positive integers.** `timeoutMs`, `maxRetries` and
+  `wait({ timeoutMs })` reject fractional, `NaN`, `Infinity` and non-positive values. These are not
+  slow timeouts, they are broken ones: `setTimeout` clamps both `NaN` and `Infinity` to fire
+  immediately, so a config typo aborted every request at once and made a live charge look like a
+  transport failure. (`src/validate.ts`)
+- **The simulator runs the production validators.** `simulate.collect()` carried its own weaker copy
+  of the idempotency-key rule (C0 controls and DEL only), so it accepted keys production rejects —
+  C1 controls, zero-width characters, non-ASCII, over-long keys. A test written to prove "a
+  double-click cannot charge twice" could pass against a key that would never have provided that
+  guarantee. It now calls the same `assertValidIdempotencyKey` and the same ack-schema validator.
+  (`src/simulate.ts`, `src/validate.ts`)
+
+### Tests
+
+- **The redirect regression test was vacuous** and has been rewritten. Its mock always returned the
+  supplied 302 and never followed anything, so it could not observe the defence under test — the
+  `redirect: "manual"` option — and stayed green with that option deleted, while a real `fetch`
+  would have replayed the bearer token to the attacker. The new mock follows redirects unless told
+  not to, and the test asserts the 3xx is refused, that the redirect target is **never contacted**,
+  and that it never sees the Authorization header. (`test/fixes.test.ts`)
+- **The 60-second unbounded-sleep test was vacuous** and has been rewritten. The separate 10s
+  `Retry-After` clamp was what bounded the sleep, so deleting the ceiling left the test green. With
+  that clamp removed the ceiling is the sole bound on the no-deadline path, and the test now asserts
+  the elapsed virtual time is pinned to ~60s rather than merely that the call finished.
+  (`test/fixes.test.ts`)
+- **New suite** (`test/round3.test.ts`) covering the protocol fix and every sibling-SDK issue
+  audited above.
+- Every fix in this release was verified non-vacuous by reverting the behaviour and confirming the
+  suite fails. 269 tests pass.
+
+### Breaking
+
+- A payment reporting `status: "success"` with **no receipt and no result code** is no longer
+  reported as `paid`. It is surfaced as indeterminate (`status: "pending"`, `paid: false`). If you
+  relied on the bare status string, you were relying on an unverifiable claim.
+- `timeoutMs` / `maxRetries` / `wait({ timeoutMs })` now throw `PaylodInvalidRequestError` on
+  fractional, `NaN`, `Infinity` or non-positive values that were previously accepted and silently
+  misbehaved.
+- A `Retry-After` this SDK previously waited up to 10s on may now be honoured for up to 60s on a
+  call with no deadline (`collect()`). Calls with a deadline (`wait()`, `collectAndWait()`) are
+  unaffected — the deadline remains the tighter bound.
+- Non-https, non-loopback-http `baseUrl` schemes (`ftp`, `ws`, `gopher`, `file`) now throw where the
+  loopback opt-in previously accepted them.
+
 ## 0.5.0
 
 Second-round fixes from a codex **re-verification** of the 0.4.0 security review. The 0.4.0 pass

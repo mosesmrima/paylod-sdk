@@ -176,6 +176,29 @@ export function toOutcome(payment: Payment): PaymentOutcome {
         : "pending");
 
   if (outcome === "success") {
+    // `paid: true` REQUIRES EVIDENCE, not an assertion.
+    //
+    // A bare `{ id, status: "success" }` is a claim with nothing behind it. M-Pesa proves a
+    // payment two ways — a confirmation receipt, or result code 0 — and a body carrying neither
+    // is not a settled payment we can act on: it is a response we cannot corroborate, from a
+    // stubbed endpoint, a truncated row, a proxy's cached envelope, or a compromised upstream.
+    // Trusting the string alone means fulfilling an order on the strength of six characters of
+    // JSON that anyone in the path can write. So an unevidenced success is treated exactly like
+    // any other unprovable state: INDETERMINATE — never paid, never safe to charge again, and
+    // surfaced as pending so `wait()` keeps polling and lets the receipt (or the webhook) settle
+    // it, rather than reporting a false success a merchant would act on immediately.
+    const hasReceipt = typeof payment.mpesaReceipt === "string" && payment.mpesaReceipt.trim() !== "";
+    const provenByCode = classified === "success";
+    if (!hasReceipt && !provenByCode) {
+      return {
+        ...base,
+        status: "pending",
+        paid: false,
+        retryable: false,
+        receipt: null,
+        message: INDETERMINATE,
+      };
+    }
     return {
       ...base,
       status: "succeeded",

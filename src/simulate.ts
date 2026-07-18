@@ -23,6 +23,7 @@
  */
 
 import { PaylodInvalidRequestError, PaylodSandboxOnlyError } from "./errors.js";
+import { assertCollectAckShape, assertValidIdempotencyKey } from "./validate.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
@@ -213,20 +214,14 @@ export class Simulator {
         `simulate.collect(): amount must be a positive whole number of KES (got ${amount}).`,
       );
     }
-    // Same rule as production collect(): a blank/whitespace/control-char key silently drops the
-    // dedup guarantee, so reject it rather than accept a key the header layer would mangle.
+    // THE production validator, not a copy of it. The copy that used to live here checked only C0
+    // controls and DEL, so the simulator accepted keys production rejects outright - C1 controls,
+    // Unicode zero-width characters, non-ASCII, and over-long keys. That is the one divergence a
+    // simulator must never have: a test written to prove "a double-click cannot charge twice"
+    // would pass here against a key that fails in production, certifying a guarantee that is not
+    // actually in force. One validator, both surfaces.
     if (params.idempotencyKey !== undefined) {
-      const key = params.idempotencyKey;
-      if (typeof key !== "string" || key.trim() === "") {
-        throw new PaylodInvalidRequestError(
-          "simulate.collect(): idempotencyKey must be a non-empty, non-whitespace string.",
-        );
-      }
-      if (/[\u0000-\u001f\u007f]/.test(key)) {
-        throw new PaylodInvalidRequestError(
-          "simulate.collect(): idempotencyKey must not contain control characters.",
-        );
-      }
+      assertValidIdempotencyKey(params.idempotencyKey, "simulate.collect(): idempotencyKey");
     }
 
     const body: Record<string, unknown> = {
@@ -255,6 +250,11 @@ export class Simulator {
       ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
     });
+
+    // The SAME ack schema production runs. A simulator that tolerates a malformed acknowledgement
+    // production would reject teaches the wrong thing about the shape of a real response — and
+    // silently hands back `paymentId: undefined` for the rest of the test to trip over.
+    assertCollectAckShape(ack, 200, params.idempotencyKey ?? "", "simulate.collect()");
 
     return {
       paymentId: ack.paymentId,
