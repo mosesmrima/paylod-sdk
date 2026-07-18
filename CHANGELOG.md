@@ -55,6 +55,12 @@ Signing is still unchanged — the shared golden webhook vector (`whsec_golden_v
   whitespace and zero-width/BOM characters (invisible in logs, so two visually identical keys can
   silently be different keys — one double charge). Length is bounded by **UTF-8 bytes** (≤255)
   rather than UTF-16 code units. (`src/client.ts`)
+- **Idempotency keys must be printable ASCII (0x20-0x7E).** HTTP header values are ASCII on the
+  wire (RFC 9110), so a non-ASCII key (`ordr-café-1`, a customer name, an emoji) either dies as an
+  unactionable transport-level encoding crash or — worse, on a laxer stack — is silently
+  re-encoded, so two requests intended to share ONE key no longer do. That quietly removes the
+  duplicate-charge guard the header exists to provide. Rejected with an actionable message before
+  dispatch. Found by the Python SDK agent. (`src/client.ts`)
 
 ### Cross-SDK standardization
 
@@ -91,6 +97,9 @@ Signing is still unchanged — the shared golden webhook vector (`whsec_golden_v
 - A `baseUrl` pointing anywhere other than `paylod.dev` / `api.paylod.dev` (or opted-in loopback)
   now **throws** `PaylodConfigError`. `baseUrl` was never a self-hosting hook; it is a stub/test
   pointer, and that is now enforced rather than documented.
+- A non-ASCII `idempotencyKey` now **throws** `PaylodInvalidRequestError`. In practice such keys
+  were already failing — as a transport-level encoding crash, or silently as a lost duplicate
+  guard — so this converts an obscure failure into an actionable one.
 
 ## 0.4.0
 

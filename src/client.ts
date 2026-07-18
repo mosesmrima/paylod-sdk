@@ -172,6 +172,19 @@ function assertValidIdempotencyKey(key: string): void {
       "idempotencyKey must be 255 bytes or fewer (UTF-8).",
     );
   }
+  // Printable ASCII only (0x20-0x7E). HTTP header values are ASCII on the wire (RFC 9110), so a
+  // non-ASCII key -- "ordr-café-1", a customer name, an emoji -- either dies as an unactionable
+  // transport-level encoding crash, or, on a laxer stack, is SILENTLY re-encoded. The second case
+  // is the dangerous one: two requests meant to share one key stop sharing it, which quietly
+  // removes the duplicate-charge guard that is the entire purpose of this header.
+  if (!/^[\x20-\x7e]+$/.test(key)) {
+    throw new PaylodInvalidRequestError(
+      "idempotencyKey must be printable ASCII (0x20-0x7E). HTTP header values are ASCII on the " +
+        "wire, so a non-ASCII key can be silently re-encoded in transit -- two requests meant to " +
+        "share one key would stop sharing it and the customer would be charged twice. Use an " +
+        "opaque id (a UUID or your attempt's primary key), not customer- or product-derived text.",
+    );
+  }
 }
 
 /**
