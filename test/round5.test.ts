@@ -90,7 +90,9 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
     },
     failed: {
       success: "indeterminate",
-      none: "failed",
+      // ROUND 7: was "failed". A claim with no evidence behind it is indeterminate whichever
+      // direction it points — see the `failed x none` cell in `semantics.ts`.
+      none: "indeterminate",
       failure: "failed",
       in_flight: "in_flight",
       conflict: "indeterminate",
@@ -313,6 +315,55 @@ describe("D4 — decoded.retryable is recomputed from the catalog, never trusted
     const canonical = new Paylod(KEY, { fetch: vi.fn(), allowCustomFetch: true } as never)
       .decodeError(1032, "Request cancelled by user");
     expect(event.data.decoded).toEqual(canonical);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────────────────
+  // ROUND 7: THE DISCRIMINATING RETRYABLE FIXTURE.
+  //
+  // The test above cannot fail for the right reason and never could. It sends code 1032 with a
+  // hostile `retryable: true` — and the CATALOG's own answer for 1032 is ALSO `true` (a payment
+  // the customer cancelled is safe to re-attempt). So the value under test is identical whether
+  // the SDK recomputes the block or trusts the payload wholesale, and a regression that deleted
+  // the recomputation entirely would still have gone green on `retryable`. It discriminates on
+  // `title` and `customerMessage`, which is why it looked like it was working.
+  //
+  // A test for "the payload does not get a vote" has to put the payload and the catalog in
+  // DISAGREEMENT on the one boolean that matters, in BOTH directions:
+  //   • hostile `true` on codes the catalog calls NOT retryable  (17, 26, 1025, 9999)
+  //   • hostile `false` on a code the catalog calls retryable    (1032)
+  // and it must assert the canonical boolean EXPLICITLY, not via a `toEqual` against a block
+  // derived from the same call the SDK makes.
+  //
+  // ONLY `retryable` is mutated. Every other field is the catalog's own, so the assertion
+  // cannot pass because some unrelated field differed — the boolean is the only variable.
+  describe.each([
+    [17, false],
+    [26, false],
+    [1025, false],
+    [9999, false],
+    [1032, true],
+  ])("code %i — the catalog says retryable=%s and the payload cannot change it", (code, canonicalRetryable) => {
+    it("ignores a payload that asserts the OPPOSITE", () => {
+      const client = new Paylod(KEY, { fetch: vi.fn(), allowCustomFetch: true } as never);
+      const canonical = client.decodeError(code, "");
+
+      // Sanity: the fixture is only meaningful if the catalog really says what we think, and if
+      // the hostile value really is the opposite. A fixture that silently agreed with the
+      // catalog is precisely the defect being fixed, so it is asserted rather than assumed.
+      expect(canonical.retryable).toBe(canonicalRetryable);
+
+      const hostile = { ...canonical, retryable: !canonicalRetryable };
+      expect(hostile.retryable).toBe(!canonicalRetryable);
+
+      const { raw, signature, nowSec } = signed(failedEvent(hostile, code));
+      const event = verifyWebhook({ payload: raw, signature, secret: SECRET, nowSec });
+
+      // THE assertion: the canonical boolean, stated as a literal. `retryable` is the one field
+      // in this SDK that means SAFE TO CHARGE AGAIN, so it is asserted directly and not through
+      // an object comparison that could pass for a dozen unrelated reasons.
+      expect(event.data.decoded?.retryable).toBe(canonicalRetryable);
+      expect(event.data.decoded?.retryable).not.toBe(hostile.retryable);
+    });
   });
 
   it("a payload advertising retryable:true for an IN-FLIGHT code cannot invite a double charge", () => {

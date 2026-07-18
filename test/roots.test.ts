@@ -183,7 +183,11 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
     ["a pending row carrying code zero", { status: "pending", resultCode: 0 }, "indeterminate"],
     ["pending with a receipt", { status: "pending", mpesaReceipt: "SFF6" }, "indeterminate"],
     ["pending with a failure code", { status: "pending", resultCode: 1032 }, "indeterminate"],
-    ["failed with no evidence", { status: "failed" }, "failed"],
+    // ROUND 7: an unbacked `failed` claim is INDETERMINATE, not a terminal failure. `failed`
+    // stops `wait()` polling and is what `verifyWebhook` requires before delivering a
+    // `payment.failed`, so a claim with no result code and no receipt behind it must not settle
+    // a payment that may still be mid-PIN. Evidence is required in BOTH directions.
+    ["failed with no evidence", { status: "failed" }, "indeterminate"],
     ["failed with a failure code", { status: "failed", resultCode: 2001 }, "failed"],
     ["failed with a pending code", { status: "failed", resultCode: 4999 }, "in_flight"],
     ["failed with a receipt", { status: "failed", mpesaReceipt: "SFF6" }, "indeterminate"],
