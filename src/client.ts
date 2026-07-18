@@ -807,6 +807,7 @@ export class Paylod {
             httpStatus: status,
             idempotencyKey,
             redactBody: (b) => this.#redactDeep(b),
+            redactText: (t) => this.#redact(t),
           }),
       });
       return { ...ack, idempotencyKey };
@@ -839,6 +840,7 @@ export class Paylod {
           httpStatus: status,
           expectedId: paymentId,
           redactBody: (b) => this.#redactDeep(b),
+          redactText: (t) => this.#redact(t),
         }),
     });
   }
@@ -991,7 +993,21 @@ export class Paylod {
     options: { secret?: string; toleranceSec?: number } = {},
   ): (request: Request) => Promise<Response> {
     return async (request: Request): Promise<Response> => {
-      const raw = await request.text();
+      // THE BYTES ARE CAPPED BEFORE THEY ARE AUTHENTICATED, because there is no order in which
+      // they could be authenticated first: verification needs the whole raw body. `request.text()`
+      // is all-or-nothing and unbounded, so an anonymous caller who could reach this route could
+      // stream gigabytes into the heap and OOM the process before a single check had run. A
+      // signature check that happens after unbounded buffering does not protect the buffering.
+      let raw: string;
+      try {
+        raw = await readWebRequestBody(request);
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: e instanceof Error ? e.message : "cannot read body" }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+
       let event: WebhookEvent;
       try {
         event = this.verifyWebhook({
@@ -1129,6 +1145,78 @@ function reportHandlerError(e: unknown): void {
  */
 export const MAX_WEBHOOK_BODY_BYTES = 1_048_576;
 
+/** The one refusal, so every intake path says the same thing for the same reason. */
+function tooLargeBody(detail: string): Error {
+  return new Error(
+    `Webhook body exceeds ${MAX_WEBHOOK_BODY_BYTES} bytes (${detail}). A paylod event is a few ` +
+      "hundred bytes; the request is refused before it is buffered because these bytes are not " +
+      "authenticated until the whole body has arrived, and an unbounded buffer an anonymous " +
+      "caller can fill is an OOM they control.",
+  );
+}
+
+/** A declared length can be refused before a single byte is pulled. It is a hint, never a bound. */
+function assertDeclaredLengthOk(declared: string | null | undefined): void {
+  if (typeof declared !== "string") return;
+  const s = declared.trim();
+  // Digits only, and short enough to be exact as a double. A malformed or absent Content-Length
+  // means nothing here — the ACTUAL bytes are counted regardless, which is the real check.
+  if (!/^\d{1,15}$/.test(s)) return;
+  if (Number(s) > MAX_WEBHOOK_BODY_BYTES) {
+    throw tooLargeBody(`Content-Length declared ${s}`);
+  }
+}
+
+/**
+ * Read a Web `Request` body incrementally under {@link MAX_WEBHOOK_BODY_BYTES}.
+ *
+ * `await request.text()` was the whole defect: it resolves only once the ENTIRE body is resident,
+ * so by the time any limit could be measured the memory has already been committed. The stream is
+ * consumed chunk by chunk and abandoned the moment the budget is gone — the point of a cap is
+ * that the bytes are never allocated, not that they are counted afterwards.
+ *
+ * The `text()` fallback covers a synthesised `Request` with no readable stream (some runtimes,
+ * some test doubles). It is strictly weaker and is applied after the fact, which is all that is
+ * available in that shape — but the declared-length check above still runs first.
+ */
+async function readWebRequestBody(request: Request): Promise<string> {
+  assertDeclaredLengthOk(request.headers?.get?.("content-length"));
+
+  const body = request.body as ReadableStream<Uint8Array> | null | undefined;
+  if (!body || typeof body.getReader !== "function") {
+    const text = await request.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_WEBHOOK_BODY_BYTES) {
+      throw tooLargeBody("no readable stream was exposed, so the body was measured after reading");
+    }
+    return text;
+  }
+
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_WEBHOOK_BODY_BYTES) {
+        // Abandon the producer rather than politely draining it — draining is the OOM.
+        await reader.cancel().catch(() => {});
+        throw tooLargeBody(`read ${total} bytes and stopped`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released by `cancel()` on some runtimes. Nothing to do.
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 // ── Minimal structural types for Express/Connect (no `express` dependency) ────────
 
 export interface ExpressLikeRequest {
@@ -1144,13 +1232,51 @@ export interface ExpressLikeResponse {
   json(body: unknown): unknown;
 }
 
+/**
+ * A body somebody else already buffered is still a body this SDK is about to hand to an HMAC, a
+ * JSON parser and a handler — so the advertised cap applies to it too.
+ *
+ * The pre-buffered branches used to return unconditionally, which meant the limit only ever
+ * bound the ONE path where this SDK did the reading. Any deployment that mounted
+ * `express.raw({ limit: "50mb" })`, or ran on a runtime that hands over `req.rawBody` (Vercel,
+ * Firebase), got no cap at all — and those are the common shapes, not the exotic ones. A limit
+ * that holds only on the path nobody uses is documentation, not a control.
+ *
+ * The allocation has already happened by then; refusing here still stops the SDK compounding it
+ * (an HMAC pass, a UTF-8 decode and a full JSON parse over the same unauthenticated megabytes)
+ * and makes the endpoint's real ceiling equal to its stated one.
+ */
+function assertBufferedSizeOk(bytes: number, source: string): void {
+  if (bytes > MAX_WEBHOOK_BODY_BYTES) {
+    throw tooLargeBody(`${source} was already buffered at ${bytes} bytes by the framework`);
+  }
+}
+
 async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
+  assertDeclaredLengthOk(
+    typeof req.headers?.["content-length"] === "string"
+      ? (req.headers["content-length"] as string)
+      : null,
+  );
+
   // express.raw() / body-parser raw → already a Buffer. Best case.
-  if (Buffer.isBuffer(req.body)) return req.body;
-  if (typeof req.body === "string") return Buffer.from(req.body, "utf8");
+  if (Buffer.isBuffer(req.body)) {
+    assertBufferedSizeOk(req.body.length, "req.body");
+    return req.body;
+  }
+  if (typeof req.body === "string") {
+    assertBufferedSizeOk(Buffer.byteLength(req.body, "utf8"), "req.body");
+    return Buffer.from(req.body, "utf8");
+  }
   // body-parser `verify` hook convention (and Vercel/Firebase runtimes).
-  if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
-  if (typeof req.rawBody === "string") return Buffer.from(req.rawBody, "utf8");
+  if (Buffer.isBuffer(req.rawBody)) {
+    assertBufferedSizeOk(req.rawBody.length, "req.rawBody");
+    return req.rawBody;
+  }
+  if (typeof req.rawBody === "string") {
+    assertBufferedSizeOk(Buffer.byteLength(req.rawBody, "utf8"), "req.rawBody");
+    return Buffer.from(req.rawBody, "utf8");
+  }
 
   // Nothing parsed it yet → drain the stream ourselves, under a hard size cap. These bytes are
   // UNAUTHENTICATED: the signature cannot be checked until they have all arrived, so the cap is
@@ -1162,11 +1288,7 @@ async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
       total += buf.length;
       if (total > MAX_WEBHOOK_BODY_BYTES) {
-        throw new Error(
-          `Webhook body exceeds ${MAX_WEBHOOK_BODY_BYTES} bytes. A paylod event is a few hundred ` +
-            "bytes; the request is refused before it is buffered because these bytes are not " +
-            "authenticated until the whole body has arrived.",
-        );
+        throw tooLargeBody(`read ${total} bytes and stopped`);
       }
       chunks.push(buf);
     }

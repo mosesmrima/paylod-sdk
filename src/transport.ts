@@ -32,6 +32,7 @@ import {
   PaylodConnectionError,
   PaylodResponseTooLargeError,
   PaylodSecurityError,
+  PaylodTerminalTransportError,
 } from "./errors.js";
 
 /** The one origin family a paylod key may ever be addressed to. */
@@ -281,6 +282,24 @@ export class Transport {
   async send(req: TransportRequest): Promise<TransportResponse> {
     const url = `${this.#baseUrl}${req.path}`;
     this.#assertOnOrigin(url, "the request URL");
+
+    // AN ALREADY-ABORTED SIGNAL MUST STOP THE DISPATCH, NOT MERELY BE LISTENED TO.
+    //
+    // The abort was wired up purely by `addEventListener("abort", …)` below. That listener only
+    // ever fires for an abort that happens LATER — a signal that was already aborted when it
+    // arrived raises no event, so nothing linked it to the inner controller and the request went
+    // out anyway. Against `POST /collect` that is not a cosmetic bug: the caller has cancelled,
+    // the SDK charges the customer regardless, and the acknowledgement comes back looking like a
+    // perfectly ordinary success for an operation nobody asked to complete.
+    //
+    // Checked here, BEFORE the controller and before `fetch`, so the guarantee is "no request was
+    // dispatched" rather than "a request was dispatched and then abandoned".
+    if (req.signal?.aborted) {
+      throw new PaylodTerminalTransportError(
+        "The request was not sent: the AbortSignal supplied by the caller was ALREADY aborted " +
+          "before the dispatch. No charge was raised and no request reached paylod.",
+      );
+    }
 
     const headers: Record<string, string> = {
       // THE credential. Constructed here, from a private field, on every request.
