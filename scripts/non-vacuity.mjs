@@ -478,6 +478,154 @@ const CASES = [
       "let warnedOnce = false;\nfunction warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  if (warnedOnce) return;\n  warnedOnce = true;\n  console.warn(",
     test: "emits N warnings for N unprotected calls from the SAME call site in ONE process",
   },
+  // ── ROUND 7 ────────────────────────────────────────────────────────────────────────────────
+  // NOTE ON SELECTORS: vitest's `-t` is a REGEX. Every selector below is chosen to contain no
+  // regex metacharacter — no parentheses, no `+`, no `?`, no `.` that matters — because a
+  // selector with an unescaped `(` silently matches ZERO tests and the run then exits 0, which
+  // the harness used to read as "the mutation was not caught". Each one is proven live by
+  // `selected()` before its verdict is trusted.
+  {
+    id: "R7-ack-rebuild",
+    what: "a successful collect ack is passed through raw instead of reconstructed",
+    file: "src/validate.ts",
+    find: `  return {
+    paymentId: ack.paymentId,
+    status: "pending",
+    checkoutRequestId: ack.checkoutRequestId,
+  };`,
+    replace: "  return parsed as CollectAckWire;",
+    test: "STRIPS unknown fields from a collect ack instead of returning them",
+  },
+  {
+    id: "R7-payment-rebuild",
+    what: "a successful status body is passed through raw instead of reconstructed",
+    file: "src/validate.ts",
+    find: `  return {
+    id: p.id,
+    status: p.status as PaymentStatus,
+    mpesaReceipt: typeof p.mpesaReceipt === "string" ? p.mpesaReceipt : null,
+    resultCode: asWireResultCode(p.resultCode),
+    resultDesc: typeof p.resultDesc === "string" ? p.resultDesc : null,
+  };`,
+    replace: "  return parsed as Payment;",
+    test: "STRIPS unknown fields from a status body instead of returning them",
+  },
+  {
+    id: "R7-secret-scan",
+    what: "a credential-bearing 2xx body is no longer refused",
+    file: "src/validate.ts",
+    find: `export function containsSecret(
+  value: unknown,
+  secrets: readonly string[],
+  depth = 0,
+): boolean {`,
+    replace: `export function containsSecret(
+  value: unknown,
+  secrets: readonly string[],
+  depth = 0,
+): boolean {
+  if (true) return false;`,
+    test: "REFUSES a 2xx collect ack whose KNOWN field carries the bearer key",
+  },
+  {
+    id: "R7-event-rebuild",
+    what: "a verified webhook event is SPREAD from the payload again",
+    file: "src/webhook.ts",
+    find: "  return event;\n}",
+    replace: "  return { ...(e as object), data: { ...d, decoded } } as unknown as WebhookEvent;\n}",
+    test: "STRIPS unknown top-level and data fields from a correctly-signed event",
+  },
+  {
+    id: "R7-failed-none",
+    what: "`failed` with NO evidence resolves as a terminal failure again",
+    file: "src/semantics.ts",
+    find: `    none: [
+      "indeterminate",
+      "status claims failed but the record carries neither a result code nor a receipt, so " +`,
+    replace: `    none: [
+      "failed",
+      "status claims failed but the record carries neither a result code nor a receipt, so " +`,
+    test: "failed with NO evidence is indeterminate, not a terminal failure",
+  },
+  {
+    id: "R7-onpoll-await",
+    what: "a promise-returning onPoll is fired and forgotten again",
+    file: "src/client.ts",
+    find: "        await this.#awaitOnPoll(options.onPoll(payment), payment, deadline, options.signal);",
+    replace: "        void options.onPoll(payment);",
+    test: "an async onPoll REJECTION fails the call instead of becoming an unhandled rejection",
+  },
+  {
+    id: "R7-render-throwable",
+    what: "the reconciliation wrapper calls String(err) unprotected again",
+    file: "src/reconcile.ts",
+    find: "  const detail = redact(renderThrowable(err));",
+    replace: "  const detail = redact(err instanceof Error ? err.message : String(err));",
+    test: "wraps a throwing toString into an error that still carries BOTH handles",
+  },
+  {
+    id: "R7-webhook-bytes",
+    what: "the Web Request adapter decodes body bytes to UTF-8 and re-encodes before the HMAC",
+    file: "src/webhook.ts",
+    find: "  const raw = toBoundedBuffer(payload);",
+    replace: "  const raw = Buffer.from(toBoundedBuffer(payload).toString('utf8'), 'utf8');",
+    test: "two DIFFERENT invalid-UTF-8 bodies do not share a signature",
+  },
+  {
+    id: "R7-manual-cap",
+    what: "the manual verify path has no body-size limit before the HMAC",
+    file: "src/webhook.ts",
+    find: `  if (declared > MAX_WEBHOOK_BODY_BYTES) {
+    throw tooLargeBody(\`the payload passed to verify() is \${declared} bytes\`);
+  }`,
+    replace: "  void declared;",
+    test: "REFUSES an oversized payload on the manual path",
+  },
+  {
+    id: "R7-sim-envelope",
+    what: "simulator outcome failures escape without the effective idempotency key",
+    file: "src/simulate.ts",
+    find: "      throw withIdempotencyKey(err, idempotencyKey, (m) => m, paymentId);",
+    replace: "      throw err;",
+    test: "simulate.outcome failures carry the derived key AND the payment id",
+  },
+  {
+    id: "R7-sim-validators",
+    what: "the simulator drops the 150,000 KES ceiling production enforces",
+    file: "src/simulate.ts",
+    find: `    const amount = assertChargeAmount(params.amount ?? 1, "simulate.collect()");`,
+    replace: "    const amount = params.amount ?? 1;",
+    test: "REFUSES an amount above the 150,000 KES ceiling, exactly as collect",
+  },
+  {
+    id: "R7-wire-nulls",
+    what: "absent optional wire fields escape as undefined again",
+    file: "src/validate.ts",
+    find: "    resultCode: asWireResultCode(p.resultCode),",
+    replace: "    resultCode: p.resultCode as never,",
+    test: "ABSENT optional fields arrive as null, never undefined",
+  },
+  {
+    id: "R7-retryable-integrity",
+    what: "the webhook decoded block is trusted from the payload again",
+    file: "src/webhook.ts",
+    find: `  const decoded =
+    e.type === "payment.failed"
+      ? decodeDarajaResult(`,
+    replace: `  const decoded =
+    e.type === "payment.failed"
+      ? ((d.decoded as never) ?? decodeDarajaResult(`,
+    also: {
+      file: "src/webhook.ts",
+      find: `          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        )
+      : null;`,
+      replace: `          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        ))
+      : null;`,
+    },
+    test: "ignores a payload that asserts the OPPOSITE",
+  },
 ];
 
 const results = [];
@@ -541,7 +689,7 @@ for (const c of CASES) {
   }
 
   for (const [file, text] of pending) writeFileSync(file, text);
-  let failed = false;
+  let status = "VACUOUS";
   let detail = "";
   try {
     execSync(
@@ -550,15 +698,44 @@ for (const c of CASES) {
     );
     detail = "test still PASSED";
   } catch (e) {
-    failed = true;
+    // A NONZERO EXIT IS NOT PROOF OF A CAUGHT MUTATION.
+    //
+    // This was the harness's own blind spot, and it invalidated every verdict it ever produced.
+    // `vitest run` exits nonzero for a whole family of reasons that have nothing to do with an
+    // assertion noticing anything: a mutated source file that no longer PARSES, a module that
+    // throws at import time, an unhandled rejection, a worker crash, the 180s timeout firing,
+    // `npx` failing to resolve vitest at all. Each of those was recorded as CAUGHT — so a
+    // mutation that merely BROKE THE BUILD was indistinguishable from one a test detected, and
+    // the strongest possible evidence of a vacuous test (the test never ran) was being reported
+    // as the strongest possible evidence of a live one.
+    //
+    // CAUGHT now requires POSITIVE evidence of the only thing that actually settles the
+    // question: vitest reporting a nonzero count of FAILED TESTS, with no startup or unhandled
+    // error alongside it. Everything else is HARNESS-ERROR — not a pass, not a fail, a verdict
+    // the harness is not entitled to give.
     const out = String(e.stdout ?? "") + String(e.stderr ?? "");
-    const m = out.match(/Tests\s+(\d+) failed/);
-    detail = m ? `${m[1]} test(s) failed` : "suite failed";
+    const failedTests = out.match(/Tests\s+(\d+) failed/);
+    const startupError = /Error: Failed to load|Startup Error|Unhandled Error|Unhandled Rejection|Transform failed|Failed to parse|SyntaxError|No test (files )?found|Vitest caught \d+ unhandled error/i.test(
+      out,
+    );
+    const timedOut = e.signal === "SIGTERM" || e.code === "ETIMEDOUT" || e.killed === true;
+
+    if (failedTests && Number(failedTests[1]) > 0 && !startupError && !timedOut) {
+      status = "CAUGHT";
+      detail = `${failedTests[1]} test(s) failed`;
+    } else {
+      status = "HARNESS-ERROR";
+      detail = timedOut
+        ? "vitest timed out — no assertion verdict"
+        : startupError
+          ? "vitest reported a startup/unhandled error, not a test failure"
+          : `vitest exited nonzero with no positive failed-test count (${String(e.status ?? "?")})`;
+    }
   } finally {
     for (const [file, text] of originals) writeFileSync(file, text);
   }
 
-  results.push({ ...c, status: failed ? "CAUGHT" : "VACUOUS", detail: `${detail}; selector covers ${live} test(s)` });
+  results.push({ ...c, status, detail: `${detail}; selector covers ${live} test(s)` });
 }
 
 const pad = (s, n) => String(s).padEnd(n);
