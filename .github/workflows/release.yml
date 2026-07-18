@@ -1,0 +1,97 @@
+name: Release
+
+# SAFETY: this workflow publishes to the public npm registry. It is deliberately wired to the
+# NARROWEST possible trigger.
+#
+#   - It runs ONLY when a human explicitly publishes a GitHub Release. Not on push, not on a bare
+#     tag push, not on workflow_dispatch. Creating a tag is NOT enough; someone has to click
+#     "Publish release".
+#   - It runs in the `npm` GitHub Environment, so an environment protection rule (required
+#     reviewers) can hold the job before it ever reaches the publish step.
+#   - It typechecks, tests and builds FIRST, in this same job. `npm publish` is the last step and
+#     every preceding step is a hard gate: any failure aborts before anything is uploaded.
+#   - It refuses to publish when the release tag and the package.json version disagree.
+#
+# Auth is npm Trusted Publishing (OIDC). There is no NPM_TOKEN, no NODE_AUTH_TOKEN and no .npmrc
+# credential anywhere in this file; the registry mints a short-lived token from the OIDC claim.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write # required: mints the OIDC token npm trades for a publish credential
+  contents: read
+
+jobs:
+  release:
+    name: Verify and publish to npm
+    runs-on: ubuntu-latest
+    environment: npm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # npm >= 11.5.1 is the first release that can exchange a GitHub OIDC token for an npm
+      # publish credential. The npm bundled with setup-node is older, so upgrade explicitly.
+      - name: Upgrade npm and assert >= 11.5.1
+        run: |
+          npm install -g npm@latest
+          need=11.5.1
+          have=$(npm --version)
+          lowest=$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)
+          if [ "$lowest" != "$need" ]; then
+            echo "npm $have is too old for OIDC trusted publishing; need >= $need" >&2
+            exit 1
+          fi
+          echo "npm $have is new enough for trusted publishing."
+
+      # Guard against publishing 0.5.0 under a v0.4.0 tag. The release tag is the human-facing
+      # claim; package.json is what actually ships. They must agree exactly.
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          pkg_version=$(node -p "require('./package.json').version")
+          tag_version="${RELEASE_TAG#v}"
+          echo "release tag:      $RELEASE_TAG (normalised: $tag_version)"
+          echo "package version:  $pkg_version"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match package.json version '$pkg_version'. Refusing to publish." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check vendored Daraja catalog is in sync
+        run: npm run check-catalog
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # npm provenance requires a PUBLIC source repository. This repo is private today, so
+      # provenance is requested only when GitHub reports the repo as public; asking for it on a
+      # private repo is a hard publish failure, not a warning.
+      - name: Publish to npm (trusted publishing, no token)
+        run: |
+          if [ "${{ github.event.repository.private }}" = "false" ]; then
+            echo "Public repository: publishing with provenance."
+            npm publish --provenance --access public
+          else
+            echo "Private repository: npm provenance is unavailable, publishing without it."
+            npm publish --access public
+          fi
