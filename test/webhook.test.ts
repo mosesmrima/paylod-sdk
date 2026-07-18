@@ -63,12 +63,15 @@ describe("signature scheme parity with the backend", () => {
       "t=1700000000,v1=3afe38e4c11734c84fad70dd16bbaeec6057ca998236f253be6bfa09ad2c2eb7";
 
     expect(signWebhook(GOLDEN_BODY, GOLDEN_SECRET, GOLDEN_T)).toBe(GOLDEN_HEADER);
-    // And the verifier accepts its own signer's golden output (freshness disabled — t is fixed).
+    // And the verifier accepts its own signer's golden output. The fixed vector pins the clock via
+    // `nowSec` (the freshness window is deterministic), which is the sanctioned way to verify an
+    // ancient fixture — a non-positive `toleranceSec` alone is now refused in production.
     const event = verifyWebhook({
       payload: GOLDEN_BODY,
       signature: GOLDEN_HEADER,
       secret: GOLDEN_SECRET,
       toleranceSec: 0,
+      nowSec: GOLDEN_T,
     });
     expect(event.data.paymentId).toBe("pay_golden");
   });
@@ -194,10 +197,79 @@ describe("verifyWebhook", () => {
     );
   });
 
-  it("can disable the freshness check with toleranceSec: 0 (historical fixtures)", () => {
+  // ── FIX 12: signature header strictness (exactly one integer t + one 64-hex v1) ──────────
+  describe("header strictness", () => {
+    const goodV1 = () => signWebhook(RAW, SECRET, NOW).split("v1=")[1]!;
+
+    it("rejects a comma-combined header carrying TWO signatures (last-value-wins is unsafe)", () => {
+      // Two `x-webhook-signature` values joined by a comma: a forged pair appended after a real one.
+      const combined = `t=${NOW},v1=${goodV1()},t=9999999999,v1=${"0".repeat(64)}`;
+      const err = (() => {
+        try {
+          verifyWebhook({ payload: RAW, signature: combined, secret: SECRET, nowSec: NOW });
+        } catch (e) {
+          return e;
+        }
+      })() as PaylodSignatureVerificationError;
+      expect(err).toBeInstanceOf(PaylodSignatureVerificationError);
+      expect(err.reason).toBe("malformed_signature");
+    });
+
+    it("rejects a duplicated v1", () => {
+      const dup = `t=${NOW},v1=${goodV1()},v1=${goodV1()}`;
+      expect(() =>
+        verifyWebhook({ payload: RAW, signature: dup, secret: SECRET, nowSec: NOW }),
+      ).toThrow(/Malformed/);
+    });
+
+    it("rejects a v1 that is not 64 lowercase-hex chars", () => {
+      const short = `t=${NOW},v1=deadbeef`;
+      const upper = `t=${NOW},v1=${goodV1().toUpperCase()}`;
+      expect(() =>
+        verifyWebhook({ payload: RAW, signature: short, secret: SECRET, nowSec: NOW }),
+      ).toThrow(/Malformed/);
+      expect(() =>
+        verifyWebhook({ payload: RAW, signature: upper, secret: SECRET, nowSec: NOW }),
+      ).toThrow(/Malformed/);
+    });
+
+    it("still accepts a single well-formed pair", () => {
+      const ok = `t=${NOW},v1=${goodV1()}`;
+      expect(() =>
+        verifyWebhook({ payload: RAW, signature: ok, secret: SECRET, nowSec: NOW }),
+      ).not.toThrow();
+    });
+  });
+
+  it("verifies an ancient fixture by pinning the clock with nowSec (toleranceSec: 0 + fixed clock)", () => {
     const header = signWebhook(RAW, SECRET, 1); // ancient
     expect(() =>
-      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: 0 }),
+      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: 0, nowSec: 1 }),
+    ).not.toThrow();
+  });
+
+  // ── FIX 13: a non-positive tolerance must NOT silently disable replay protection ──────────
+  it("REFUSES toleranceSec: 0 in production (no injected clock) — replay protection stays on", () => {
+    const header = signWebhook(RAW, SECRET, NOW);
+    const err = (() => {
+      try {
+        verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: 0 });
+      } catch (e) {
+        return e;
+      }
+    })() as PaylodSignatureVerificationError;
+    expect(err).toBeInstanceOf(PaylodSignatureVerificationError);
+    expect(err.reason).toBe("insecure_tolerance");
+  });
+
+  it("REFUSES a negative tolerance too, unless a fixed nowSec is injected", () => {
+    const header = signWebhook(RAW, SECRET, NOW);
+    expect(() =>
+      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: -5 }),
+    ).toThrow(/tolerance/i);
+    // …but with a pinned clock (a fixed-vector test) it is allowed.
+    expect(() =>
+      verifyWebhook({ payload: RAW, signature: header, secret: SECRET, toleranceSec: -5, nowSec: NOW }),
     ).not.toThrow();
   });
 

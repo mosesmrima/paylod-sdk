@@ -79,6 +79,15 @@ export interface PaymentOutcome {
 
 /** Shown while the prompt is live but M-Pesa has not given us a code to decode yet. */
 const WAITING = "Check your phone and enter your M-Pesa PIN to complete this payment.";
+/**
+ * Shown when the record contradicts itself — the raw `status` field says one terminal thing and
+ * the decoded result code says another. We CANNOT prove money did or did not move, so this is an
+ * indeterminate payment: never `paid`, never `retryable`. It is surfaced as `pending` so `wait()`
+ * lets a webhook settle it (and ultimately throws `PaylodTimeoutError`, the SDK's indeterminate
+ * signal) rather than reporting a false success or a false failure.
+ */
+const INDETERMINATE =
+  "We couldn't confirm this payment yet. Please wait — do not retry — while it settles.";
 const CANCELLED_CODE = "1032";
 
 /**
@@ -130,19 +139,43 @@ export function toOutcome(payment: Payment): PaymentOutcome {
     : null;
   const code = detail?.code ?? null;
 
-  // When M-Pesa has given us a code, the classifier is authoritative — that is what it is for.
-  // Before then, the API's own status is all we have.
-  const outcome = hasCode
-    ? classifyStkResult(payment.resultCode, payment.resultDesc)
-    : payment.status === "success"
-      ? "success"
-      : payment.status === "failed"
-        ? "failed"
-        : "pending";
+  // When M-Pesa has given us a code, the CLASSIFIER is authoritative and the raw `status` field
+  // must NOT override it. A row marked status:"success" that carries a pending code (4999) or a
+  // failure code (1032) must never be reported as paid. Before there is a code, the API's own
+  // status is all we have.
+  const classified = hasCode ? classifyStkResult(payment.resultCode, payment.resultDesc) : null;
 
   const base = { paymentId: payment.id, code, detail, payment } as const;
 
-  if (outcome === "success" || payment.status === "success") {
+  // A genuine contradiction between two TERMINAL signals — the raw status says success while the
+  // code classifies as a failure, or vice versa. Neither can be trusted, so the payment is
+  // INDETERMINATE: not paid, not safe to charge again. (A `pending` classification is NOT a
+  // contradiction — it just means "still in flight, keep polling".)
+  const contradictory =
+    classified !== null &&
+    ((classified === "success" && payment.status === "failed") ||
+      (classified === "failed" && payment.status === "success"));
+
+  if (contradictory) {
+    return {
+      ...base,
+      status: "pending",
+      paid: false,
+      retryable: false,
+      receipt: null,
+      message: INDETERMINATE,
+    };
+  }
+
+  const outcome =
+    classified ??
+    (payment.status === "success"
+      ? "success"
+      : payment.status === "failed"
+        ? "failed"
+        : "pending");
+
+  if (outcome === "success") {
     return {
       ...base,
       status: "succeeded",

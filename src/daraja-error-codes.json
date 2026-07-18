@@ -34,13 +34,14 @@
       "family": "stk_result",
       "title": "M-Pesa system internal error",
       "cause": "Safaricom's system (or the receiving shortcode / Party B) was temporarily unable to process the transaction — a transient M-Pesa-side error, not a problem with your request.",
-      "fix": "Wait ~30-45 seconds and retry the same request; if it persists across many attempts, check the Safaricom status page.",
+      "fix": "This is transient, but it is NOT proven that no charge was raised. Confirm the payment's final state with GET /status/:id (or the webhook) before charging again; only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
-      "retryable": true,
+      "retryable": false,
       "customerMessage": "M-Pesa had a hiccup. Please try again in a moment.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
-        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
+        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
+        "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
       ]
     },
     {
@@ -48,12 +49,13 @@
       "family": "stk_result",
       "title": "M-Pesa system busy",
       "cause": "M-Pesa is under high load and rejected the request because the system was busy. This is an M-Pesa-side condition, not your configuration.",
-      "fix": "Back off and retry the same request after about 30 seconds (exponential backoff recommended).",
+      "fix": "Back off, then confirm the payment's final state with GET /status/:id (or the webhook) before charging again — a busy-system rejection is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
-      "retryable": true,
+      "retryable": false,
       "customerMessage": "M-Pesa is busy right now. Please try again shortly.",
       "sources": [
-        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
+        "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
+        "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
       ]
     },
     {
@@ -89,13 +91,14 @@
       "family": "stk_result",
       "title": "Error sending the STK prompt",
       "cause": "M-Pesa could not send the STK prompt — usually a transient system error, or the request message (TransactionDesc) exceeded the 182-character limit.",
-      "fix": "Keep TransactionDesc within 182 characters, then retry. If the text is already short, treat it as a transient M-Pesa error and retry with backoff.",
+      "fix": "Keep TransactionDesc within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a send failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
-      "retryable": true,
+      "retryable": false,
       "customerMessage": "We couldn't reach M-Pesa. Please try again in a moment.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
-        "https://woodev.co.ke/common-m-pesa-api-errors/"
+        "https://woodev.co.ke/common-m-pesa-api-errors/",
+        "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
       ]
     },
     {
@@ -103,13 +106,14 @@
       "family": "stk_result",
       "title": "Error sending the STK prompt",
       "cause": "The push could not be delivered — commonly a transient M-Pesa error, or the request message exceeds the 182-character limit.",
-      "fix": "Shorten the request fields (especially TransactionDesc) to stay within 182 characters and retry; otherwise retry with backoff as a transient M-Pesa error.",
+      "fix": "Shorten the request fields (especially TransactionDesc) to stay within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a delivery failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
-      "retryable": true,
+      "retryable": false,
       "customerMessage": "We couldn't reach M-Pesa. Please try again in a moment.",
       "sources": [
         "https://woodev.co.ke/common-m-pesa-api-errors/",
-        "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/"
+        "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
+        "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
       ]
     },
     {

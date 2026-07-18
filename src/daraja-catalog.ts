@@ -137,7 +137,7 @@ const PENDING_DESC_RE =
  * 500.* whose message matches one of these is NOT treated as pending.
  */
 const TERMINAL_500_MESSAGE_RE =
-  /\b(?:wrong\s+credentials|merchant\s+does\s+not\s+exist|invalid\s+access\s+token|unable\s+to\s+lock\s+subscriber)\b/i;
+  /\b(?:wrong\s+credentials|merchant\s+does\s+not\s+exist|invalid\s+access\s+token|unable\s+to\s+lock\s+subscriber|insufficient\s+funds?)\b/i;
 
 /** Normalize a `ResultCode` that Daraja may send as a string OR a number (defensive). */
 function normalizeCode(resultCode: unknown): string {
@@ -259,11 +259,30 @@ function failedFallback(code: string, rawDesc?: string | null): DecodedError {
   };
 }
 
+/** Strip the internal-only fields off a catalog entry to produce a `DecodedError`. */
+function decodedFrom(code: string, entry: CatalogEntry): DecodedError {
+  const { code: _c, family: _f, sources: _s, ...rest } = entry;
+  return { code, ...rest };
+}
+
 /**
  * Decode a Daraja ResultCode into a normalized, human-readable error.
  *
- * Defers to `classifyStkResult` FIRST, so pending/in-flight codes (4999, 500.001.1001) can
- * never decode as a failure and can never be advertised as retryable.
+ * ── Family-awareness ──────────────────────────────────────────────────────────────────────
+ * The STK "still processing → pending" semantics (and the blank/unknown-numeric → pending
+ * fallback) apply ONLY to the STK result surface. A dotted `api_error` code (e.g. 400.002.02,
+ * 500.001.1001) or an alphanumeric `b2c_c2b_result` code (e.g. C2B00011) is a TERMINAL error;
+ * routing it through `classifyStkResult` used to misclassify it as `pending` and decode it as
+ * "payment still in progress", which is wrong. So we select by family:
+ *
+ *   • STK family: defer to `classifyStkResult`, so 4999 / 500.001.1001 can never decode as a
+ *     failure and can never be advertised as retryable.
+ *   • Non-STK families: decode straight from the catalog by family — no pending semantics. This
+ *     also disambiguates the OVERLOADED 500.001.1001, whose `api_error` entry is the terminal
+ *     "merchant does not exist / insufficient funds" server error.
+ *
+ * If the caller asks for the (default) STK family but the code exists ONLY in non-STK families,
+ * we decode it by its real family rather than letting the STK unknown→pending rule mislabel it.
  *
  * @param resultCode the Daraja ResultCode (number or string). `null`/`undefined` is treated as
  *   an unknown/indeterminate outcome.
@@ -283,15 +302,28 @@ export function decodeDarajaResult(
   // engine; for a human/agent-facing decode it would be a lie.) Indeterminate ⇒ not retryable.
   if (code === "") return failedFallback("unknown", rawDesc);
 
-  const outcome = classifyStkResult(code, rawDesc);
-  const entry = pickEntry(code, family, outcome);
+  const matches = ALL_ENTRIES.filter((e) => e.code === code);
+  const hasStk = matches.some((e) => e.family === "stk_result");
 
-  if (entry) {
-    const { code: _c, family: _f, sources: _s, ...rest } = entry;
-    return { code, ...rest };
+  // If STK was requested but the code is not an STK code, decode it by the family it DOES have.
+  const effectiveFamily: DarajaFamily =
+    family === "stk_result" && !hasStk && matches.length > 0 ? matches[0]!.family : family;
+
+  if (effectiveFamily === "stk_result") {
+    const outcome = classifyStkResult(code, rawDesc);
+    const entry = pickEntry(code, effectiveFamily, outcome);
+    if (entry) return decodedFrom(code, entry);
+    if (outcome === "pending") return pendingFallback(code);
+    return failedFallback(code || "unknown", rawDesc);
   }
 
-  if (outcome === "pending") return pendingFallback(code);
+  // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
+  // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+  const entry =
+    matches.find((e) => e.family === effectiveFamily) ??
+    matches.find((e) => e.family !== "stk_result") ??
+    matches[0];
+  if (entry) return decodedFrom(code, entry);
   return failedFallback(code || "unknown", rawDesc);
 }
 

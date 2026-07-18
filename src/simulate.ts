@@ -213,6 +213,21 @@ export class Simulator {
         `simulate.collect(): amount must be a positive whole number of KES (got ${amount}).`,
       );
     }
+    // Same rule as production collect(): a blank/whitespace/control-char key silently drops the
+    // dedup guarantee, so reject it rather than accept a key the header layer would mangle.
+    if (params.idempotencyKey !== undefined) {
+      const key = params.idempotencyKey;
+      if (typeof key !== "string" || key.trim() === "") {
+        throw new PaylodInvalidRequestError(
+          "simulate.collect(): idempotencyKey must be a non-empty, non-whitespace string.",
+        );
+      }
+      if (/[\u0000-\u001f\u007f]/.test(key)) {
+        throw new PaylodInvalidRequestError(
+          "simulate.collect(): idempotencyKey must not contain control characters.",
+        );
+      }
+    }
 
     const body: Record<string, unknown> = {
       phone: params.phone ? normalizePhone(params.phone) : DEFAULT_SIM_PHONE,

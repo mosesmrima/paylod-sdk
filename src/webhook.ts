@@ -44,16 +44,42 @@ function toBuffer(payload: string | Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
 }
 
+/** A well-formed `v1` is 64 lowercase hex chars (HMAC-SHA256 digest). */
+const V1_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and nothing else that
+ * matters — so we require EXACTLY ONE `t` and EXACTLY ONE `v1`, and reject anything else.
+ *
+ * This closes a last-value-wins hole: two `x-webhook-signature` headers combined into one
+ * comma-joined value (`t=1,v1=<real>,t=9999999999,v1=<forged>`) must NOT be accepted by silently
+ * taking the last pair. Duplicates of either key are fatal, as is a malformed `v1`.
+ */
 function parseHeader(header: string): { t: string; v1: string } | null {
-  const parts = new Map<string, string>();
+  let t: string | undefined;
+  let v1: string | undefined;
+  let tCount = 0;
+  let v1Count = 0;
   for (const seg of header.split(",")) {
-    const idx = seg.indexOf("=");
+    const s = seg.trim();
+    if (s === "") continue;
+    const idx = s.indexOf("=");
     if (idx <= 0) continue;
-    parts.set(seg.slice(0, idx).trim(), seg.slice(idx + 1).trim());
+    const key = s.slice(0, idx).trim();
+    const val = s.slice(idx + 1).trim();
+    if (key === "t") {
+      t = val;
+      tCount++;
+    } else if (key === "v1") {
+      v1 = val;
+      v1Count++;
+    }
+    // Unknown keys are ignored for forward-compatibility, but a duplicate t/v1 is fatal below.
   }
-  const t = parts.get("t");
-  const v1 = parts.get("v1");
-  if (!t || !v1) return null;
+  if (tCount !== 1 || v1Count !== 1 || !t || !v1) return null;
+  // `v1` must be exactly one 64-char lowercase-hex digest. `t` is validated (integer) by the caller
+  // so the "not a number" diagnostic stays specific.
+  if (!V1_RE.test(v1)) return null;
   return { t, v1 };
 }
 
@@ -87,14 +113,16 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
     );
   }
 
+  // `t` must always be an integer, regardless of tolerance — a non-numeric timestamp is malformed.
+  const t = Number(parsed.t);
+  if (!Number.isInteger(t)) {
+    throw new PaylodSignatureVerificationError(
+      "malformed_signature",
+      "Signature timestamp is not a number.",
+    );
+  }
+
   if (toleranceSec > 0) {
-    const t = Number(parsed.t);
-    if (!Number.isFinite(t)) {
-      throw new PaylodSignatureVerificationError(
-        "malformed_signature",
-        "Signature timestamp is not a number.",
-      );
-    }
     const now = params.nowSec ?? Math.floor(Date.now() / 1000);
     if (Math.abs(now - t) > toleranceSec) {
       throw new PaylodSignatureVerificationError(
@@ -102,7 +130,18 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
         `Signature timestamp is outside the ${toleranceSec}s tolerance (replay?).`,
       );
     }
+  } else if (params.nowSec === undefined) {
+    // A non-positive tolerance would DISABLE replay protection. That is only ever acceptable with
+    // a fixed, injected clock (a pinned test vector). In production — no `nowSec` — refuse it
+    // loudly rather than silently accepting replays of any age.
+    throw new PaylodSignatureVerificationError(
+      "insecure_tolerance",
+      "toleranceSec must be a positive number of seconds. A non-positive tolerance disables " +
+        "webhook replay protection and is only permitted in tests that inject a fixed `nowSec`.",
+    );
   }
+  // else: toleranceSec <= 0 AND a fixed `nowSec` was injected — a deterministic fixed-vector test.
+  // The freshness window is intentionally skipped; the pinned clock makes replay a non-issue.
 
   const raw = toBuffer(payload);
   const expected = createHmac("sha256", secret)

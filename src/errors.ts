@@ -45,17 +45,25 @@ export class PaylodApiError extends PaylodError {
   readonly body: unknown;
   /** `Idempotency-Key` sent with the offending request, if any — useful for support tickets. */
   readonly idempotencyKey?: string | undefined;
+  /**
+   * `true` when the money state cannot be proven either way. Set for a malformed 2xx (a success
+   * response with no `paymentId`): the charge may or may not have been raised, so this is a STOP
+   * signal — read the status with {@link idempotencyKey}, do NOT blindly retry with a new key.
+   */
+  readonly indeterminate: boolean;
 
   constructor(
     message: string,
     status: number,
     body: unknown,
     idempotencyKey?: string | undefined,
+    indeterminate = false,
   ) {
     super(message);
     this.status = status;
     this.body = body;
     this.idempotencyKey = idempotencyKey;
+    this.indeterminate = indeterminate;
   }
 
   /** 401 — the API key is missing or invalid. */
@@ -144,7 +152,10 @@ export class PaylodSignatureVerificationError extends PaylodError {
     | "malformed_signature"
     | "stale_timestamp"
     | "no_match"
-    | "invalid_payload";
+    | "invalid_payload"
+    /** A non-positive `toleranceSec` was used outside a fixed-clock test — replay protection would
+     * have been silently disabled. Configure a positive tolerance in production. */
+    | "insecure_tolerance";
 
   constructor(reason: PaylodSignatureVerificationError["reason"], message: string) {
     super(message);

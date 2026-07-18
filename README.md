@@ -109,12 +109,18 @@ PAYLOD_WEBHOOK_SECRET=whsec_xxxxxxxx   # only if you consume webhooks
 
 ```ts
 const paylod = new Paylod(key, {
-  baseUrl: "http://localhost:4010", // point at a stub in tests, or self-host
-  timeoutMs: 30_000,                // per HTTP request
-  maxRetries: 2,                    // transient failures only (network, 5xx, 429)
-  fetch: myFetch,                   // inject an instrumented fetch
+  baseUrl: "https://paylod.dev/functions/v1", // https required; self-host or a stub
+  timeoutMs: 30_000,                          // per HTTP request
+  maxRetries: 2,                              // transient failures only (network, 5xx, 429)
+  fetch: myFetch,                             // inject an instrumented fetch
+  // allowInsecureBaseUrl: true,              // TEST ONLY: permit http://localhost — never with a live key
 });
 ```
+
+> **`baseUrl` must be `https://`.** A plaintext origin would send your API key in the clear and
+> opens you to SSRF / redirection, so it is refused at construction. A loopback stub
+> (`http://localhost`, `http://127.0.0.1`) is allowed **only** with `allowInsecureBaseUrl: true`,
+> and **never** with an `mp_live_` key.
 
 > **Maintainer note:** the docs elsewhere advertise `https://api.paylod.dev/v1`. That hostname **does not route** — it 307s to `/signin`. The working base, and the default here, is `https://paylod.dev/functions/v1`.
 
@@ -451,7 +457,7 @@ interface WebhookEvent {
 }
 ```
 
-**Deliveries can repeat.** Retries and a lost 200 both look the same from our side. Key your fulfilment on `data.paymentId` (or the `x-webhook-id` header) and make it idempotent.
+**Deliveries can repeat.** Retries and a lost 200 both look the same from our side. Key your fulfilment on the **signed** `data.paymentId` and make it idempotent. Do **not** dedup on the `x-webhook-id` header: it is **unsigned**, so an attacker can replay a captured body with a fresh `x-webhook-id` to slip past a header-keyed dedup check. Only the signed body (verified by `verifyWebhook`) is trustworthy — dedup on `data.paymentId` from it.
 
 ---
 

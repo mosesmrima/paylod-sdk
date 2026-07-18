@@ -140,6 +140,13 @@ export interface PaylodOptions {
   readonly baseUrl?: string;
   /** Defaults to `process.env.PAYLOD_WEBHOOK_SECRET`. Only needed for `webhook()`/`verify()`. */
   readonly webhookSecret?: string;
+  /**
+   * **Test-only.** Permit a plaintext `http://` `baseUrl` **when it points at loopback**
+   * (`localhost` / `127.0.0.1`) — e.g. a local mock server (Prism, MSW) in tests. It is refused
+   * for any non-loopback host, and refused unconditionally with a live (`mp_live_`) key, so it can
+   * never expose a production key over the wire. HTTPS is required otherwise.
+   */
+  readonly allowInsecureBaseUrl?: boolean;
   /** Per-HTTP-request timeout, ms. Default 30_000. */
   readonly timeoutMs?: number;
   /** Retries for *idempotent/transient* failures (network, 5xx, 429). Default 2. */

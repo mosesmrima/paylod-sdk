@@ -100,6 +100,100 @@ interface RequestOptions {
   readonly body?: unknown;
   readonly idempotencyKey?: string;
   readonly signal?: AbortSignal;
+  /**
+   * Absolute deadline (`Date.now()` ms) for the WHOLE operation. Each in-flight request is capped
+   * to the remaining time, and every backoff / `Retry-After` sleep is clamped to it — so a
+   * `wait()` cannot overrun its `timeoutMs` by a full request timeout per poll.
+   */
+  readonly deadlineMs?: number;
+  /**
+   * Run against a 2xx body before it is returned. Throw here to reject a malformed success (e.g. a
+   * 200 with no payment id) as an error instead of silently handing back an empty shape.
+   */
+  readonly validate?: (parsed: unknown, status: number) => void;
+}
+
+/**
+ * A `409` retried only when it is explicitly the "same key still running" case. Every other 409
+ * (body conflict, indeterminate) is a real answer and must NOT be retried.
+ */
+const IN_PROGRESS_409_RE = /already in progress/i;
+
+/** The wall clock, in one place. (`Date` is what the fake-timer test harness controls.) */
+function nowMs(): number {
+  return Date.now();
+}
+
+/**
+ * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
+ * keys, keys carrying control characters (which also cannot go in an HTTP header), and absurdly
+ * long values. A caller-supplied key is the ONE thing standing between a double-click and a
+ * double-charge, so a bad one must fail loudly rather than be quietly accepted.
+ */
+function assertValidIdempotencyKey(key: string): void {
+  if (typeof key !== "string" || key.trim() === "") {
+    throw new PaylodInvalidRequestError(
+      "idempotencyKey must be a non-empty, non-whitespace string — a blank key silently drops " +
+        "double-charge protection.",
+    );
+  }
+  // Control chars (C0 range + DEL): invalid in HTTP header values and a sign of a bad key.
+  if (/[\u0000-\u001f\u007f]/.test(key)) {
+    throw new PaylodInvalidRequestError(
+      "idempotencyKey must not contain control characters (tabs, newlines, NULs, etc.).",
+    );
+  }
+  if (key.length > 255) {
+    throw new PaylodInvalidRequestError("idempotencyKey must be 255 characters or fewer.");
+  }
+}
+
+/**
+ * If the SDK generated the idempotency key (or even if the caller supplied it), a failed collect
+ * MUST hand the effective key back on the error so the caller can retry with the SAME key rather
+ * than mint a fresh one and double-charge. Best-effort: never clobber a key an error already set.
+ */
+function attachIdempotencyKey(err: unknown, key: string): void {
+  if (
+    err &&
+    typeof err === "object" &&
+    (err as { idempotencyKey?: unknown }).idempotencyKey === undefined
+  ) {
+    try {
+      (err as { idempotencyKey?: string }).idempotencyKey = key;
+    } catch {
+      /* frozen error object — nothing more we can do */
+    }
+  }
+}
+
+/**
+ * Enforce a secure origin for `baseUrl`. HTTPS is required so the API key is never sent in the
+ * clear and a hostile redirect target can't be substituted. Loopback HTTP is permitted ONLY
+ * behind an explicit test-only opt-in, and NEVER with a live (`mp_live_`) key.
+ */
+function assertSecureBaseUrl(baseUrl: string, apiKey: string, allowInsecure: boolean): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new PaylodConfigError(`baseUrl is not a valid URL: "${baseUrl}".`);
+  }
+
+  if (parsed.protocol === "https:") return;
+
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback =
+    host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  const isLive = apiKey.startsWith("mp_live_");
+
+  if (parsed.protocol === "http:" && isLoopback && allowInsecure && !isLive) return;
+
+  throw new PaylodConfigError(
+    `baseUrl must use https:// (got "${baseUrl}"). Plaintext HTTP would transmit your API key in ` +
+      `the clear and opens you to SSRF / redirection. Loopback HTTP (localhost, 127.0.0.1) is ` +
+      `allowed ONLY with { allowInsecureBaseUrl: true } and NEVER with an mp_live_ key.`,
+  );
 }
 
 /**
@@ -178,6 +272,9 @@ export class Paylod {
       /\/+$/,
       "",
     );
+    // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
+    // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
+    assertSecureBaseUrl(this.#baseUrl, this.#apiKey, options.allowInsecureBaseUrl === true);
     this.#webhookSecret = options.webhookSecret ?? env.PAYLOD_WEBHOOK_SECRET;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
@@ -216,15 +313,47 @@ export class Paylod {
 
   // ── HTTP ──────────────────────────────────────────────────────────────────────
 
+  /** Scrub the API key and webhook secret out of anything that could be logged or thrown. */
+  #redact(s: string): string {
+    let out = s;
+    if (this.#apiKey) out = out.split(this.#apiKey).join("[redacted]");
+    if (this.#webhookSecret) out = out.split(this.#webhookSecret).join("[redacted]");
+    return out;
+  }
+
+  /** Remaining time to the deadline, or `undefined` when there is no deadline. */
+  #remaining(deadlineMs: number | undefined): number | undefined {
+    return deadlineMs === undefined ? undefined : deadlineMs - nowMs();
+  }
+
+  /** A sleep clamped to the operation deadline, so a backoff can never push past `wait()`'s cap. */
+  async #boundedSleep(ms: number, deadlineMs: number | undefined, signal?: AbortSignal): Promise<void> {
+    let capped = ms;
+    const remaining = this.#remaining(deadlineMs);
+    if (remaining !== undefined) capped = Math.min(capped, Math.max(0, remaining));
+    if (capped > 0) await sleep(capped, signal);
+  }
+
   async #request<T>(opts: RequestOptions): Promise<T> {
     const url = `${this.#baseUrl}${opts.path}`;
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= this.#maxRetries; attempt++) {
-      if (attempt > 0) await sleep(jitter(250 * 2 ** (attempt - 1)), opts.signal);
+      if (attempt > 0) {
+        await this.#boundedSleep(jitter(250 * 2 ** (attempt - 1)), opts.deadlineMs, opts.signal);
+      }
+
+      // Cap this request to whatever time the overall operation has left. A 30s per-request
+      // timeout must never let a `wait({ timeoutMs: 5000 })` run for 30s.
+      let perRequestTimeout = this.#timeoutMs;
+      const remaining = this.#remaining(opts.deadlineMs);
+      if (remaining !== undefined) {
+        if (remaining <= 0) break; // out of time — surface the last error / a timeout below
+        perRequestTimeout = Math.min(perRequestTimeout, remaining);
+      }
 
       const timer = new AbortController();
-      const to = setTimeout(() => timer.abort(), this.#timeoutMs);
+      const to = setTimeout(() => timer.abort(), perRequestTimeout);
       const onOuterAbort = () => timer.abort();
       opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
@@ -243,10 +372,15 @@ export class Paylod {
           headers,
           body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
           signal: timer.signal,
+          // Never auto-follow a redirect: a cross-origin 3xx would replay the Authorization header
+          // to another host. We inspect and refuse it ourselves instead.
+          redirect: "manual",
         });
       } catch (e) {
         lastError = new PaylodConnectionError(
-          `Could not reach paylod at ${url}: ${e instanceof Error ? e.message : String(e)}`,
+          this.#redact(
+            `Could not reach paylod at ${url}: ${e instanceof Error ? e.message : String(e)}`,
+          ),
           { cause: e },
         );
         if (opts.signal?.aborted) throw lastError;
@@ -254,6 +388,18 @@ export class Paylod {
       } finally {
         clearTimeout(to);
         opts.signal?.removeEventListener("abort", onOuterAbort);
+      }
+
+      // A redirect is never expected from the API. Refuse it rather than follow it to a host that
+      // would receive the bearer token. Not retryable — a redirect loop is not a transient blip.
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        throw new PaylodConnectionError(
+          this.#redact(
+            `paylod returned an unexpected redirect (HTTP ${res.status || "opaque"}) from ${url}. ` +
+              `Refusing to follow it — a cross-origin redirect could leak your Authorization header ` +
+              `to another host.`,
+          ),
+        );
       }
 
       const text = await res.text().catch(() => "");
@@ -264,30 +410,40 @@ export class Paylod {
         parsed = text;
       }
 
-      if (res.ok) return parsed as T;
+      if (res.ok) {
+        // A malformed 2xx (e.g. no payment id) is INDETERMINATE, not a silent empty success.
+        opts.validate?.(parsed, res.status);
+        return parsed as T;
+      }
 
-      const message =
-        (parsed && typeof parsed === "object" && typeof (parsed as { error?: unknown }).error === "string"
+      const message = this.#redact(
+        (parsed &&
+        typeof parsed === "object" &&
+        typeof (parsed as { error?: unknown }).error === "string"
           ? (parsed as { error: string }).error
-          : null) ?? `paylod responded ${res.status}`;
+          : null) ?? `paylod responded ${res.status}`,
+      );
 
       const apiError = new PaylodApiError(message, res.status, parsed, opts.idempotencyKey);
 
-      // 429 / 5xx are transient. Everything else (400/401/404/409/422) is a real answer —
-      // retrying it just burns time and, for 409, hides a genuine bug.
+      // 429 / 5xx are transient. A 409 is retried ONLY when it is explicitly "same key still in
+      // progress" — every other 409 (body conflict, indeterminate) is a real, terminal answer.
       const transient = res.status === 429 || res.status >= 500;
-      if (!transient || attempt === this.#maxRetries) throw apiError;
+      const inProgress = res.status === 409 && IN_PROGRESS_409_RE.test(message);
+      if ((!transient && !inProgress) || attempt === this.#maxRetries) throw apiError;
 
-      const retryAfter = Number(res.headers.get("retry-after"));
       lastError = apiError;
+      // Honour Retry-After (clamped to 10s and to the operation deadline). If absent, the
+      // top-of-loop backoff covers the wait.
+      const retryAfter = Number(res.headers.get("retry-after"));
       if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        await sleep(Math.min(retryAfter * 1000, 10_000), opts.signal);
+        await this.#boundedSleep(Math.min(retryAfter * 1000, 10_000), opts.deadlineMs, opts.signal);
       }
     }
 
     throw lastError instanceof Error
       ? lastError
-      : new PaylodConnectionError(`Request to ${url} failed`);
+      : new PaylodConnectionError(this.#redact(`Request to ${url} failed`));
   }
 
   // ── Validation ────────────────────────────────────────────────────────────────
@@ -375,58 +531,99 @@ export class Paylod {
   async collect(params: CollectParams, options: { signal?: AbortSignal } = {}): Promise<CollectAck> {
     const body = this.#buildCollectBody(params);
     if (params.idempotencyKey === undefined) warnMissingIdempotencyKey();
+    // A caller-supplied key is the double-charge guard — reject a blank/whitespace/control-char
+    // one loudly rather than silently drop protection. A generated key is always well-formed.
+    else assertValidIdempotencyKey(params.idempotencyKey);
     const idempotencyKey = params.idempotencyKey ?? randomUUID();
 
-    // Simulator mode (`new Paylod(testKey, { simulate: true })`): same call, same ack, no handset.
-    // Your charge path runs UNCHANGED — which is the only way to actually test it. The key was
-    // proven to be a sandbox key in the constructor, so this branch cannot reach production.
-    if (this.#simulate) {
-      const created = await this.simulate.collect(
-        {
-          // Forward the WHOLE body, not a subset. The idempotency layer fingerprints the request
-          // body, so a field the simulator never sees is a field it cannot fingerprint: a reused
-          // key with changed `metadata` (or `description`) would 409 in production and silently
-          // REPLAY here. That is the exact false confidence the simulator exists to remove — a
-          // test asserting "a reused key with a different body is rejected" must not go green
-          // against a simulator that would let it through.
-          phone: params.phone,
-          amount: params.amount,
-          ...(params.accountReference !== undefined
-            ? { accountReference: params.accountReference }
-            : {}),
-          ...(params.description !== undefined ? { description: params.description } : {}),
-          ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
-          // Forward the key: the simulator dedupes on it exactly as production does, so the same
-          // key really does return the same paymentId here.
+    try {
+      // Simulator mode (`new Paylod(testKey, { simulate: true })`): same call, same ack, no handset.
+      // Your charge path runs UNCHANGED — which is the only way to actually test it. The key was
+      // proven to be a sandbox key in the constructor, so this branch cannot reach production.
+      if (this.#simulate) {
+        const created = await this.simulate.collect(
+          {
+            // Forward the WHOLE body, not a subset. The idempotency layer fingerprints the request
+            // body, so a field the simulator never sees is a field it cannot fingerprint: a reused
+            // key with changed `metadata` (or `description`) would 409 in production and silently
+            // REPLAY here. That is the exact false confidence the simulator exists to remove — a
+            // test asserting "a reused key with a different body is rejected" must not go green
+            // against a simulator that would let it through.
+            phone: params.phone,
+            amount: params.amount,
+            ...(params.accountReference !== undefined
+              ? { accountReference: params.accountReference }
+              : {}),
+            ...(params.description !== undefined ? { description: params.description } : {}),
+            ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
+            // Forward the key: the simulator dedupes on it exactly as production does, so the same
+            // key really does return the same paymentId here.
+            idempotencyKey,
+          },
+          options,
+        );
+        return {
+          paymentId: created.paymentId,
+          status: "pending",
+          checkoutRequestId: created.checkoutRequestId,
           idempotencyKey,
-        },
-        options,
-      );
-      return {
-        paymentId: created.paymentId,
-        status: "pending",
-        checkoutRequestId: created.checkoutRequestId,
-        idempotencyKey,
-      };
-    }
+        };
+      }
 
-    const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
-      method: "POST",
-      path: "/collect",
-      body,
-      idempotencyKey,
-      signal: options.signal,
-    });
-    return { ...ack, idempotencyKey };
+      const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
+        method: "POST",
+        path: "/collect",
+        body,
+        idempotencyKey,
+        signal: options.signal,
+        // A 2xx with no payment id is INDETERMINATE: the charge may have moved. Fail with the key
+        // attached rather than hand back an empty id a caller would treat as a new payment.
+        validate: (parsed, status) => {
+          const id = (parsed as { paymentId?: unknown } | null)?.paymentId;
+          if (typeof id !== "string" || id.trim() === "") {
+            throw new PaylodApiError(
+              "paylod returned a 2xx response with no paymentId — the charge state is " +
+                "INDETERMINATE. Read the payment with this idempotencyKey before starting any new " +
+                "attempt; do NOT mint a fresh key (that risks a second charge).",
+              status,
+              parsed,
+              idempotencyKey,
+              true,
+            );
+          }
+        },
+      });
+      return { ...ack, idempotencyKey };
+    } catch (err) {
+      // Whatever went wrong (network, timeout, 5xx, malformed 2xx), the caller MUST be able to
+      // recover the effective key and retry with the SAME one — a fresh key would double-charge.
+      attachIdempotencyKey(err, idempotencyKey);
+      throw err;
+    }
   }
 
   /** Read a payment. `GET /status/:id`. */
-  async status(paymentId: string, options: { signal?: AbortSignal } = {}): Promise<Payment> {
+  async status(
+    paymentId: string,
+    options: { signal?: AbortSignal; deadlineMs?: number } = {},
+  ): Promise<Payment> {
     if (!paymentId) throw new PaylodInvalidRequestError("paymentId is required.");
     return this.#request<Payment>({
       method: "GET",
       path: `/status/${encodeURIComponent(paymentId)}`,
       signal: options.signal,
+      deadlineMs: options.deadlineMs,
+      // A 2xx status body with no id is malformed — surface it rather than return an empty Payment.
+      validate: (parsed, status) => {
+        const id = (parsed as { id?: unknown } | null)?.id;
+        if (typeof id !== "string" || id.trim() === "") {
+          throw new PaylodApiError(
+            "paylod returned a 2xx status body with no payment id (malformed response).",
+            status,
+            parsed,
+          );
+        }
+      },
     });
   }
 
@@ -457,12 +654,16 @@ export class Paylod {
    */
   async wait(paymentId: string, options: WaitOptions = {}): Promise<PaymentOutcome> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
-    const startedAt = Date.now();
+    const startedAt = nowMs();
     const deadline = startedAt + timeoutMs;
 
     let last: Payment | undefined;
     for (let attempt = 0; ; attempt++) {
-      const payment = await this.status(paymentId, { signal: options.signal });
+      // Propagate the wait's deadline into each poll so no single status read can hang past it.
+      const payment = await this.status(paymentId, {
+        ...(options.signal ? { signal: options.signal } : {}),
+        deadlineMs: deadline,
+      });
       last = payment;
 
       const outcome = toOutcome(payment);
@@ -470,11 +671,11 @@ export class Paylod {
       options.onPoll?.(payment);
 
       const delay = pollDelay(attempt);
-      if (Date.now() + delay >= deadline) break;
+      if (nowMs() + delay >= deadline) break;
       await sleep(delay, options.signal);
     }
 
-    throw new PaylodTimeoutError(paymentId, last, Date.now() - startedAt);
+    throw new PaylodTimeoutError(paymentId, last as Payment, nowMs() - startedAt);
   }
 
   /**
