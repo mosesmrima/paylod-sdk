@@ -3,6 +3,103 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.7.0 — BREAKING
+
+Fourth-round codex review returned **NOT SAFE TO PUBLISH**. Four earlier rounds of per-finding
+patching had not converged, for a reason worth stating plainly: the findings were symptoms, and
+nobody had fixed the two structures generating them. This release changes the design rather than
+the symptoms.
+
+Signing is unchanged — the shared golden webhook vector (`whsec_golden_vector_v1` →
+`3afe38e4…2c2eb7`) still passes byte for byte, and its literals are untouched.
+
+### ROOT 1 — credentialed dispatch cannot be replaced
+
+The API key is a bearer credential. It used to be handed to a caller-supplied `fetch`, which was
+then policed after the fact: the SDK set `redirect: "manual"` and inspected the response for a
+3xx. That is not a control. An injected `fetch` can ignore `redirect: "manual"`, follow a
+cross-origin 302 itself, and return an ordinary `200` — and by the time the SDK inspects that
+response, the Authorization header has already been replayed to another host.
+
+- **New `Transport` owns the credential.** Callers pass a method, a path and a body. They never
+  see the key, never construct headers, and so have no way to address it anywhere.
+- **`options.fetch` is now a gated test seam.** It requires `allowCustomFetch: true` **and is
+  refused outright for `mp_live_` keys** — the posture `allowInsecureBaseUrl` already had.
+- **Origin pinned per dispatch**, not once at construction.
+- **Redirects refused four independent ways**: `opaqueredirect`, a 3xx status, `res.redirected`
+  (the implementation followed one despite `manual` — detection, with a message telling you to
+  rotate the key), and an off-origin `res.url`.
+
+**Migration:** `new Paylod(key, { fetch })` → `new Paylod(key, { fetch, allowCustomFetch: true })`,
+and only with an `mp_test_` key.
+
+### ROOT 2 — one semantic model, in `semantics.ts`
+
+Validators checked SHAPE. Every defect below involves a perfectly well-typed body, so shape
+validation could not see any of them. A payment record now makes one CLAIM (`status`) and carries
+EVIDENCE (`mpesaReceipt`, `resultCode`), and the two are never allowed to substitute for one
+another. Four laws, which the sibling PHP/Python/JVM SDKs mirror:
+
+- **L1 BINDING** — a returned payment id that is not the id requested is a hard error.
+- **L2 EVIDENCE** — `paid` requires a receipt **or** result code 0. Success *without* a receipt
+  stays legitimate: receipts attach asynchronously, so evidence of one kind is required, never a
+  receipt outright.
+- **L3 CONSISTENCY** — a claim contradicting its evidence is INDETERMINATE, never a failure, and
+  never a *retryable* failure.
+- **L4 RECEIPT** — a receipt forces `paid` or `indeterminate`; never failed, never in-flight.
+
+Behaviour changes, all confirmed against the previous build:
+
+| record | 0.6.0 | 0.7.0 |
+| --- | --- | --- |
+| `status: "pending"`, `resultCode: 0` | **paid**, receipt `null` | indeterminate |
+| `status: "failed"` + receipt + code 1032 | `cancelled`, **`retryable: true`** | indeterminate |
+| `status: "failed"` + receipt, no code | `failed`, receipt dropped | indeterminate |
+| `status: "pending"` + receipt | pending | indeterminate |
+
+The second row was the worst defect in the SDK: it told a merchant it was safe to charge again for
+a payment carrying an M-Pesa confirmation receipt.
+
+Also in this root:
+
+- **ID binding on every status read.** Nothing previously compared the returned `id` to the
+  requested one, so a cache keyed wrongly, a proxy collapsing requests, or a routing bug could
+  return a *different* payment — and if that one was paid, the caller shipped goods.
+- **Collect acks require HTTP 202**, not any 2xx. A bare `200` is what a cache, a captive portal
+  or a rewritten route produces; it is not a dispatched charge.
+- **Every dispatch surface runs the same validators, including the simulator.** `simulate.collect`
+  validates inside the request (so it sees the real status), generates an idempotency key when the
+  caller omits one — production always did — and `simulate.outcome` now carries an idempotency key
+  and validates its response as a payment, ID binding included. It previously did none of these.
+
+### Also closed
+
+- Webhook events are **validated, not cast**. `verifyWebhook` enforces the full schema, type/status
+  consistency, and success evidence via the same `judge()` the status path uses. Signature
+  verification is split out as `verifyWebhookSignature`.
+- Escaping failures are **normalised** into an SDK error carrying the idempotency key. The old
+  in-place mutation silently dropped it for thrown primitives and frozen errors.
+- The response body is read **inside** the timeout window; a stalled body can no longer hang past
+  the deadline.
+- Sanitised connection errors no longer carry the **unsanitised exception as `cause`**.
+- Deep redaction **fails closed** past depth 8 instead of returning values unredacted.
+- Malformed-2xx errors store the **redacted** body.
+- Deadlines use a **monotonic** clock, not the wall clock.
+- **Upper bounds** on timeouts and retries — `1e20` was accepted and, because `setTimeout` clamps
+  above 2^31-1 ms, meant "abort immediately".
+- Idempotency keys **exclude ASCII space** (HTTP trims field values, so `" k"` and `"k"` are the
+  same key on the wire and different keys in your database).
+- Webhook adapters no longer **echo handler exception messages**, and the Express adapter caps the
+  **unauthenticated** body it buffers at 1 MiB.
+
+### Verification
+
+330 tests, `tsc --noEmit` clean, build clean. Every change above is covered by a mutation test in
+`scripts/non-vacuity.mjs`, which reverts the protection in source, requires the guarding test to
+FAIL, and restores: **19/19 caught**. That harness found two vacuous tests of its own during this
+release — one whose `-t` selector matched zero tests because of a regex metacharacter, and one
+whose fixture tripped ID binding before reaching the code under test.
+
 ## 0.6.0
 
 Third-round codex review. This SDK came back with only **Low**-severity findings — the cleanest of
