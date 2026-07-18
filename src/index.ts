@@ -64,6 +64,7 @@ export { normalizePhone, normalizeMsisdn, isValidMsisdn, MSISDN_INPUT_RE } from 
 
 export {
   verifyWebhook,
+  verifyWebhookSignature,
   signWebhook,
   SIGNATURE_HEADER,
   EVENT_ID_HEADER,

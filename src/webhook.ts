@@ -17,6 +17,8 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodSignatureVerificationError } from "./errors.js";
+import { judge } from "./semantics.js";
+import { asPaymentStatus, PAYMENT_STATUSES } from "./validate.js";
 import type { WebhookEvent } from "./types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
@@ -95,12 +97,18 @@ function parseHeader(header: string): { t: string; v1: string } | null {
 }
 
 /**
- * Verify a paylod webhook and return the typed event.
+ * Verify ONLY the signature, the freshness and that the body is JSON. Returns the parsed body
+ * WITHOUT validating that it is a paylod event.
  *
- * Throws {@link PaylodSignatureVerificationError} on any failure — never returns a
- * half-trusted value. Respond `400` and drop the request when it throws.
+ * Split out from {@link verifyWebhook} because these are two genuinely different questions —
+ * "did paylod send this?" and "is this a well-formed payment event?" — and conflating them makes
+ * both harder to test. The cross-repo golden vector pins the SIGNING SCHEME, so it belongs on
+ * this function; the schema rules belong on `verifyWebhook`.
+ *
+ * Prefer {@link verifyWebhook} in application code. Reach for this only when you deliberately
+ * want the raw signed payload (a relay, a recorder, a schema-version shim).
  */
-export function verifyWebhook(params: VerifyParams): WebhookEvent {
+export function verifyWebhookSignature(params: VerifyParams): unknown {
   const { payload, signature, secret, toleranceSec = DEFAULT_TOLERANCE_SEC } = params;
 
   if (!secret) {
@@ -200,27 +208,142 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
     );
   }
 
-  let event: unknown;
   try {
-    event = JSON.parse(raw.toString("utf8"));
+    return JSON.parse(raw.toString("utf8"));
   } catch {
     throw new PaylodSignatureVerificationError(
       "invalid_payload",
       "Webhook body is signed correctly but is not valid JSON.",
     );
   }
-  if (
-    typeof event !== "object" ||
-    event === null ||
-    typeof (event as WebhookEvent).type !== "string" ||
-    typeof (event as WebhookEvent).data !== "object"
-  ) {
-    throw new PaylodSignatureVerificationError(
-      "invalid_payload",
-      "Webhook body is not a paylod event (missing `type`/`data`).",
+}
+
+/** Reject with a consistent, non-leaking message. */
+function invalid(detail: string): never {
+  throw new PaylodSignatureVerificationError(
+    "invalid_payload",
+    `Webhook body is signed correctly but is not a valid paylod event: ${detail}. A signature ` +
+      "proves WHO sent the body, not that the body means what your handler assumes — so the " +
+      "event is rejected rather than passed on half-understood.",
+  );
+}
+
+function optionalString(v: unknown, field: string): void {
+  if (v !== undefined && v !== null && typeof v !== "string") invalid(`${field} is not a string`);
+}
+
+/**
+ * Verify a paylod webhook and return the typed event.
+ *
+ * Throws {@link PaylodSignatureVerificationError} on any failure — never returns a half-trusted
+ * value. Respond `400` and drop the request when it throws.
+ *
+ * ── Why the schema is validated at all ────────────────────────────────────────────────────
+ * The previous version checked that `type` was a string and `data` was an object, then CAST the
+ * whole body to `WebhookEvent`. Every other field was a lie the type system was happy to tell:
+ * `event.data.status`, `event.data.amount` and `event.data.mpesaReceipt` were typed as
+ * `PaymentStatus`, `number` and `string | null` while actually being whatever arrived. A handler
+ * written against those types — which is every handler, because that is what the types are for —
+ * would branch on `data.status === "success"` and fulfil an order on a field nothing had checked.
+ *
+ * A valid signature does NOT make that safe. It proves the body came from paylod; it says
+ * nothing about whether the body is coherent. A bug upstream, a partially-written row, a schema
+ * change, or a compromised signing key all produce correctly-signed nonsense, and the handler is
+ * the last place that can refuse it.
+ *
+ * Three layers are enforced:
+ *   1. SHAPE       — every field present is the type the interface promises.
+ *   2. CONSISTENCY — `type` and `data.status` must agree. A `payment.success` carrying
+ *                    `status: "failed"` is not an event we can act on either way.
+ *   3. EVIDENCE    — a `payment.success` must satisfy the SAME semantic model a status read
+ *                    does: a receipt or result code 0. The event type is a claim, and a claim is
+ *                    not evidence for itself — this is law L2 from `semantics.ts`, applied to
+ *                    the delivery channel that most often triggers order fulfilment.
+ */
+export function verifyWebhook(params: VerifyParams): WebhookEvent {
+  const body = verifyWebhookSignature(params);
+
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    invalid("the body is not a JSON object");
+  }
+  const e = body as Record<string, unknown>;
+
+  if (e.type !== "payment.success" && e.type !== "payment.failed") {
+    invalid(`type was ${JSON.stringify(e.type)}, expected payment.success or payment.failed`);
+  }
+  if (typeof e.created !== "number" || !Number.isSafeInteger(e.created) || e.created < 0) {
+    invalid("created is not a non-negative integer of unix seconds");
+  }
+  if (typeof e.data !== "object" || e.data === null || Array.isArray(e.data)) {
+    invalid("data is not an object");
+  }
+  const d = e.data as Record<string, unknown>;
+
+  if (typeof d.paymentId !== "string" || d.paymentId.trim() === "") {
+    invalid("data.paymentId is missing or empty");
+  }
+  if (typeof d.status !== "string" || !PAYMENT_STATUSES.includes(d.status)) {
+    invalid(
+      `data.status was ${JSON.stringify(d.status)}, not one of ${PAYMENT_STATUSES.join("/")}`,
     );
   }
-  return event as WebhookEvent;
+  if (typeof d.amount !== "number" || !Number.isFinite(d.amount)) {
+    invalid("data.amount is not a finite number");
+  }
+  if (d.env !== undefined && d.env !== "sandbox" && d.env !== "production") {
+    invalid(`data.env was ${JSON.stringify(d.env)}, expected sandbox or production`);
+  }
+  optionalString(d.applicationId, "data.applicationId");
+  optionalString(d.phone, "data.phone");
+  optionalString(d.accountRef, "data.accountRef");
+  optionalString(d.mpesaReceipt, "data.mpesaReceipt");
+  optionalString(d.checkoutRequestId, "data.checkoutRequestId");
+  optionalString(d.resultDesc, "data.resultDesc");
+  if (
+    d.resultCode !== undefined &&
+    d.resultCode !== null &&
+    typeof d.resultCode !== "number" &&
+    typeof d.resultCode !== "string"
+  ) {
+    invalid("data.resultCode is neither a number/string nor null");
+  }
+
+  // 2. CONSISTENCY. The event type and the record's own status must say the same thing.
+  const expectedStatus = e.type === "payment.success" ? "success" : "failed";
+  if (d.status !== expectedStatus) {
+    invalid(
+      `type is ${JSON.stringify(e.type)} but data.status is ${JSON.stringify(d.status)} — the ` +
+        `event contradicts itself, so neither field can be trusted`,
+    );
+  }
+
+  // 3. EVIDENCE, via the one semantic model. Reusing `judge` rather than re-deriving the rule
+  // here is the whole point of having a model: the webhook path and the status-read path cannot
+  // drift into disagreeing about what proves a payment.
+  const { verdict, reason } = judge({
+    id: d.paymentId,
+    status: asPaymentStatus(d.status),
+    mpesaReceipt: typeof d.mpesaReceipt === "string" ? d.mpesaReceipt : null,
+    resultCode: (d.resultCode ?? null) as number | null,
+    resultDesc: typeof d.resultDesc === "string" ? d.resultDesc : null,
+  });
+
+  if (e.type === "payment.success" && verdict !== "paid") {
+    invalid(
+      `it announces a successful payment but the record does not prove one (${reason}). ` +
+        "Refusing to hand your handler an unevidenced success — that is how an order gets " +
+        "fulfilled for a payment that never settled",
+    );
+  }
+  if (e.type === "payment.failed" && verdict !== "failed") {
+    invalid(
+      `it announces a failed payment but the record does not support that (${reason}). In ` +
+        "particular a failure notice carrying a receipt, or one carrying a still-in-flight " +
+        "result code, must not be delivered as a settled failure",
+    );
+  }
+
+  return body as WebhookEvent;
 }
 
 /**

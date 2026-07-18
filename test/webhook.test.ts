@@ -6,6 +6,7 @@ import {
   SIGNATURE_HEADER,
   signWebhook,
   verifyWebhook,
+  verifyWebhookSignature,
 } from "../src/index.js";
 import type { WebhookEvent } from "../src/index.js";
 import { mockFetch } from "./helpers.js";
@@ -63,16 +64,20 @@ describe("signature scheme parity with the backend", () => {
       "t=1700000000,v1=3afe38e4c11734c84fad70dd16bbaeec6057ca998236f253be6bfa09ad2c2eb7";
 
     expect(signWebhook(GOLDEN_BODY, GOLDEN_SECRET, GOLDEN_T)).toBe(GOLDEN_HEADER);
+    // The vector pins the SIGNING SCHEME. Its body is a minimal signing fixture rather than a
+    // representative event, so it is verified at the signature layer — `verifyWebhook` also
+    // enforces the event schema, which is covered by its own tests instead of by editing these
+    // cross-repo-pinned literals.
     // And the verifier accepts its own signer's golden output. The fixed vector pins the clock via
     // `nowSec` at the vector's own `t` and runs a NORMAL 300s window — that is the only sanctioned
     // way to verify an ancient fixture, because the freshness check can no longer be disabled.
-    const event = verifyWebhook({
+    const event = verifyWebhookSignature({
       payload: GOLDEN_BODY,
       signature: GOLDEN_HEADER,
       secret: GOLDEN_SECRET,
       toleranceSec: 300,
       nowSec: GOLDEN_T,
-    });
+    }) as { data: { paymentId: string } };
     expect(event.data.paymentId).toBe("pay_golden");
   });
 });
@@ -186,7 +191,7 @@ describe("verifyWebhook", () => {
         secret: SECRET,
         nowSec: NOW,
       }),
-    ).toThrow(/not a paylod event/);
+    ).toThrow(/not a valid paylod event/);
   });
 
   it("rejects a non-numeric timestamp", () => {

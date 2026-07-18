@@ -931,10 +931,19 @@ export class Paylod {
         await handler(event);
       } catch (e) {
         // Non-2xx → paylod retries. Better a duplicate delivery than a lost payment.
-        return new Response(
-          JSON.stringify({ error: e instanceof Error ? e.message : "handler failed" }),
-          { status: 500, headers: { "content-type": "application/json" } },
-        );
+        //
+        // The handler's own exception message is NOT echoed. This response goes back over the
+        // public internet to whoever posted to the endpoint, and a handler message is arbitrary
+        // application text: a database error quoting a connection string, an ORM dump, a stack
+        // frame, an assertion carrying customer data. Returning it turns a webhook endpoint into
+        // an information-disclosure oracle that anyone can probe by posting garbage. The
+        // exception is re-thrown into the runtime's own error channel instead, so it still
+        // reaches your logs with full fidelity.
+        reportHandlerError(e);
+        return new Response(JSON.stringify({ error: "handler failed" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        });
       }
       return new Response(JSON.stringify({ received: true }), {
         status: 200,
@@ -999,13 +1008,46 @@ export class Paylod {
       try {
         await handler(event);
       } catch (e) {
-        res.status(500).json({ error: e instanceof Error ? e.message : "handler failed" });
+        // See `webhookHandler` — the handler's message is never echoed to the caller.
+        reportHandlerError(e);
+        res.status(500).json({ error: "handler failed" });
         return;
       }
       res.status(200).json({ received: true });
     };
   }
 }
+
+/**
+ * Surface a webhook handler's exception WITHOUT putting it in the HTTP response.
+ *
+ * The adapters answer 500 so paylod retries the delivery, but the response body is a fixed
+ * string: it travels back to whoever posted to the endpoint, and a handler's message is
+ * arbitrary application text (a database error quoting a connection string, an ORM dump, a
+ * stack frame, an assertion carrying customer data). Logging it locally keeps every bit of that
+ * diagnostic value for the operator while giving the caller nothing to probe for.
+ *
+ * Deliberately NOT re-thrown asynchronously: an exception raised from a microtask is an uncaught
+ * exception, and Node's default behaviour for one is to terminate the process. Turning a single
+ * failing webhook handler into a server crash would be a far worse bug than the leak this fixes.
+ */
+function reportHandlerError(e: unknown): void {
+  console.error("[paylod] webhook handler threw; responding 500 so paylod retries.", e);
+}
+
+/**
+ * Hard ceiling on a webhook body we will buffer, in bytes.
+ *
+ * The Express adapter drains the request stream BEFORE the signature has been checked — it has
+ * to, because verification needs the raw bytes. That means the bytes are UNAUTHENTICATED at the
+ * moment they are buffered, and with no limit, anyone who can reach the endpoint could stream
+ * gigabytes into the process heap and OOM it. A signature check that happens after unbounded
+ * buffering does not protect the buffering.
+ *
+ * 1 MiB is far above any real paylod event (they are a few hundred bytes) and far below anything
+ * that threatens a server.
+ */
+export const MAX_WEBHOOK_BODY_BYTES = 1_048_576;
 
 // ── Minimal structural types for Express/Connect (no `express` dependency) ────────
 
@@ -1030,11 +1072,23 @@ async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
   if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
   if (typeof req.rawBody === "string") return Buffer.from(req.rawBody, "utf8");
 
-  // Nothing parsed it yet → drain the stream ourselves.
+  // Nothing parsed it yet → drain the stream ourselves, under a hard size cap. These bytes are
+  // UNAUTHENTICATED: the signature cannot be checked until they have all arrived, so the cap is
+  // the only thing bounding what an anonymous caller can make this process allocate.
   if (req.body === undefined && typeof req[Symbol.asyncIterator] === "function") {
     const chunks: Buffer[] = [];
+    let total = 0;
     for await (const chunk of req as AsyncIterable<Buffer | Uint8Array | string>) {
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk));
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
+      total += buf.length;
+      if (total > MAX_WEBHOOK_BODY_BYTES) {
+        throw new Error(
+          `Webhook body exceeds ${MAX_WEBHOOK_BODY_BYTES} bytes. A paylod event is a few hundred ` +
+            "bytes; the request is refused before it is buffered because these bytes are not " +
+            "authenticated until the whole body has arrived.",
+        );
+      }
+      chunks.push(buf);
     }
     return Buffer.concat(chunks);
   }
