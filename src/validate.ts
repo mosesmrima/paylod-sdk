@@ -155,6 +155,42 @@ export type BodyRedactor = (body: unknown) => unknown;
 
 const identity: BodyRedactor = (b) => b;
 
+/** How a validator renders a MESSAGE without leaking the API key. Defaults to no-op. */
+export type TextRedactor = (text: string) => string;
+
+const identityText: TextRedactor = (t) => t;
+
+/**
+ * THE one sanitizer every SDK error message runs attacker-controlled values through.
+ *
+ * ── Why this exists ───────────────────────────────────────────────────────────────────────
+ * The malformed-2xx validators quoted the offending value back for diagnostic value — `status was
+ * "settled"`, `the body describes payment "pay_9"`. Those values come from the RESPONSE, which is
+ * exactly the thing being distrusted. A body whose `status` field, or whose mismatched `id`, is
+ * set to the bearer key put that key verbatim into the exception message and into its stack —
+ * which is then logged, shipped to an error reporter, and rendered in a dashboard. The `body`
+ * field on the error was carefully deep-redacted; the MESSAGE beside it was not, so the redaction
+ * protected the field nobody reads and missed the one everybody does.
+ *
+ * Three things happen here, in order:
+ *   1. the value is rendered as JSON, so a hostile object cannot run its own `toString`;
+ *   2. it is TRUNCATED, so a megabyte of response cannot become a megabyte of log line;
+ *   3. it is passed through the caller's key/secret redactor — the same one the body gets.
+ *
+ * Truncation before redaction would be wrong (a key split across the cut would survive), so the
+ * redactor runs last.
+ */
+export function sanitizeForMessage(value: unknown, redactText: TextRedactor = identityText): string {
+  let rendered: string;
+  try {
+    rendered = JSON.stringify(value) ?? String(value);
+  } catch {
+    rendered = "[unrenderable]";
+  }
+  const redacted = redactText(rendered);
+  return redacted.length > 80 ? `${redacted.slice(0, 80)}…` : redacted;
+}
+
 /**
  * Validate the COMPLETE `POST /collect` acknowledgement — including its HTTP STATUS.
  *
@@ -172,10 +208,13 @@ export function assertCollectAck(
     readonly idempotencyKey: string;
     readonly what?: string;
     readonly redactBody?: BodyRedactor;
+    /** Redacts the API key/secret out of any text interpolated into the message. */
+    readonly redactText?: TextRedactor;
   },
 ): void {
   const what = opts.what ?? "paylod";
   const redactBody = opts.redactBody ?? identity;
+  const safe = (v: unknown) => sanitizeForMessage(v, opts.redactText ?? identityText);
   const indeterminate = (detail: string): never => {
     throw new PaylodApiError(
       `${what} returned a response that is not a valid collect acknowledgement (${detail}) — ` +
@@ -220,7 +259,7 @@ export function assertCollectAck(
   // Note the asymmetry with a STATUS read, which legitimately carries terminal states. There,
   // `success` is not trusted from the string — it must be backed by a receipt or result code 0.
   if (ack.status !== "pending") {
-    return indeterminate(`status was ${JSON.stringify(ack.status)}, expected the literal "pending"`);
+    return indeterminate(`status was ${safe(ack.status)}, expected the literal "pending"`);
   }
 }
 
@@ -258,10 +297,13 @@ export function assertPaymentBody(
     readonly expectedId: string;
     readonly what?: string;
     readonly redactBody?: BodyRedactor;
+    /** Redacts the API key/secret out of any text interpolated into the message. */
+    readonly redactText?: TextRedactor;
   },
 ): void {
   const what = opts.what ?? "paylod";
   const redactBody = opts.redactBody ?? identity;
+  const safe = (v: unknown) => sanitizeForMessage(v, opts.redactText ?? identityText);
   const bad = (detail: string): never => {
     throw new PaylodApiError(
       `${what} returned a status body this SDK cannot trust (${detail}). The payment state is ` +
@@ -283,14 +325,14 @@ export function assertPaymentBody(
   // useless but actively misleading.
   if (p.id !== opts.expectedId) {
     return bad(
-      `the body describes payment ${JSON.stringify(p.id)} but ${JSON.stringify(opts.expectedId)} ` +
-        "was requested — this response answers a different question, so it tells you NOTHING " +
-        "about the payment you asked about",
+      `the body describes payment ${safe(p.id)} but ${safe(opts.expectedId)} was requested — ` +
+        "this response answers a different question, so it tells you NOTHING about the payment " +
+        "you asked about",
     );
   }
 
   if (typeof p.status !== "string" || !PAYMENT_STATUSES.includes(p.status)) {
-    return bad(`status was ${JSON.stringify(p.status)}, not one of ${PAYMENT_STATUSES.join("/")}`);
+    return bad(`status was ${safe(p.status)}, not one of ${PAYMENT_STATUSES.join("/")}`);
   }
   if (p.mpesaReceipt !== undefined && p.mpesaReceipt !== null && typeof p.mpesaReceipt !== "string") {
     return bad("mpesaReceipt is neither a string nor null");
@@ -302,6 +344,18 @@ export function assertPaymentBody(
     typeof p.resultCode !== "string"
   ) {
     return bad("resultCode is neither a number/string nor null");
+  }
+
+  // `resultDesc` was the one field on the record nothing checked, and it is not inert: it is a
+  // CORROBORATING SIGNAL the classifier reads (a "still processing" phrasing can outrank an
+  // uncatalogued code), so it is as load-bearing as `resultCode`. An object-valued `resultDesc`
+  // passed this validator, reached `classifyStkResult`, and threw a raw `TypeError` out of
+  // `.trim()` — so `check()` and `wait()` died with a stack trace from the middle of the SDK
+  // instead of raising the indeterminate-response error the caller knows how to handle. A crash
+  // is not a safe failure here: it happens AFTER a charge may have been raised, and it is not a
+  // shape any `catch (e instanceof PaylodError)` recovers from.
+  if (p.resultDesc !== undefined && p.resultDesc !== null && typeof p.resultDesc !== "string") {
+    return bad("resultDesc is neither a string nor null");
   }
 }
 

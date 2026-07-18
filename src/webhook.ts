@@ -247,8 +247,58 @@ function invalid(detail: string): never {
   );
 }
 
+/** A field the schema allows to be absent or explicitly null, but never any other shape. */
 function optionalString(v: unknown, field: string): void {
   if (v !== undefined && v !== null && typeof v !== "string") invalid(`${field} is not a string`);
+}
+
+/**
+ * A field the schema says is ALWAYS present and always a non-blank string.
+ *
+ * `applicationId`, `env` and `phone` were treated as optional and then cast into a `WebhookEvent`
+ * that types them as required. A handler reading `event.data.applicationId` to route a payment to
+ * the right merchant account, or `event.data.env` to refuse a sandbox event on a production
+ * ledger, was reading `undefined` through a type that promised a string — so the sandbox guard
+ * silently evaluated `undefined !== "production"` and the multi-tenant guard compared `undefined`
+ * against a real id. Optional-in-practice and required-in-the-types is the worst of both: nothing
+ * checks it and everything assumes it.
+ */
+function requiredString(v: unknown, field: string): void {
+  if (typeof v !== "string") invalid(`${field} is missing or is not a string`);
+  if ((v as string).trim() === "") invalid(`${field} is present but blank`);
+}
+
+/**
+ * The largest amount paylod will move in one payment, in KES. Mirrors the client-side `MAX_AMOUNT`
+ * so the delivery channel cannot admit a figure the charging channel would have refused.
+ */
+const MAX_WEBHOOK_AMOUNT = 150_000;
+
+/**
+ * M-Pesa moves WHOLE KENYAN SHILLINGS. It has no sub-unit on this rail, it cannot move a negative
+ * amount, and it cannot move zero.
+ *
+ * `Number.isFinite` was the whole check, so `-100`, `0.5` and `1e15` all arrived at a handler
+ * typed as a plain `number`. Each one is a live reconciliation bug: a negative books a credit
+ * against an order, a fraction rounds differently in the ledger than it does in the UI, and an
+ * absurd figure trips limits somewhere downstream instead of here. An amount that could never
+ * have been charged is a strong signal the record is wrong, and a wrong record must not be
+ * delivered as a settled payment.
+ */
+function assertAmount(v: unknown): void {
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    invalid("data.amount is not a finite number");
+  }
+  const n = v as number;
+  if (!Number.isInteger(n) || Object.is(n, -0)) {
+    invalid(`data.amount must be a whole number of KES (got ${JSON.stringify(n)})`);
+  }
+  if (n <= 0 || n > MAX_WEBHOOK_AMOUNT) {
+    invalid(
+      `data.amount must be between 1 and ${MAX_WEBHOOK_AMOUNT} KES (got ${JSON.stringify(n)}) — ` +
+        "an amount M-Pesa could never have moved is evidence the record is wrong",
+    );
+  }
 }
 
 /**
@@ -306,14 +356,12 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
       `data.status was ${JSON.stringify(d.status)}, not one of ${PAYMENT_STATUSES.join("/")}`,
     );
   }
-  if (typeof d.amount !== "number" || !Number.isFinite(d.amount)) {
-    invalid("data.amount is not a finite number");
-  }
-  if (d.env !== undefined && d.env !== "sandbox" && d.env !== "production") {
+  assertAmount(d.amount);
+  if (d.env !== "sandbox" && d.env !== "production") {
     invalid(`data.env was ${JSON.stringify(d.env)}, expected sandbox or production`);
   }
-  optionalString(d.applicationId, "data.applicationId");
-  optionalString(d.phone, "data.phone");
+  requiredString(d.applicationId, "data.applicationId");
+  requiredString(d.phone, "data.phone");
   optionalString(d.accountRef, "data.accountRef");
   optionalString(d.mpesaReceipt, "data.mpesaReceipt");
   optionalString(d.checkoutRequestId, "data.checkoutRequestId");
@@ -376,16 +424,25 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
   // canonical catalog, keyed on the fields we DID validate (`resultCode` / `resultDesc`) — the
   // same call `decodeError()` and `check()` make. The payload's own block is discarded.
   //
-  // Null in, null out: the contract is that `decoded` is populated on `payment.failed` and null on
-  // `payment.success`, and recomputing must not start inventing a block where the schema says
-  // there is none.
+  // THE BLOCK'S PRESENCE IS DERIVED FROM THE EVENT TYPE, NOT FROM THE PAYLOAD.
+  //
+  // "Null in, null out" still let the payload vote — just on a different question. Omitting
+  // `decoded` from a `payment.failed` produced an event with `decoded: null`, and every handler
+  // that renders `event.data.decoded.customerMessage` or gates a retry on
+  // `event.data.decoded.retryable` then hits a null it was typed to believe could not be there.
+  // A block that goes missing exactly when a hostile sender wants a retry decision skipped is the
+  // same defect as a block that lies, reached by omission instead of assertion.
+  //
+  // So the contract is enforced rather than mirrored: `payment.failed` ALWAYS carries a block,
+  // synthesised from the canonical catalog; `payment.success` NEVER does. Nothing the payload
+  // sends — a hostile block, a partial block, no block at all — changes either answer.
   const decoded =
-    d.decoded === null || d.decoded === undefined
-      ? null
-      : decodeDarajaResult(
-          (d.resultCode ?? null) as number | string | null,
+    e.type === "payment.failed"
+      ? decodeDarajaResult(
+          d.resultCode ?? null,
           typeof d.resultDesc === "string" ? d.resultDesc : null,
-        );
+        )
+      : null;
 
   // Rebuilt rather than mutated: the caller owns the object they parsed, and a verifier that
   // silently edits its input is a surprise nobody needs. Every other field is passed through
