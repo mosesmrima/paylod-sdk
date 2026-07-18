@@ -1,0 +1,49 @@
+name: CI
+
+# This repo had no CI at all — only release.yml, which runs on a published GitHub Release and so
+# gives no signal on push or PR. `engines.node` was therefore an untested claim.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # MUST stay in sync with `engines.node` in package.json (>=18).
+      #
+      # Unlike @paylod/mcp, this package's >=18 floor is REAL and is exercised here. It has zero
+      # runtime dependencies and touches crypto only through named `node:crypto` imports
+      # (randomUUID, createHmac, timingSafeEqual) — never `globalThis.crypto`, the Node 19+ global
+      # that forces @paylod/mcp up to 20. Its only other platform need is global `fetch`, which
+      # Node 18 ships. Verified: the full suite passes on 18.20.8, 20, 22 and 24.
+      matrix:
+        node-version: [18, 20, 22, 24]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check vendored Daraja catalog is in sync
+        run: npm run check-catalog
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
