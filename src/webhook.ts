@@ -19,7 +19,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodSignatureVerificationError } from "./errors.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
 import { judge } from "./semantics.js";
-import { asPaymentStatus, PAYMENT_STATUSES } from "./validate.js";
+import { asPaymentStatus, asWireResultCode, containsSecret, PAYMENT_STATUSES } from "./validate.js";
 import type { WebhookEvent } from "./types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
@@ -64,6 +64,63 @@ export interface VerifyParams {
 function toBuffer(payload: string | Buffer | Uint8Array): Buffer {
   if (typeof payload === "string") return Buffer.from(payload, "utf8");
   return Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+}
+
+/**
+ * Hard ceiling on a webhook body this SDK will authenticate, in bytes.
+ *
+ * ── Why it lives HERE and not on the adapters ─────────────────────────────────────────────
+ * It used to live in `client.ts`, next to the Express and Web-`Request` adapters that drain the
+ * request stream — which made it a property of THOSE TWO INTAKE PATHS rather than of webhook
+ * verification. The manual API is public and documented, and it is what every framework this SDK
+ * has no adapter for uses: Fastify, Koa, NestJS, AWS Lambda, Azure Functions, a raw
+ * `http.createServer`, a queue consumer replaying stored bodies. All of them call
+ * `verifyWebhook` / `verifyWebhookSignature` directly, and all of them got NO cap at all.
+ *
+ * That is the same OOM the adapters were fixed for, reached through the front door: an anonymous
+ * caller who can reach the endpoint hands over an arbitrarily large body, and this SDK then runs
+ * an HMAC pass, a UTF-8 decode and a full JSON parse across every unauthenticated byte of it.
+ * The bytes cannot be authenticated first — verification needs all of them — so the cap is the
+ * only bound that exists, and it has to sit on the function that does the authenticating.
+ *
+ * 1 MiB is far above any real paylod event (a few hundred bytes) and far below anything that
+ * threatens a server. The adapters import this constant rather than declaring their own, so the
+ * advertised limit and the enforced limit are the same number in every path.
+ */
+export const MAX_WEBHOOK_BODY_BYTES = 1_048_576;
+
+/** The one refusal, so every intake path says the same thing for the same reason. */
+export function tooLargeBody(detail: string): Error {
+  return new Error(
+    `Webhook body exceeds ${MAX_WEBHOOK_BODY_BYTES} bytes (${detail}). A paylod event is a few ` +
+      "hundred bytes; the request is refused before it is buffered because these bytes are not " +
+      "authenticated until the whole body has arrived, and an unbounded buffer an anonymous " +
+      "caller can fill is an OOM they control.",
+  );
+}
+
+/**
+ * Convert an incoming payload to bytes and REFUSE IT IF IT IS OVER THE CAP — before the HMAC,
+ * before the UTF-8 decode, before `JSON.parse`.
+ *
+ * The size is measured on the BYTES, never on `String.length`: a UTF-16 length undercounts every
+ * non-ASCII character by up to 3x, so a "1 MiB" check on a string length is really a 3 MiB check
+ * against an attacker who picks the characters.
+ */
+function toBoundedBuffer(payload: string | Buffer | Uint8Array): Buffer {
+  if (typeof payload !== "string" && !ArrayBuffer.isView(payload)) {
+    throw new PaylodSignatureVerificationError(
+      "invalid_payload",
+      "verify() needs the RAW request body as a string, Buffer or Uint8Array — not a parsed " +
+        "object. Re-serialising a parsed body does not reproduce the signed bytes.",
+    );
+  }
+  const declared =
+    typeof payload === "string" ? Buffer.byteLength(payload, "utf8") : payload.byteLength;
+  if (declared > MAX_WEBHOOK_BODY_BYTES) {
+    throw tooLargeBody(`the payload passed to verify() is ${declared} bytes`);
+  }
+  return toBuffer(payload);
 }
 
 /** A well-formed `v1` is 64 lowercase hex chars (HMAC-SHA256 digest). */
@@ -126,6 +183,16 @@ function parseHeader(header: string): { t: string; v1: string } | null {
  */
 export function verifyWebhookSignature(params: VerifyParams): unknown {
   const { payload, signature, secret, toleranceSec = DEFAULT_TOLERANCE_SEC } = params;
+
+  // THE SIZE CAP, FIRST — before the conversion, before the HMAC, before `JSON.parse`.
+  //
+  // This is the public, manual verification path, and it had no bound of any kind. Every
+  // framework without an adapter in this SDK arrives here, so "the webhook endpoint is capped at
+  // 1 MiB" was true only for Express and the Web `Request` handler and false everywhere else.
+  // These bytes are UNAUTHENTICATED by definition at this point — the signature is what we are
+  // about to compute — so an anonymous caller chose them, and without a cap they choose how much
+  // work and how much memory this process spends before it is allowed to say no.
+  const raw = toBoundedBuffer(payload);
 
   if (!secret) {
     throw new PaylodSignatureVerificationError(
@@ -211,7 +278,6 @@ export function verifyWebhookSignature(params: VerifyParams): unknown {
     );
   }
 
-  const raw = toBuffer(payload);
   const expected = createHmac("sha256", secret)
     .update(`${parsed.t}.`)
     .update(raw)
@@ -444,10 +510,61 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
         )
       : null;
 
-  // Rebuilt rather than mutated: the caller owns the object they parsed, and a verifier that
-  // silently edits its input is a surprise nobody needs. Every other field is passed through
-  // exactly as validated.
-  return { ...e, data: { ...d, decoded } } as unknown as WebhookEvent;
+  // 5. THE EVENT IS RECONSTRUCTED FIELD BY FIELD — NEVER SPREAD.
+  //
+  // `{ ...e, data: { ...d, decoded } }` validated a known set of fields and then returned a
+  // strictly LARGER object: every key the payload carried that the schema does not name came
+  // along, typed as if it were not there. The signature does not help — it proves paylod sent
+  // the bytes, and a compromised or misconfigured signer produces perfectly-signed extra fields.
+  // A `__raw`, a `debug`, a mirrored `headers` block lands inside `event.data`, and the FIRST
+  // thing a handler does with a verified event is log it. That is the webhook secret (or
+  // anything else upstream echoed) written to the caller's log sink under a signature that says
+  // it is trustworthy.
+  //
+  // The allowlist below IS the `WebhookEvent` interface. Building the object from exactly these
+  // keys means an unknown field cannot survive verification by construction — not because we
+  // remembered to delete it, and not because a `delete` list was kept in sync with the schema.
+  // Adding a field to `WebhookEvent` without adding it here is a compile error.
+  const event: WebhookEvent = {
+    type: e.type,
+    created: e.created,
+    data: {
+      paymentId: d.paymentId,
+      applicationId: d.applicationId as string,
+      env: d.env,
+      status: asPaymentStatus(d.status),
+      amount: d.amount as number,
+      phone: d.phone as string,
+      accountRef: typeof d.accountRef === "string" ? d.accountRef : null,
+      mpesaReceipt: typeof d.mpesaReceipt === "string" ? d.mpesaReceipt : null,
+      checkoutRequestId: typeof d.checkoutRequestId === "string" ? d.checkoutRequestId : null,
+      resultCode: asWireResultCode(d.resultCode),
+      resultDesc: typeof d.resultDesc === "string" ? d.resultDesc : null,
+      decoded,
+    },
+  };
+
+  // 6. THE SECRET MUST NOT APPEAR IN THE EVENT WE HAND OVER.
+  //
+  // The allowlist above closes the UNKNOWN-field route. This closes the known-field one: a
+  // `resultDesc`, an `accountRef` or a `phone` whose VALUE carries the signing secret. Those are
+  // free-text fields, they are rendered in dashboards and written to ordinary handler logs, and
+  // the secret is the one value that must never reach either — it is what lets an attacker forge
+  // events, so leaking it converts a log reader into a signer.
+  //
+  // Refused rather than redacted, and refused AFTER the signature checked out, because a
+  // correctly-signed event that contains the signing secret is not a well-formed event with an
+  // unfortunate string in it. It is evidence that something upstream is echoing the secret, and
+  // the honest response to that is to stop, not to quietly scrub one copy and continue.
+  if (containsSecret(event, [params.secret])) {
+    invalid(
+      "the event body contains the webhook signing secret. A verified event is logged wholesale " +
+        "by handlers, so delivering it would write the signing key — the value that lets anyone " +
+        "forge these events — into ordinary application logs",
+    );
+  }
+
+  return event;
 }
 
 /**

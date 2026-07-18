@@ -23,7 +23,16 @@
  */
 
 import { PaylodInvalidRequestError, PaylodSandboxOnlyError } from "./errors.js";
-import { assertCollectAck, assertPaymentBody, resolveIdempotencyKey } from "./validate.js";
+import {
+  assertAccountReference,
+  assertChargeAmount,
+  assertDescription,
+  assertValidIdempotencyKey,
+  parseCollectAck,
+  parsePaymentBody,
+  resolveIdempotencyKey,
+} from "./validate.js";
+import { withIdempotencyKey } from "./reconcile.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
@@ -107,6 +116,13 @@ export interface SimulatedPayment {
   readonly checkoutRequestId: string;
   /** The outcomes you may force on this payment. */
   readonly outcomes: readonly SimOutcomeChoice[];
+  /**
+   * The `Idempotency-Key` that was actually sent — the one you passed, or the throwaway the SDK
+   * minted under `unsafeGeneratedIdempotencyKey`. It mirrors {@link CollectAck.idempotencyKey}
+   * for the same reason: it is the handle a caller needs to replay THIS attempt rather than mint
+   * a fresh key, and `simulate.pay()` needs it to attach to a post-acknowledgement failure.
+   */
+  readonly idempotencyKey: string;
 }
 
 /** The raw `200` body from `POST /simulate/outcome`. */
@@ -170,7 +186,7 @@ export type SimTransport = <T>(opts: {
   body: unknown;
   idempotencyKey?: string;
   signal?: AbortSignal;
-  validate?: (parsed: unknown, status: number) => void;
+  project?: (parsed: unknown, status: number) => T;
 }) => Promise<T>;
 
 /**
@@ -251,12 +267,17 @@ export class Simulator {
       "simulate.collect()",
     );
 
-    const amount = params.amount ?? 1;
-    if (!Number.isInteger(amount) || amount <= 0) {
-      throw new PaylodInvalidRequestError(
-        `simulate.collect(): amount must be a positive whole number of KES (got ${amount}).`,
-      );
-    }
+    // THE PRODUCTION VALIDATORS, on every simulator dispatch.
+    //
+    // This used to be a local `Number.isInteger(amount) && amount > 0` and nothing else — no
+    // 150,000 KES ceiling, no reference bound, no description bound. So the simulator accepted a
+    // charge for 10,000,000 KES with a 200-character description, and a test written against it
+    // proved a request production rejects at the boundary. That is the same class of divergence
+    // the idempotency-key rule was consolidated to fix: a simulator that is LAXER than production
+    // certifies guarantees that are not in force, which is worse than having no simulator.
+    const amount = assertChargeAmount(params.amount ?? 1, "simulate.collect()");
+    assertAccountReference(params.accountReference, "simulate.collect()");
+    assertDescription(params.description, "simulate.collect()");
 
     const body: Record<string, unknown> = {
       phone: params.phone ? normalizePhone(params.phone) : DEFAULT_SIM_PHONE,
@@ -272,35 +293,46 @@ export class Simulator {
     if (params.description !== undefined) body.description = params.description;
     if (params.metadata !== undefined) body.metadata = params.metadata;
 
-    const ack = await this.#request<{
-      paymentId: string;
-      checkoutRequestId: string;
-      status: "pending";
-      outcomes: readonly SimOutcomeChoice[];
-    }>({
-      method: "POST",
-      path: "/simulate/collect",
-      body,
-      idempotencyKey,
-      ...(options.signal ? { signal: options.signal } : {}),
-      // THE SAME validator production runs, with the REAL HTTP status — including the 202
-      // requirement. A simulator that tolerates an acknowledgement production would reject
-      // teaches the wrong thing about the shape of a real response, and silently hands back
-      // `paymentId: undefined` for the rest of the test to trip over.
-      validate: (parsed, status) =>
-        assertCollectAck(parsed, {
-          httpStatus: status,
-          idempotencyKey,
-          what: "simulate.collect()",
-        }),
-    });
+    // THE RECONCILIATION ENVELOPE, on the simulator too. A `simulate.collect()` that fails
+    // mid-flight used to throw bare: no key on the error, so a test asserting "I can always
+    // recover the key and replay the same attempt" passed against production and would have
+    // failed here. The simulator's whole promise is that your charge path runs unchanged, and
+    // the error path is part of the charge path.
+    try {
+      const ack = await this.#request<SimulatedPayment>({
+        method: "POST",
+        path: "/simulate/collect",
+        body,
+        idempotencyKey,
+        ...(options.signal ? { signal: options.signal } : {}),
+        // THE SAME validator production runs, with the REAL HTTP status — including the 202
+        // requirement. A simulator that tolerates an acknowledgement production would reject
+        // teaches the wrong thing about the shape of a real response, and silently hands back
+        // `paymentId: undefined` for the rest of the test to trip over.
+        //
+        // It RECONSTRUCTS, exactly as production does: the returned object is built from the
+        // validated ack plus the outcome menu, never from the parsed body.
+        project: (parsed, status) => {
+          const validated = parseCollectAck(parsed, {
+            httpStatus: status,
+            idempotencyKey,
+            what: "simulate.collect()",
+          });
+          const raw = parsed as { outcomes?: unknown };
+          return {
+            paymentId: validated.paymentId,
+            status: "pending",
+            checkoutRequestId: validated.checkoutRequestId,
+            outcomes: Array.isArray(raw.outcomes) ? (raw.outcomes as SimOutcomeChoice[]) : [],
+            idempotencyKey,
+          };
+        },
+      });
 
-    return {
-      paymentId: ack.paymentId,
-      status: "pending",
-      checkoutRequestId: ack.checkoutRequestId,
-      outcomes: ack.outcomes ?? [],
-    };
+      return ack;
+    } catch (err) {
+      throw withIdempotencyKey(err, idempotencyKey, (m) => m);
+    }
   }
 
   /**
@@ -320,7 +352,35 @@ export class Simulator {
     assertSandboxKey(this.#apiKey, "simulate.outcome()");
     if (!paymentId) throw new PaylodInvalidRequestError("simulate.outcome(): paymentId is required.");
 
-    const ack = await this.#request<SimSettleAck>({
+    // THE DERIVED KEY RUNS THE SHARED VALIDATOR.
+    //
+    // It is built by interpolating a caller-supplied `paymentId` into a template, and then it was
+    // put straight into an HTTP header without ever meeting the rule every other key in this SDK
+    // must satisfy. A payment id carrying a newline, a space, a C1 control or a non-ASCII
+    // character produced a key production would reject outright — either a transport crash or,
+    // worse, a silently re-encoded header, which is the exact "two requests stop sharing one key"
+    // failure `assertValidIdempotencyKey` exists to prevent. Deriving a key is not a reason to
+    // skip validating it; it is a reason to validate it, because nobody reviewed it by hand.
+    const idempotencyKey = `sim-outcome-${paymentId}-${outcome}`;
+    assertValidIdempotencyKey(idempotencyKey, "simulate.outcome(): derived idempotencyKey");
+
+    try {
+      return await this.#settle(paymentId, outcome, idempotencyKey, options);
+    } catch (err) {
+      // Settling is a mutating call, so its failures carry the key AND the payment id — the two
+      // handles needed to find out whether the settle landed before deciding anything else.
+      throw withIdempotencyKey(err, idempotencyKey, (m) => m, paymentId);
+    }
+  }
+
+  /** The settle dispatch itself. Split out so the reconciliation envelope wraps ALL of it. */
+  async #settle(
+    paymentId: string,
+    outcome: SimOutcomeId,
+    idempotencyKey: string,
+    options: { signal?: AbortSignal },
+  ): Promise<SimulatedOutcome> {
+    const ack = await this.#request<SimulatedOutcome>({
       method: "POST",
       path: "/simulate/outcome",
       body: { paymentId, outcome },
@@ -328,7 +388,7 @@ export class Simulator {
       // could re-dispatch it. The key is derived deterministically from the operation, which is
       // exactly the right shape here: retrying "settle THIS payment as THIS outcome" is the same
       // operation and must replay, while settling it as a different outcome is a different one.
-      idempotencyKey: `sim-outcome-${paymentId}-${outcome}`,
+      idempotencyKey,
       ...(options.signal ? { signal: options.signal } : {}),
       // The settle response describes a PAYMENT, so it runs the payment validator — the same one
       // `status()` runs, ID BINDING included. This surface previously did no validation at all:
@@ -336,25 +396,25 @@ export class Simulator {
       // classifier, so a body describing a DIFFERENT payment (or carrying an unknown status) was
       // classified on its merits and returned as this payment's outcome. Every dispatch surface
       // runs the same validators, or the guarantee is not a guarantee.
-      validate: (parsed, status) =>
-        assertPaymentBody(normalizeSettleAck(parsed), {
+      // RECONSTRUCTED, exactly as `status()` is. The settle ack describes a payment, so the
+      // shared parser owns the `Payment` that reaches the classifier — the fields are rebuilt
+      // from the validated body rather than read off the raw one, so a simulator response cannot
+      // carry an unknown field into a `PaymentOutcome` any more than a production one can.
+      project: (parsed, status) => {
+        const payment = parsePaymentBody(normalizeSettleAck(parsed), {
           httpStatus: status,
           expectedId: paymentId,
           what: "simulate.outcome()",
-        }),
+        });
+        const raw = parsed as { webhookQueued?: unknown };
+        // Build the outcome with the SAME classifier every other read uses. This is the point of
+        // the whole feature: there is no "simulated" outcome type and no special branch —
+        // `paylod.check()` on this id returns an identical object.
+        return { ...toOutcome(payment), webhookQueued: raw.webhookQueued !== false };
+      },
     });
 
-    // Build the outcome with the SAME classifier every other read uses. This is the point of the
-    // whole feature: there is no "simulated" outcome type and no special branch — `paylod.check()`
-    // on this id returns an identical object.
-    const payment: Payment = {
-      id: ack.paymentId,
-      status: ack.status,
-      mpesaReceipt: ack.mpesaReceipt ?? null,
-      resultCode: ack.resultCode ?? null,
-      resultDesc: ack.resultDesc ?? null,
-    };
-    return { ...toOutcome(payment), webhookQueued: ack.webhookQueued !== false };
+    return ack;
   }
 
   /**
@@ -375,6 +435,18 @@ export class Simulator {
     // back into "both optional", which is precisely the shape the required key exists to forbid.
     const { outcome, ...rest } = params;
     const created = await this.collect(rest as SimulateCollectParams, options);
-    return this.outcome(created.paymentId, outcome, options);
+
+    // POST-ACKNOWLEDGEMENT FAILURES CARRY THE PAYMENT ID.
+    //
+    // `collect()` above attaches the key to its own failures, but the moment it returns, a
+    // payment EXISTS — and everything after that point used to throw with no payment id on it.
+    // A caller catching a failed `simulate.pay()` therefore had no handle on the row that had
+    // just been created, which is the same loss `collectAndWait` was fixed for on the production
+    // side. The simulator has to lose the same things production loses, and no more.
+    try {
+      return await this.outcome(created.paymentId, outcome, options);
+    } catch (err) {
+      throw withIdempotencyKey(err, created.idempotencyKey, (m) => m, created.paymentId);
+    }
   }
 }

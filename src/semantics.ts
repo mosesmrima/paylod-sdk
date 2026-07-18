@@ -34,7 +34,8 @@
  *   L1  BINDING      A record whose `id` is not the id that was requested is never evaluated
  *                    at all. It is a hard error. (Enforced at the transport boundary, in
  *                    `validate.ts` — a wrong-payment body must not even reach this file.)
- *   L2  EVIDENCE     `paid` requires SUCCESS evidence. A bare `status: "success"` with no
+ *   L2  EVIDENCE     A TERMINAL verdict requires evidence, in BOTH directions. A bare
+ *                    `status: "success"` with no
  *                    receipt and no result code proves nothing and is never paid. Note the
  *                    converse is NOT required: success WITHOUT a receipt is legitimate,
  *                    because receipts attach asynchronously — result code 0 is equally good
@@ -146,9 +147,10 @@ export function evidenceFor(payment: Payment): PaymentEvidence {
  *   • Success evidence beside a non-success claim is never paid and never failed — the two
  *     signals contradict, so it is indeterminate (L3 + L4).
  *   • A success claim needs evidence to be believed (L2).
- *   • A failure claim is believed on failure evidence or on silence: proving a payment did NOT
- *     happen is not something we require evidence for, because the safe action (do not ship,
- *     do not capture) is the same either way.
+ *   • A failure claim needs evidence too (L2 again). `failed` with NOTHING behind it proves no
+ *     more than `success` with nothing behind it: `failed` is TERMINAL here — it stops `wait()`
+ *     polling and it is what `verifyWebhook` requires before it will deliver a `payment.failed`
+ *     — so an unbacked failure claim ends the wait on a payment that may still be mid-PIN.
  *   • In-flight evidence outranks a terminal `failed` claim: a `failed` row carrying 4999
  *     means the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure
  *     is the revenue-losing bug this codebase already shipped twice.
@@ -185,9 +187,10 @@ const CONFLICT_REASON =
  *   • Success evidence beside a non-success claim is never paid and never failed — the two
  *     signals contradict, so it is indeterminate (L3 + L4).
  *   • A success claim needs evidence to be believed (L2).
- *   • A failure claim is believed on failure evidence or on silence: proving a payment did NOT
- *     happen is not something we require evidence for, because the safe action (do not ship,
- *     do not capture) is the same either way.
+ *   • A failure claim needs evidence too (L2 again). `failed` with NOTHING behind it proves no
+ *     more than `success` with nothing behind it: `failed` is TERMINAL here — it stops `wait()`
+ *     polling and it is what `verifyWebhook` requires before it will deliver a `payment.failed`
+ *     — so an unbacked failure claim ends the wait on a payment that may still be mid-PIN.
  *   • In-flight evidence outranks a terminal `failed` claim: a `failed` row carrying 4999
  *     means the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure
  *     is the revenue-losing bug this codebase already shipped twice.
@@ -236,7 +239,34 @@ const VERDICTS: {
       "status claims failed but the evidence proves the payment succeeded — refusing to " +
         "report a payment that carries proof of settlement as a failure",
     ],
-    none: ["failed", "the payment failed terminally"],
+    // L2, APPLIED SYMMETRICALLY. This cell used to read `failed`, on the argument that "the safe
+    // action is the same either way" — do not ship, do not capture. That argument is wrong, and
+    // it was the last place in this module where A CLAIM SUBSTITUTED FOR MISSING EVIDENCE.
+    //
+    // `failed` is not a neutral resting state in this SDK, it is a TERMINAL one with two live
+    // consequences. `wait()` stops polling the moment the verdict leaves `pending`, so a bare
+    // `{ status: "failed" }` — the shape a truncated row, a stubbed endpoint, a cached error
+    // envelope or a partially-written record produces — ends the wait on a payment that may be
+    // mid-PIN and about to succeed, and the customer is shown "Please try again" for a charge
+    // that then settles. And `verifyWebhook` accepts a `payment.failed` event only when the
+    // verdict is `failed`, so this cell was the one that let an evidence-free failure notice
+    // through to a handler that reverses an order.
+    //
+    // We required evidence for `success` for exactly this reason and then took `failed` on
+    // trust. Both directions lose money; the success direction loses it visibly, which is the
+    // only reason it got the rule first. A record that proves nothing resolves to
+    // `indeterminate`, which renders as `pending` — the wait continues, the webhook settles it,
+    // and nothing terminal is reported on the strength of an unbacked assertion.
+    //
+    // NOTE what this deliberately does NOT change: `failed` beside a real catalog failure code
+    // is still `failed` (the cell below), and the catalog still decides whether that code is
+    // retryable. A cancelled or wrong-PIN payment is as retryable as it ever was.
+    none: [
+      "indeterminate",
+      "status claims failed but the record carries neither a result code nor a receipt, so " +
+        "there is no evidence the payment actually failed — reporting a terminal failure on an " +
+        "unbacked claim stops the wait on a payment that may still be mid-PIN",
+    ],
     failure: ["failed", "the payment failed terminally"],
     in_flight: [
       "in_flight",

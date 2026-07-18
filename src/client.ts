@@ -15,22 +15,38 @@ import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
 import { assertSandboxKey, Simulator } from "./simulate.js";
 import {
-  assertCollectAck,
-  assertPaymentBody,
+  assertAccountReference,
+  assertChargeAmount,
+  assertDescription,
+  parseCollectAck,
+  parsePaymentBody,
   resolveIdempotencyKey,
   assertWholeNonNegative,
   assertWholePositiveMs,
+  MAX_AMOUNT,
 } from "./validate.js";
+import { withIdempotencyKey } from "./reconcile.js";
 import { assertSecureBaseUrl, monotonicNowMs, Transport } from "./transport.js";
 import type {
   CollectAck,
+  CollectAckWire,
   CollectParams,
   Payment,
   PaylodOptions,
   WaitOptions,
   WebhookEvent,
 } from "./types.js";
-import { SIGNATURE_HEADER, verifyWebhook } from "./webhook.js";
+import {
+  MAX_WEBHOOK_BODY_BYTES,
+  SIGNATURE_HEADER,
+  tooLargeBody,
+  verifyWebhook,
+} from "./webhook.js";
+
+// Re-exported so the public entry point keeps exporting it from here. The DEFINITION moved to
+// `webhook.ts` — see the constant's own comment: the cap belongs to verification, not to the two
+// adapters that happen to buffer bytes.
+export { MAX_WEBHOOK_BODY_BYTES };
 
 /**
  * The base URL. It is the same for every paylod customer, so it is baked in — you never pass
@@ -57,8 +73,6 @@ const MAX_UNBOUNDED_SLEEP_MS = 60_000;
 /** Ramp: quick first look, then ease off. Capped at 5s. Values in ms. */
 const POLL_SCHEDULE_MS = [1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000] as const;
 
-const MAX_AMOUNT = 150_000;
-
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
@@ -84,7 +98,7 @@ function pollDelay(attempt: number): number {
   return jitter(base);
 }
 
-interface RequestOptions {
+interface RequestOptions<T> {
   readonly method: "GET" | "POST";
   readonly path: string;
   readonly body?: unknown;
@@ -97,10 +111,24 @@ interface RequestOptions {
    */
   readonly deadlineMs?: number;
   /**
-   * Run against a 2xx body before it is returned. Throw here to reject a malformed success (e.g. a
-   * 200 with no payment id) as an error instead of silently handing back an empty shape.
+   * Run against a 2xx body, and RETURN THE OBJECT THAT WILL BE HANDED BACK. Throw here to reject
+   * a malformed success (e.g. a 200 with no payment id) as an error instead of silently handing
+   * back an empty shape.
+   *
+   * ── Why this returns instead of asserting ─────────────────────────────────────────────────
+   * It used to be `(parsed, status) => void`, and `#request` then did `return parsed as T`. So
+   * the object the SDK validated and the object it RETURNED were different sizes: the validator
+   * checked the five fields the contract names, and the caller received those five plus every
+   * other field the server chose to send. Unknown fields — an upstream debug envelope, a proxy
+   * that mirrors request headers, an `authorization` echo — rode out inside a public `CollectAck`
+   * or `Payment`, typed as though they did not exist, and were serialized by the first thing that
+   * logged the result.
+   *
+   * A validator that cannot decide what is returned is not a boundary, it is a comment. Making
+   * this signature return `T` moves the reconstruction INTO the one place every 2xx passes
+   * through, so a new call site cannot forget it: there is no path that returns a raw body.
    */
-  readonly validate?: (parsed: unknown, status: number) => void;
+  readonly project?: (parsed: unknown, status: number) => T;
 }
 
 /**
@@ -235,47 +263,6 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
  * An error that already carries the key (the common case: `PaylodApiError` built with it) is
  * returned untouched, so nothing is re-wrapped needlessly and `instanceof` checks keep working.
  */
-function withIdempotencyKey(
-  err: unknown,
-  key: string,
-  redact: (s: string) => string,
-  paymentId?: string,
-): unknown {
-  if (err instanceof PaylodError) {
-    // One of ours. Fill in whichever half of the handle is missing, in place where we can. Never
-    // clobber a value the error already set — the site that raised it knew more than we do.
-    //
-    // Both halves matter and they do different jobs: the KEY lets the caller replay the same
-    // attempt instead of minting a fresh one (which double-charges), and the PAYMENT ID lets them
-    // READ it. The sibling JVM SDK lost both when a non-`Exception` `Error` escaped after the
-    // acknowledgement, leaving a caller holding a possibly-live charge with no handle on it at all.
-    try {
-      if (err.idempotencyKey === undefined) err.idempotencyKey = key;
-      if (paymentId !== undefined && err.paymentId === undefined) err.paymentId = paymentId;
-      const keyOk = err.idempotencyKey !== undefined;
-      const idOk = paymentId === undefined || err.paymentId !== undefined;
-      if (keyOk && idOk) return err;
-    } catch {
-      /* frozen / read-only — wrap below */
-    }
-  }
-
-  // Anything else: a foreign Error, a frozen error, or a thrown primitive. Wrap it in an SDK error
-  // that definitely carries the key. The state of the charge is unknown, so this is INDETERMINATE
-  // — the caller must read the payment with this key, never blind-retry with a new one.
-  // Redacted: a foreign error from a caller-supplied fetch can easily quote the request headers,
-  // and the bearer key with them.
-  const detail = redact(err instanceof Error ? err.message : String(err));
-  const wrapped = new PaylodConnectionError(
-    `The charge attempt failed and its state is INDETERMINATE (${detail}). Read the payment ` +
-      "with this error's idempotencyKey before starting any new attempt; do NOT mint a fresh " +
-      "key, which risks charging the customer a second time.",
-  );
-  wrapped.idempotencyKey = key;
-  if (paymentId !== undefined) wrapped.paymentId = paymentId;
-  return wrapped;
-}
-
 /**
  * The paylod API client.
  *
@@ -442,7 +429,7 @@ export class Paylod {
         ...(opts.signal ? { signal: opts.signal } : {}),
         // The simulator's validators run INSIDE the request, so they see the real HTTP status and
         // run on exactly the same path production's do.
-        ...(opts.validate ? { validate: opts.validate } : {}),
+        ...(opts.project ? { project: opts.project } : {}),
       }),
     );
   }
@@ -522,7 +509,7 @@ export class Paylod {
     if (capped > 0) await sleep(capped, signal);
   }
 
-  async #request<T>(opts: RequestOptions): Promise<T> {
+  async #request<T>(opts: RequestOptions<T>): Promise<T> {
     const url = `${this.#baseUrl}${opts.path}`;
     let lastError: unknown;
 
@@ -599,7 +586,17 @@ export class Paylod {
 
       if (res.ok) {
         // A malformed 2xx (e.g. no payment id) is INDETERMINATE, not a silent empty success.
-        opts.validate?.(parsed, res.status);
+        //
+        // THE PROJECTOR OWNS THE RETURNED OBJECT. A 2xx body is server-controlled data, and the
+        // rule this SDK is built on is that server-controlled data never reaches a public object
+        // unvalidated. The old `validate(); return parsed as T` broke exactly that rule on the
+        // one path nobody was watching — the SUCCESS path — because success was implicitly
+        // trusted. There is now no route from a parsed body to a caller that does not go through
+        // a projector which rebuilds the object field by field.
+        //
+        // The `parsed as T` fallback remains ONLY for requests that declare no projector, which
+        // are the ones whose bodies are never returned to a caller.
+        if (opts.project) return opts.project(parsed, res.status);
         return parsed as T;
       }
 
@@ -647,26 +644,13 @@ export class Paylod {
    * Bounds mirror `_shared/schemas/collect.ts`.
    */
   #buildCollectBody(params: CollectParams): Record<string, unknown> {
-    const { amount } = params;
-    if (typeof amount !== "number" || !Number.isFinite(amount)) {
-      throw new PaylodInvalidRequestError("amount must be a number (whole KES).");
-    }
-    if (!Number.isInteger(amount)) {
-      throw new PaylodInvalidRequestError(
-        `amount must be a whole number of KES — M-Pesa rejects decimals (got ${amount}).`,
-      );
-    }
-    if (amount <= 0 || amount > MAX_AMOUNT) {
-      throw new PaylodInvalidRequestError(
-        `amount must be between 1 and ${MAX_AMOUNT} KES (got ${amount}).`,
-      );
-    }
-    if (params.accountReference !== undefined && params.accountReference.trim().length > 12) {
-      throw new PaylodInvalidRequestError("accountReference must be 12 characters or fewer.");
-    }
-    if (params.description !== undefined && params.description.trim().length > 64) {
-      throw new PaylodInvalidRequestError("description must be 64 characters or fewer.");
-    }
+    // THE shared validators, not a local copy. They live in `validate.ts` alongside the
+    // idempotency-key rule and for the same reason: the simulator has to run the IDENTICAL check,
+    // and it previously ran a weaker one — no amount ceiling at all, no reference or description
+    // bound — so a test could go green on a charge production refuses at the boundary.
+    const amount = assertChargeAmount(params.amount, "collect()");
+    assertAccountReference(params.accountReference, "collect()");
+    assertDescription(params.description, "collect()");
 
     const body: Record<string, unknown> = {
       amount,
@@ -767,7 +751,7 @@ export class Paylod {
         };
       }
 
-      const ack = await this.#request<Omit<CollectAck, "idempotencyKey">>({
+      const ack = await this.#request<CollectAckWire>({
         method: "POST",
         path: "/collect",
         body,
@@ -776,12 +760,17 @@ export class Paylod {
         // A 2xx we cannot fully read is INDETERMINATE: the charge may have moved. The check is on
         // the COMPLETE ack — paymentId, checkoutRequestId and status — because a partial check is
         // a partial guarantee, and it is the shared validator the simulator runs too.
-        validate: (parsed, status) =>
-          assertCollectAck(parsed, {
+        //
+        // It RECONSTRUCTS the ack rather than blessing the parsed body, and it scans that body
+        // for this client's own credentials first. Both halves close the same hole from opposite
+        // ends: an unknown field carrying the bearer key, and a known field carrying it.
+        project: (parsed, status) =>
+          parseCollectAck(parsed, {
             httpStatus: status,
             idempotencyKey,
             redactBody: (b) => this.#redactDeep(b),
             redactText: (t) => this.#redact(t),
+            secrets: this.#secrets(),
           }),
       });
       return { ...ack, idempotencyKey };
@@ -809,14 +798,31 @@ export class Paylod {
       // the case where guessing turns into fulfilling an unpaid order.
       // ID BINDING: the body must describe the payment we ASKED about. A response that answers
       // a different question tells us nothing about this one, however well-formed it is.
-      validate: (parsed, status) =>
-        assertPaymentBody(parsed, {
+      // RECONSTRUCTED, not passed through — see `parsePaymentBody`. A status body's `resultDesc`
+      // is free text the server chose, and it lands in `PaymentOutcome.message` and in logs.
+      project: (parsed, status) =>
+        parsePaymentBody(parsed, {
           httpStatus: status,
           expectedId: paymentId,
           redactBody: (b) => this.#redactDeep(b),
           redactText: (t) => this.#redact(t),
+          secrets: this.#secrets(),
         }),
     });
+  }
+
+  /**
+   * The credentials that must never appear in a SUCCESSFUL response body.
+   *
+   * The same pair `#redact` scrubs out of error text. A 2xx that contains either of them is not
+   * a response we can explain, so it is refused as indeterminate rather than redacted — see
+   * `containsSecret`.
+   */
+  #secrets(): readonly string[] {
+    const out: string[] = [];
+    if (this.#apiKey) out.push(this.#apiKey);
+    if (this.#webhookSecret) out.push(this.#webhookSecret);
+    return out;
   }
 
   /**
@@ -863,7 +869,30 @@ export class Paylod {
 
       const outcome = toOutcome(payment);
       if (outcome.status !== "pending") return outcome;
-      options.onPoll?.(payment);
+
+      // THE CALLBACK IS AWAITED, UNDER THE WAIT'S OWN DEADLINE.
+      //
+      // `options.onPoll?.(payment)` discarded the return value. `onPoll` is typed to return
+      // `void`, but TypeScript will happily pass an `async` function to a `void`-returning slot —
+      // that is a deliberate assignability rule, not a mistake a caller can be warned about — so
+      // "a promise is never returned here" was never true in practice. Every realistic `onPoll`
+      // does I/O: writing the pending state to a database, pushing a websocket frame, emitting a
+      // metric.
+      //
+      // A rejection from that floating promise is an UNHANDLED REJECTION. Node terminates the
+      // process on one by default, and it happens in a microtask — after `collect()` has been
+      // acknowledged and a charge is live on a handset, and outside every `try/catch` in this
+      // SDK, including `collectAndWait`'s reconciliation wrapper. The process dies holding the
+      // only copy of the idempotency key and the payment id, so the charge cannot be reconciled
+      // by the code that raised it. That is strictly worse than any spinner update failing.
+      //
+      // Awaited, the same rejection becomes an ordinary failure of `wait()`, and `collectAndWait`
+      // attaches the key and the payment id to it on the way out — a handle to a possibly-live
+      // charge instead of a dead process. The deadline is applied so a callback that never
+      // settles cannot extend the wait indefinitely either.
+      if (options.onPoll) {
+        await this.#awaitOnPoll(options.onPoll(payment), payment, deadline, options.signal);
+      }
 
       const delay = pollDelay(attempt);
       if (monotonicNowMs() + delay >= deadline) break;
@@ -871,6 +900,51 @@ export class Paylod {
     }
 
     throw new PaylodTimeoutError(paymentId, last as Payment, monotonicNowMs() - startedAt);
+  }
+
+  /**
+   * Await an `onPoll` result under the wait's deadline.
+   *
+   * A non-promise (the common, synchronous case) returns immediately and costs nothing. A promise
+   * is raced against the remaining budget, so a callback that hangs forever fails the wait with a
+   * clear message instead of pinning the caller — a `wait({ timeoutMs })` that can be extended
+   * without bound by a caller's own callback is not a timeout.
+   *
+   * The rejection is deliberately NOT swallowed. Swallowing it would trade a process crash for a
+   * silent one, and `onPoll` failing usually means the caller's own record of this payment did
+   * not get written — precisely the thing they need to know about a live charge.
+   */
+  async #awaitOnPoll(
+    result: void | Promise<void>,
+    payment: Payment,
+    deadlineMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (result === null || result === undefined) return;
+    if (typeof (result as Promise<void>).then !== "function") return;
+
+    const remaining = this.#remaining(deadlineMs) ?? MAX_UNBOUNDED_SLEEP_MS;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        result,
+        new Promise<never>((_resolve, reject) => {
+          const fail = (): void => {
+            reject(new PaylodTimeoutError(payment.id, payment, Math.max(0, remaining)));
+          };
+          if (remaining <= 0) return fail();
+          timer = setTimeout(fail, remaining);
+          if (signal) {
+            signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), {
+              once: true,
+            });
+          }
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**
@@ -972,7 +1046,9 @@ export class Paylod {
       // is all-or-nothing and unbounded, so an anonymous caller who could reach this route could
       // stream gigabytes into the heap and OOM the process before a single check had run. A
       // signature check that happens after unbounded buffering does not protect the buffering.
-      let raw: string;
+      // A `Buffer`, never a string — see `readWebRequestBody`. Decoding here and re-encoding for
+      // the HMAC collapses distinct invalid-UTF-8 bodies onto one canonical byte string.
+      let raw: Buffer;
       try {
         raw = await readWebRequestBody(request);
       } catch (e) {
@@ -1105,30 +1181,6 @@ function reportHandlerError(e: unknown): void {
   console.error("[paylod] webhook handler threw; responding 500 so paylod retries.", e);
 }
 
-/**
- * Hard ceiling on a webhook body we will buffer, in bytes.
- *
- * The Express adapter drains the request stream BEFORE the signature has been checked — it has
- * to, because verification needs the raw bytes. That means the bytes are UNAUTHENTICATED at the
- * moment they are buffered, and with no limit, anyone who can reach the endpoint could stream
- * gigabytes into the process heap and OOM it. A signature check that happens after unbounded
- * buffering does not protect the buffering.
- *
- * 1 MiB is far above any real paylod event (they are a few hundred bytes) and far below anything
- * that threatens a server.
- */
-export const MAX_WEBHOOK_BODY_BYTES = 1_048_576;
-
-/** The one refusal, so every intake path says the same thing for the same reason. */
-function tooLargeBody(detail: string): Error {
-  return new Error(
-    `Webhook body exceeds ${MAX_WEBHOOK_BODY_BYTES} bytes (${detail}). A paylod event is a few ` +
-      "hundred bytes; the request is refused before it is buffered because these bytes are not " +
-      "authenticated until the whole body has arrived, and an unbounded buffer an anonymous " +
-      "caller can fill is an OOM they control.",
-  );
-}
-
 /** A declared length can be refused before a single byte is pulled. It is a hint, never a bound. */
 function assertDeclaredLengthOk(declared: string | null | undefined): void {
   if (typeof declared !== "string") return;
@@ -1149,20 +1201,39 @@ function assertDeclaredLengthOk(declared: string | null | undefined): void {
  * consumed chunk by chunk and abandoned the moment the budget is gone — the point of a cap is
  * that the bytes are never allocated, not that they are counted afterwards.
  *
- * The `text()` fallback covers a synthesised `Request` with no readable stream (some runtimes,
- * some test doubles). It is strictly weaker and is applied after the fact, which is all that is
- * available in that shape — but the declared-length check above still runs first.
+ * The `arrayBuffer()` fallback covers a synthesised `Request` with no readable stream (some
+ * runtimes, some test doubles). It is strictly weaker and is applied after the fact, which is all
+ * that is available in that shape — but the declared-length check above still runs first.
+ *
+ * ── THE BYTES ARE NEVER DECODED ───────────────────────────────────────────────────────────
+ * This returned a `string`, which meant the raw body was decoded to UTF-8 here and re-encoded
+ * inside `verifyWebhookSignature` before the HMAC. That round trip is LOSSY, and lossy in the
+ * one direction that matters for a signature check: every invalid UTF-8 byte sequence decodes to
+ * U+FFFD, and U+FFFD re-encodes to the fixed bytes `EF BF BD`. So an unbounded family of
+ * DIFFERENT bodies — any body containing any invalid sequence — collapsed onto one canonical
+ * byte string, and each of them verified against a signature computed for that canonical form.
+ * An attacker holding one valid signature over a replacement-character body could therefore mint
+ * many distinct bodies that all pass, which is a signature check that no longer binds the bytes
+ * it is supposed to bind.
+ *
+ * The fix is not to decode at all. `Buffer` in, `Buffer` through `verify()`, `Buffer` into the
+ * HMAC — the JSON parse at the far end is the only place a decode is legitimate, and by then the
+ * bytes have already been authenticated.
  */
-async function readWebRequestBody(request: Request): Promise<string> {
+async function readWebRequestBody(request: Request): Promise<Buffer> {
   assertDeclaredLengthOk(request.headers?.get?.("content-length"));
 
   const body = request.body as ReadableStream<Uint8Array> | null | undefined;
   if (!body || typeof body.getReader !== "function") {
-    const text = await request.text();
-    if (Buffer.byteLength(text, "utf8") > MAX_WEBHOOK_BODY_BYTES) {
+    // `arrayBuffer()`, NOT `text()`. `text()` is the decode this function exists to avoid, and
+    // using it only "in the fallback" would mean the byte-collapsing bug survived on precisely
+    // the runtimes that do not expose a stream — a silent, per-runtime difference in what
+    // verifies, which is worse than a uniform bug.
+    const buf = Buffer.from(await request.arrayBuffer());
+    if (buf.byteLength > MAX_WEBHOOK_BODY_BYTES) {
       throw tooLargeBody("no readable stream was exposed, so the body was measured after reading");
     }
-    return text;
+    return buf;
   }
 
   const reader = body.getReader();
@@ -1188,7 +1259,7 @@ async function readWebRequestBody(request: Request): Promise<string> {
       // Already released by `cancel()` on some runtimes. Nothing to do.
     }
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
 }
 
 // ── Minimal structural types for Express/Connect (no `express` dependency) ────────

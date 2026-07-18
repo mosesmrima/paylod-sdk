@@ -11,6 +11,23 @@ import type { DecodedError } from "./daraja-catalog.js";
 export type PaymentStatus = "pending" | "success" | "failed";
 
 /**
+ * A Daraja `ResultCode` AS IT ARRIVES ON THE WIRE.
+ *
+ * It is genuinely both: Daraja sends `0` and `4999` as JSON numbers on some paths and `"0"`,
+ * `"4999"`, `"500.001.1001"` as strings on others — `500.001.1001` cannot be a number at all.
+ * This SDK's classifier has always assessed the code by EXACT FORM precisely because of that,
+ * and the validators have always accepted both.
+ *
+ * The public types nevertheless said `number | null`. That is not a simplification, it is a
+ * false statement about data the caller receives: `typeof payment.resultCode === "number"` looked
+ * like a redundant check and was in fact required, and anyone who wrote
+ * `payment.resultCode === 4999` got `false` for the string `"4999"` with no type error to warn
+ * them. Naming the real union is the fix; narrowing it in the validator would be the other
+ * option, but discarding a code we cannot represent is worse than reporting it honestly.
+ */
+export type WireResultCode = number | string;
+
+/**
  * The idempotency half of every money-moving call, as a discriminated pair.
  *
  * `idempotencyKey` is REQUIRED — the type will not let you omit it. The only alternative is to
@@ -119,13 +136,21 @@ export interface CollectAck {
   readonly idempotencyKey: string;
 }
 
+/**
+ * The collect acknowledgement AS THE SERVER SENDS IT — the `CollectAck` minus the
+ * client-side `idempotencyKey`. This is what `parseCollectAck` reconstructs, field by field,
+ * so no unknown server field can reach the public {@link CollectAck}.
+ */
+export type CollectAckWire = Omit<CollectAck, "idempotencyKey">;
+
 /** The `200` body from `GET /status/:id`. */
 export interface Payment {
   readonly id: string;
   readonly status: PaymentStatus;
   /** The M-Pesa confirmation code (e.g. `SFF6XYZ123`). Only present on success. */
   readonly mpesaReceipt: string | null;
-  readonly resultCode: number | null;
+  /** See {@link WireResultCode} — a Daraja code is a number OR a string on the wire. */
+  readonly resultCode: WireResultCode | null;
   readonly resultDesc: string | null;
 }
 
@@ -150,7 +175,8 @@ export interface WebhookEvent {
     readonly accountRef: string | null;
     readonly mpesaReceipt: string | null;
     readonly checkoutRequestId: string | null;
-    readonly resultCode: number | null;
+    /** See {@link WireResultCode} — a Daraja code is a number OR a string on the wire. */
+    readonly resultCode: WireResultCode | null;
     readonly resultDesc: string | null;
     /** Populated on `payment.failed`, `null` on `payment.success`. */
     readonly decoded: DecodedError | null;
@@ -242,8 +268,22 @@ export interface PaylodOptions {
 export interface WaitOptions {
   /** Give up after this long. Default 120_000 ms (STK prompts expire around 60s). */
   readonly timeoutMs?: number;
-  /** Called with each `pending` snapshot — handy for a "waiting for PIN…" spinner. */
-  readonly onPoll?: (payment: Payment) => void;
+  /**
+   * Called with each `pending` snapshot — handy for a "waiting for PIN…" spinner.
+   *
+   * **A promise returned here is AWAITED**, under the wait's own deadline. It used to be
+   * discarded: `options.onPoll?.(payment)` ignored the return value, so an `async` callback that
+   * rejected — a database write, a websocket push, a metrics call — became an UNHANDLED
+   * REJECTION. Node's default for one is to terminate the process, and it happened AFTER the
+   * charge was acknowledged, in a microtask outside every `try/catch` in this SDK. The process
+   * died holding the only copy of the idempotency key and payment id needed to reconcile a
+   * charge that may already have been in flight, which is the precise loss the reconciliation
+   * envelope exists to prevent.
+   *
+   * Awaiting it means a throwing `onPoll` now fails the `wait()` call itself, carrying the
+   * idempotency key and payment id, exactly like every other failure on the money path.
+   */
+  readonly onPoll?: (payment: Payment) => void | Promise<void>;
   /** Abort the wait early. */
   readonly signal?: AbortSignal;
 }

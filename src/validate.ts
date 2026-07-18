@@ -13,7 +13,71 @@
 import { randomUUID } from "node:crypto";
 
 import { PaylodApiError, PaylodInvalidRequestError } from "./errors.js";
-import type { PaymentStatus } from "./types.js";
+import type { CollectAckWire, Payment, PaymentStatus, WireResultCode } from "./types.js";
+
+/**
+ * The largest amount paylod will move in one payment, in KES.
+ *
+ * It lives HERE, with the other validators, because three surfaces need the same ceiling —
+ * `collect()`, the simulator, and the webhook schema — and a ceiling that only some of them
+ * apply is not a ceiling. The simulator carried no amount ceiling at all, so a test could prove
+ * "we charge 10,000,000 KES successfully" against a simulator that accepted a figure production
+ * refuses at the boundary.
+ */
+export const MAX_AMOUNT = 150_000;
+
+/** `accountReference` is 1-12 chars on the wire; `description` is 1-64. */
+export const MAX_ACCOUNT_REFERENCE_LEN = 12;
+export const MAX_DESCRIPTION_LEN = 64;
+
+/**
+ * THE amount rule, for every surface that dispatches a charge.
+ *
+ * M-Pesa moves whole Kenyan shillings. A decimal is rejected by Daraja, a non-positive figure is
+ * not a payment, and anything above the ceiling could never have been charged.
+ */
+export function assertChargeAmount(amount: unknown, what: string): number {
+  if (typeof amount !== "number" || !Number.isFinite(amount)) {
+    throw new PaylodInvalidRequestError(`${what}: amount must be a number (whole KES).`);
+  }
+  if (!Number.isInteger(amount)) {
+    throw new PaylodInvalidRequestError(
+      `${what}: amount must be a whole number of KES — M-Pesa rejects decimals (got ${amount}).`,
+    );
+  }
+  if (amount <= 0 || amount > MAX_AMOUNT) {
+    throw new PaylodInvalidRequestError(
+      `${what}: amount must be between 1 and ${MAX_AMOUNT} KES (got ${amount}).`,
+    );
+  }
+  return amount;
+}
+
+/** THE `accountReference` rule. Shared so the simulator cannot accept a reference production rejects. */
+export function assertAccountReference(value: unknown, what: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "string") {
+    throw new PaylodInvalidRequestError(`${what}: accountReference must be a string.`);
+  }
+  if (value.trim().length > MAX_ACCOUNT_REFERENCE_LEN) {
+    throw new PaylodInvalidRequestError(
+      `${what}: accountReference must be ${MAX_ACCOUNT_REFERENCE_LEN} characters or fewer.`,
+    );
+  }
+}
+
+/** THE `description` rule, shared for the same reason. */
+export function assertDescription(value: unknown, what: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "string") {
+    throw new PaylodInvalidRequestError(`${what}: description must be a string.`);
+  }
+  if (value.trim().length > MAX_DESCRIPTION_LEN) {
+    throw new PaylodInvalidRequestError(
+      `${what}: description must be ${MAX_DESCRIPTION_LEN} characters or fewer.`,
+    );
+  }
+}
 
 /**
  * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
@@ -283,6 +347,50 @@ export function sanitizeForMessage(value: unknown, redactText: TextRedactor = id
 }
 
 /**
+ * DEEP CREDENTIAL SCAN over a server-controlled value.
+ *
+ * ── Why a successful response is scanned at all ───────────────────────────────────────────
+ * Every non-2xx path in this SDK is careful: the message is redacted, the body is deep-redacted,
+ * and the bearer key cannot ride out on an error. The 2xx path had none of that, because a
+ * successful response was implicitly trusted — and trust is exactly the wrong posture for bytes
+ * the other side chose. A 2xx body that echoes the request (a debug envelope, a proxy that
+ * mirrors headers, a compromised or misconfigured upstream, a `resultDesc` carrying the
+ * `Authorization` header verbatim) put the bearer key straight into the returned `CollectAck` or
+ * `PaymentOutcome`, and from there into the caller's logs, their APM, and every serialized
+ * telemetry frame downstream.
+ *
+ * Reconstructing an allowlisted object closes the UNKNOWN-field half of that (see
+ * `parseCollectAck` / `parsePaymentBody`). This closes the other half: a KNOWN field —
+ * `resultDesc`, `mpesaReceipt`, even `id` — that carries the credential in its value. Redaction
+ * is not the answer on a success path, because a successful response that contains our own
+ * credential is not a response we understand; it is evidence something is echoing or
+ * intercepting, and the honest verdict is INDETERMINATE.
+ *
+ * Object KEYS are scanned as well as values — a secret can appear as a key just as easily.
+ */
+export function containsSecret(
+  value: unknown,
+  secrets: readonly string[],
+  depth = 0,
+): boolean {
+  const live = secrets.filter((s) => typeof s === "string" && s.length > 0);
+  if (live.length === 0) return false;
+  // Bounded like every other structural walk in this SDK: a hostile body must not be able to
+  // turn a safety scan into a stack overflow, which would be a crash on the money path.
+  if (depth > 8) return false;
+
+  if (typeof value === "string") return live.some((s) => value.includes(s));
+  if (Array.isArray(value)) return value.some((v) => containsSecret(v, live, depth + 1));
+  if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (live.some((s) => k.includes(s))) return true;
+      if (containsSecret(v, live, depth + 1)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Validate the COMPLETE `POST /collect` acknowledgement — including its HTTP STATUS.
  *
  * Every field here is load-bearing, so a partial check is a false sense of safety: a 2xx with a
@@ -292,7 +400,7 @@ export function sanitizeForMessage(value: unknown, redactText: TextRedactor = id
  * so it must be surfaced as a stop-and-read signal carrying the key, never handed back as a
  * half-populated ack that a caller would treat as a healthy new payment.
  */
-export function assertCollectAck(
+export function parseCollectAck(
   parsed: unknown,
   opts: {
     readonly httpStatus: number;
@@ -301,8 +409,10 @@ export function assertCollectAck(
     readonly redactBody?: BodyRedactor;
     /** Redacts the API key/secret out of any text interpolated into the message. */
     readonly redactText?: TextRedactor;
+    /** Credentials that must not appear ANYWHERE in a successful body. See {@link containsSecret}. */
+    readonly secrets?: readonly string[];
   },
-): void {
+): CollectAckWire {
   const what = opts.what ?? "paylod";
   const redactBody = opts.redactBody ?? identity;
   const safe = (v: unknown) => sanitizeForMessage(v, opts.redactText ?? identityText);
@@ -352,6 +462,31 @@ export function assertCollectAck(
   if (ack.status !== "pending") {
     return indeterminate(`status was ${safe(ack.status)}, expected the literal "pending"`);
   }
+
+  // THE CREDENTIAL SCAN, over the WHOLE body — before anything is handed back. See
+  // `containsSecret`. A collect ack that contains our own bearer key is not an ack we can act on.
+  if (containsSecret(parsed, opts.secrets ?? [])) {
+    return indeterminate(
+      "the response body contains this client's own API key or webhook secret — something is " +
+        "echoing or intercepting the request, so the acknowledgement cannot be trusted and must " +
+        "not be returned (it would carry the credential into your logs and telemetry)",
+    );
+  }
+
+  // RECONSTRUCTED, NEVER PASSED THROUGH.
+  //
+  // Returning `parsed` after validating it is a validator that checks a body and then hands back
+  // a DIFFERENT, larger object than the one it checked. Every field the schema does not name —
+  // an upstream debug envelope, a mirrored `authorization`, a proxy's diagnostic block — rode
+  // out inside the public `CollectAck`, was typed as if it did not exist, and was serialized by
+  // the first thing that logged the ack. The fields below are the complete contract; the object
+  // is built from exactly them, so an unknown field cannot survive validation by definition
+  // rather than by our remembering to strip it.
+  return {
+    paymentId: ack.paymentId,
+    status: "pending",
+    checkoutRequestId: ack.checkoutRequestId,
+  };
 }
 
 /**
@@ -380,7 +515,7 @@ export function assertCollectAck(
  * now know nothing about the payment we asked about. "I do not know" must never collapse to
  * "failed" (reported as retryable, so the customer is charged twice) or to "paid".
  */
-export function assertPaymentBody(
+export function parsePaymentBody(
   parsed: unknown,
   opts: {
     readonly httpStatus: number;
@@ -390,8 +525,10 @@ export function assertPaymentBody(
     readonly redactBody?: BodyRedactor;
     /** Redacts the API key/secret out of any text interpolated into the message. */
     readonly redactText?: TextRedactor;
+    /** Credentials that must not appear ANYWHERE in a successful body. See {@link containsSecret}. */
+    readonly secrets?: readonly string[];
   },
-): void {
+): Payment {
   const what = opts.what ?? "paylod";
   const redactBody = opts.redactBody ?? identity;
   const safe = (v: unknown) => sanitizeForMessage(v, opts.redactText ?? identityText);
@@ -448,6 +585,47 @@ export function assertPaymentBody(
   if (p.resultDesc !== undefined && p.resultDesc !== null && typeof p.resultDesc !== "string") {
     return bad("resultDesc is neither a string nor null");
   }
+
+  // THE CREDENTIAL SCAN. Same rule as the collect ack, same reason: `resultDesc` is a
+  // server-controlled free-text field that lands in logs and in `PaymentOutcome.message`, so it
+  // is the single most likely carrier for an echoed `Authorization` header.
+  if (containsSecret(parsed, opts.secrets ?? [])) {
+    return bad(
+      "the response body contains this client's own API key or webhook secret — something is " +
+        "echoing or intercepting the request, so the record cannot be trusted and must not be " +
+        "returned (it would carry the credential into your logs and telemetry)",
+    );
+  }
+
+  // RECONSTRUCTED, NEVER PASSED THROUGH — see `parseCollectAck` for the argument. The public
+  // `Payment` is built from exactly the five fields the contract names, so an unknown field
+  // cannot reach `PaymentOutcome`, a handler, or a log line.
+  //
+  // The optional fields are NORMALIZED to `null` here rather than left `undefined`. The type has
+  // always said `string | null` / `WireResultCode | null`, but the pass-through returned whatever
+  // the body had — so an ABSENT field arrived as `undefined` through a type that promised it
+  // could not be, and `payment.resultCode === null` (a perfectly reasonable check, and the one
+  // `hasResultCode` is written against) silently read false for a record that carried no code.
+  return {
+    id: p.id,
+    status: p.status as PaymentStatus,
+    mpesaReceipt: typeof p.mpesaReceipt === "string" ? p.mpesaReceipt : null,
+    resultCode: asWireResultCode(p.resultCode),
+    resultDesc: typeof p.resultDesc === "string" ? p.resultDesc : null,
+  };
+}
+
+/**
+ * Narrow an ALREADY-VALIDATED `resultCode` to the wire union.
+ *
+ * The union is `number | string | null` and that is not a widening — it is what the wire has
+ * always carried, and what `classifyStkResult` has always been written to assess by exact form.
+ * The public type used to say `number | null` while the validator accepted and returned strings
+ * unchanged, so `typeof payment.resultCode === "number"` was a check the types told callers they
+ * did not need to write and that the data required them to.
+ */
+export function asWireResultCode(v: unknown): WireResultCode | null {
+  return typeof v === "number" || typeof v === "string" ? v : null;
 }
 
 /** Narrow a validated body to the `PaymentStatus` union without an unchecked cast at the call site. */
