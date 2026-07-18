@@ -183,8 +183,11 @@ const CASES = [
     id: "W-size",
     what: "the unauthenticated webhook body is buffered without a cap",
     file: "src/client.ts",
-    find: "      if (total > MAX_WEBHOOK_BODY_BYTES) {",
-    replace: "      if (false) {",
+    // Since round 6 the byte counter exists on BOTH the Express drain and the Web stream reader,
+    // so the bare `if (total > …)` is no longer a unique anchor. The preceding line disambiguates
+    // (`buf.length` is the Express path; the Web path counts `value.byteLength`).
+    find: "      total += buf.length;\n      if (total > MAX_WEBHOOK_BODY_BYTES) {",
+    replace: "      total += buf.length;\n      if (false) {",
     test: "refuses to buffer an unbounded unauthenticated body",
   },
 
@@ -215,6 +218,16 @@ const CASES = [
     file: "src/daraja-catalog.ts",
     find: '  if (raw === "0") return "success";',
     replace: '  if (raw !== "" && Number(raw) === 0) return "success";',
+    // Since round 6 the canonical-form gate stops a non-canonical code REACHING this line at all,
+    // so reverting the predicate alone is a no-op — which is precisely the shape of a vacuous
+    // mutation. The guarantee is "an impostor is never success", and removing it takes BOTH the
+    // ordering rule and the strict predicate. (Same pattern as R1-live.)
+    also: {
+      file: "src/daraja-catalog.ts",
+      find: "  if (resultCode === null || resultCode === undefined) return { kind: \"absent\" };",
+      replace:
+        "  if (resultCode === null || resultCode === undefined) return { kind: \"absent\" };\n  resultCode = String(resultCode).trim();",
+    },
     test: "does NOT classify",
   },
   {
@@ -230,14 +243,145 @@ const CASES = [
     what: "the payload's own `decoded` block is trusted instead of recomputed",
     file: "src/webhook.ts",
     find: `  const decoded =
+    e.type === "payment.failed"
+      ? decodeDarajaResult(
+          d.resultCode ?? null,
+          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        )
+      : null;`,
+    replace: "  const decoded = d.decoded as never;",
+    test: "OVERRIDES a hostile retryable:true",
+  },
+
+  // ── 0.9.0 — the round-6 (ordering / boundary) protections ─────────────────────────────────
+  {
+    id: "C1-order",
+    what: "the result code is normalized (String+trim) BEFORE its form is validated",
+    file: "src/daraja-catalog.ts",
+    find: '  if (resultCode === null || resultCode === undefined) return { kind: "absent" };',
+    replace:
+      '  if (resultCode === null || resultCode === undefined) return { kind: "absent" };\n  resultCode = String(resultCode).trim();',
+    test: "does NOT report",
+  },
+  {
+    id: "C1-decode",
+    what: "an ambiguous code is re-normalized into a catalog hit by the DECODER",
+    file: "src/daraja-catalog.ts",
+    find: "  if (form.kind === \"ambiguous\") return indeterminateFallback(form.code, rawDesc);",
+    replace:
+      "  if (form.kind === \"ambiguous\") return decodeDarajaResult(form.code.trim(), rawDesc, family);",
+    test: "does NOT decode",
+  },
+  {
+    id: "C1-negzero",
+    what: "numeric negative zero is no longer distinguished from zero",
+    file: "src/daraja-catalog.ts",
+    find: '    if (Object.is(resultCode, -0)) return { kind: "ambiguous", code: "-0" };',
+    replace: "    void 0;",
+    test: "numeric negative zero",
+  },
+  {
+    id: "H1-web",
+    what: "the Web Request adapter buffers the unauthenticated body with request.text()",
+    file: "src/client.ts",
+    find: "        raw = await readWebRequestBody(request);",
+    replace: "        raw = await request.text();",
+    test: "refuses an oversized STREAMED body without buffering it",
+  },
+  {
+    id: "H1-buffered",
+    what: "a PRE-BUFFERED body (express.raw / Vercel rawBody) bypasses the advertised cap",
+    file: "src/client.ts",
+    find: '    assertBufferedSizeOk(req.body.length, "req.body");',
+    replace: "    void 0;",
+    test: "refuses an oversized pre-buffered Buffer body",
+  },
+  {
+    id: "H1-declared",
+    what: "an oversized Content-Length is not refused before the stream is touched",
+    file: "src/client.ts",
+    find: "  if (Number(s) > MAX_WEBHOOK_BODY_BYTES) {",
+    replace: "  if (false) {",
+    test: "refuses an oversized declared Content-Length",
+  },
+  {
+    id: "H2-leak",
+    what: "a malformed `status` is quoted verbatim into the exception message",
+    file: "src/validate.ts",
+    find: '    return bad(`status was ${safe(p.status)}, not one of ${PAYMENT_STATUSES.join("/")}`);',
+    replace:
+      '    return bad(`status was ${JSON.stringify(p.status)}, not one of ${PAYMENT_STATUSES.join("/")}`);',
+    test: "IS the bearer key does not leak it",
+  },
+  {
+    id: "H2-bind-leak",
+    what: "a MISMATCHED payment id is quoted verbatim into the exception message",
+    file: "src/validate.ts",
+    find: "      `the body describes payment ${safe(p.id)} but ${safe(opts.expectedId)} was requested — ` +",
+    replace:
+      "      `the body describes payment ${JSON.stringify(p.id)} but ${JSON.stringify(opts.expectedId)} was requested — ` +",
+    test: "a MISMATCHED id that is the bearer key",
+  },
+  {
+    id: "H3-abort",
+    what: "an ALREADY-aborted signal is subscribed to but never checked, so the charge dispatches",
+    file: "src/transport.ts",
+    find: "    if (req.signal?.aborted) {",
+    replace: "    if (false) {",
+    test: "dispatches ZERO requests",
+  },
+  {
+    id: "M5-desc",
+    what: "resultDesc is unvalidated, so an object value crashes the classifier with a TypeError",
+    file: "src/validate.ts",
+    find: '  if (p.resultDesc !== undefined && p.resultDesc !== null && typeof p.resultDesc !== "string") {',
+    replace: "  if (false) {",
+    test: "rather than throwing a raw TypeError",
+  },
+  {
+    id: "M4-amount",
+    what: "a webhook amount is only checked for finiteness (negatives and fractions pass)",
+    file: "src/webhook.ts",
+    find: "  assertAmount(d.amount);",
+    replace:
+      '  if (typeof d.amount !== "number" || !Number.isFinite(d.amount)) invalid("data.amount is not a finite number");',
+    test: "rejects a negative amount",
+  },
+  {
+    id: "M4-required",
+    what: "applicationId is optional again, while the type still promises a string",
+    file: "src/webhook.ts",
+    find: '  requiredString(d.applicationId, "data.applicationId");',
+    replace: '  optionalString(d.applicationId, "data.applicationId");',
+    test: "rejects a missing applicationId",
+  },
+  {
+    id: "M4-env",
+    what: "env is optional again, so a sandbox/production guard reads undefined",
+    file: "src/webhook.ts",
+    find: '  if (d.env !== "sandbox" && d.env !== "production") {',
+    replace: '  if (d.env !== undefined && d.env !== "sandbox" && d.env !== "production") {',
+    test: "rejects a missing env",
+  },
+  {
+    id: "M4-synth",
+    what: "a MISSING decoded block is mirrored as null instead of being synthesised",
+    file: "src/webhook.ts",
+    find: `  const decoded =
+    e.type === "payment.failed"
+      ? decodeDarajaResult(
+          d.resultCode ?? null,
+          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        )
+      : null;`,
+    replace: `  const decoded =
     d.decoded === null || d.decoded === undefined
       ? null
       : decodeDarajaResult(
-          (d.resultCode ?? null) as number | string | null,
+          d.resultCode ?? null,
           typeof d.resultDesc === "string" ? d.resultDesc : null,
         );`,
-    replace: "  const decoded = d.decoded as never;",
-    test: "OVERRIDES a hostile retryable:true",
+    test: "gets one built from the catalog",
   },
   {
     id: "D6-paymentid",
@@ -313,25 +457,36 @@ for (const c of CASES) {
     continue;
   }
 
-  const original = readFileSync(c.file, "utf8");
-  const occurrences = original.split(c.find).length - 1;
+  // A case is one or more edits. They are applied to an IN-MEMORY copy per file and written once,
+  // so two edits to the SAME file compose instead of the second silently overwriting the first —
+  // which is the one way a multi-part mutation could quietly degrade into a single-part one, and
+  // therefore into exactly the vacuous result this harness exists to detect.
+  const edits = [{ file: c.file, find: c.find, replace: c.replace }, ...(c.also ? [c.also] : [])];
+  const originals = new Map();
+  const pending = new Map();
+  let brokenAnchor = null;
 
-  if (occurrences !== 1) {
-    results.push({ ...c, status: "BROKEN-ANCHOR", detail: `matched ${occurrences}x` });
+  for (const edit of edits) {
+    if (!originals.has(edit.file)) {
+      const text = readFileSync(edit.file, "utf8");
+      originals.set(edit.file, text);
+      pending.set(edit.file, text);
+    }
+    const current = pending.get(edit.file);
+    const occurrences = current.split(edit.find).length - 1;
+    if (occurrences !== 1) {
+      brokenAnchor = `anchor in ${edit.file} matched ${occurrences}x`;
+      break;
+    }
+    pending.set(edit.file, current.replace(edit.find, edit.replace));
+  }
+
+  if (brokenAnchor) {
+    results.push({ ...c, status: "BROKEN-ANCHOR", detail: brokenAnchor });
     continue;
   }
 
-  let alsoOriginal;
-  if (c.also) {
-    alsoOriginal = readFileSync(c.also.file, "utf8");
-    if (alsoOriginal.split(c.also.find).length - 1 !== 1) {
-      results.push({ ...c, status: "BROKEN-ANCHOR", detail: "secondary anchor did not match 1x" });
-      continue;
-    }
-    writeFileSync(c.also.file, alsoOriginal.replace(c.also.find, c.also.replace));
-  }
-
-  writeFileSync(c.file, original.replace(c.find, c.replace));
+  for (const [file, text] of pending) writeFileSync(file, text);
   let failed = false;
   let detail = "";
   try {
@@ -346,8 +501,7 @@ for (const c of CASES) {
     const m = out.match(/Tests\s+(\d+) failed/);
     detail = m ? `${m[1]} test(s) failed` : "suite failed";
   } finally {
-    writeFileSync(c.file, original);
-    if (c.also && alsoOriginal !== undefined) writeFileSync(c.also.file, alsoOriginal);
+    for (const [file, text] of originals) writeFileSync(file, text);
   }
 
   results.push({ ...c, status: failed ? "CAUGHT" : "VACUOUS", detail: `${detail}; selector covers ${live} test(s)` });
