@@ -78,12 +78,12 @@ const CASES = [
     id: "R2-pending0",
     what: "a pending record carrying code 0 is treated as paid",
     file: "src/semantics.ts",
-    find: `          return of(
-            "indeterminate",
-            "status says pending while the evidence says the payment succeeded — a pending " +
-              "record must never be reported as paid",
-          );`,
-    replace: '          return of("paid", "REVERTED");',
+    find: `    success: [
+      "indeterminate",
+      "status says pending while the evidence says the payment succeeded — a pending " +
+        "record must never be reported as paid",
+    ],`,
+    replace: '    success: ["paid", "REVERTED"],',
     test: "a pending row carrying code zero",
   },
   {
@@ -98,16 +98,12 @@ const CASES = [
     id: "R2-evidence",
     what: "a bare status:success with no evidence is treated as paid",
     file: "src/semantics.ts",
-    find: `        case "none":
-          // L2. This is the "a stubbed endpoint / truncated row / cached proxy envelope can
-          // write six characters of JSON" case. A claim with nothing behind it is not money.
-          return of(
-            "indeterminate",
-            "status claims success but the record carries neither a receipt nor a result code, " +
-              "so there is no evidence the payment actually settled",
-          );`,
-    replace: `        case "none":
-          return of("paid", "REVERTED");`,
+    find: `    none: [
+      "indeterminate",
+      "status claims success but the record carries neither a receipt nor a result code, " +
+        "so there is no evidence the payment actually settled",
+    ],`,
+    replace: '    none: ["paid", "REVERTED"],',
     test: "L2: paid ALWAYS has success evidence",
   },
   {
@@ -190,6 +186,99 @@ const CASES = [
     find: "      if (total > MAX_WEBHOOK_BODY_BYTES) {",
     replace: "      if (false) {",
     test: "refuses to buffer an unbounded unauthenticated body",
+  },
+
+  // ── 0.8.0 — the round-5 (sibling-derived) protections ──────────────────────────────────────
+  {
+    id: "D1-total",
+    what: "the failed x in_flight cell reports a LIVE prompt as a terminal failure",
+    file: "src/semantics.ts",
+    find: `    in_flight: [
+      "in_flight",
+      "status says failed but the result code means the prompt is still live and the " +
+        "customer has not entered their PIN yet",
+    ],`,
+    replace: '    in_flight: ["failed", "REVERTED"],',
+    test: "covers the FULL cross-product",
+  },
+  {
+    id: "D1-claim",
+    what: "an unrecognised claim falls back to a verdict derived from the evidence",
+    file: "src/semantics.ts",
+    find: "  const row = Object.prototype.hasOwnProperty.call(VERDICTS, claimed)\n    ? VERDICTS[claimed]\n    : undefined;",
+    replace: "  const row = VERDICTS[claimed] ?? VERDICTS.success;",
+    test: "an unrecognised claim resolves as indeterminate",
+  },
+  {
+    id: "D2-coerce",
+    what: "result-code zero is decided by Number() coercion again",
+    file: "src/daraja-catalog.ts",
+    find: '  if (raw === "0") return "success";',
+    replace: '  if (raw !== "" && Number(raw) === 0) return "success";',
+    test: "does NOT classify",
+  },
+  {
+    id: "D3-terminal",
+    what: "a credential-compromise detection is retried like an ordinary network blip",
+    file: "src/client.ts",
+    find: "        if (e instanceof PaylodTerminalTransportError) throw e;",
+    replace: "        if (false) throw e;",
+    test: "does NOT retry after the fetch impl FOLLOWED a redirect",
+  },
+  {
+    id: "D4-decoded",
+    what: "the payload's own `decoded` block is trusted instead of recomputed",
+    file: "src/webhook.ts",
+    find: `  const decoded =
+    d.decoded === null || d.decoded === undefined
+      ? null
+      : decodeDarajaResult(
+          (d.resultCode ?? null) as number | string | null,
+          typeof d.resultDesc === "string" ? d.resultDesc : null,
+        );`,
+    replace: "  const decoded = d.decoded as never;",
+    test: "OVERRIDES a hostile retryable:true",
+  },
+  {
+    id: "D6-paymentid",
+    what: "an escaping throw after the ack no longer carries the payment id",
+    file: "src/client.ts",
+    find: "      throw withIdempotencyKey(err, ack.idempotencyKey, (m) => this.#redact(m), ack.paymentId);",
+    replace: "      throw withIdempotencyKey(err, ack.idempotencyKey, (m) => this.#redact(m));",
+    test: "carries BOTH when user code throws a PRIMITIVE",
+  },
+  {
+    id: "D6-frozen",
+    what: "a frozen error is returned as-is, losing the handle (the JVM defect)",
+    file: "src/client.ts",
+    find: "  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
+    replace:
+      "  if (err instanceof PaylodError) return err;\n  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
+    test: "carries BOTH when a FROZEN PaylodError escapes after the ack",
+  },
+  {
+    id: "D7-bytes",
+    what: "the response body is buffered with no byte cap (OOM loses the key)",
+    file: "src/transport.ts",
+    find: "        if (total > MAX_RESPONSE_BYTES) throw this.#tooLarge();",
+    replace: "        if (false) throw this.#tooLarge();",
+    test: "refuses a body over the byte cap",
+  },
+  {
+    id: "D7-depth",
+    what: "JSON is parsed with no depth budget",
+    file: "src/client.ts",
+    find: "      if (depth > maxDepth) {",
+    replace: "      if (false) {",
+    test: "refuses a JSON document nested past the depth cap",
+  },
+  {
+    id: "D8-tolerance",
+    what: "the webhook tolerance loses its UPPER bound (an enormous window disables replay protection)",
+    file: "src/webhook.ts",
+    find: "  if (!Number.isInteger(toleranceSec) || toleranceSec <= 0 || toleranceSec > MAX_TOLERANCE_SEC) {",
+    replace: "  if (!Number.isInteger(toleranceSec) || toleranceSec <= 0) {",
+    test: "refuses an ENORMOUS tolerance",
   },
 ];
 
