@@ -10,8 +10,31 @@ import type { DecodedError } from "./daraja-catalog.js";
 /** Terminal + non-terminal payment states. NOTE: it is `success`, never `paid`. */
 export type PaymentStatus = "pending" | "success" | "failed";
 
-/** Request body for `POST /collect`. */
-export interface CollectParams {
+/**
+ * The idempotency half of every money-moving call, as a discriminated pair.
+ *
+ * `idempotencyKey` is REQUIRED — the type will not let you omit it. The only alternative is to
+ * say, in the call itself, that you want an unprotected charge. That is deliberately ugly to
+ * write and it warns on every single call. See {@link CollectParamsBase.idempotencyKey}.
+ */
+export type IdempotencyParams =
+  | {
+      /** See {@link CollectParamsBase.idempotencyKey}. */
+      readonly idempotencyKey: string;
+      readonly unsafeGeneratedIdempotencyKey?: false;
+    }
+  | {
+      readonly idempotencyKey?: undefined;
+      /**
+       * **Opt out of double-charge protection.** The SDK mints a throwaway key per call, which
+       * collapses nothing: a double-click, a refreshed tab or a redelivered job each become a
+       * SEPARATE charge. Warns on EVERY call. For scratch scripts only, never production.
+       */
+      readonly unsafeGeneratedIdempotencyKey: true;
+    };
+
+/** Request body for `POST /collect`, minus the idempotency pair. */
+export interface CollectParamsBase {
   /** Whole KES. Must be a positive integer ≤ 150000 — M-Pesa rejects decimals. */
   readonly amount: number;
   /** Any Kenyan format: `0712345678`, `+254712345678`, `254712345678`, `712345678`. */
@@ -71,13 +94,17 @@ export interface CollectParams {
    * For money, at-most-once beats at-least-once. Same key + a *different* body is a different
    * `409` — two charges collided on one key, always a bug on your side.
    *
-   * **If you omit it**, the SDK generates a fresh key for each call. That makes an internal
-   * network retry of one call safe, but it does NOT stop your application from sending the same
-   * logical charge twice — which is the common way customers get double-charged. The SDK emits a
-   * one-time `console.warn` in that case.
+   * **You cannot omit it.** Since 0.10.0 this is required, at compile time and at runtime. The
+   * SDK used to generate one for you and warn once per process — but a key minted inside the call
+   * is a different value on every call, so it collapsed nothing, and the one party that knows a
+   * retry is a retry is you. If you genuinely want an unprotected charge (a scratch script, never
+   * production), pass `unsafeGeneratedIdempotencyKey: true`; it warns on EVERY call.
    */
-  readonly idempotencyKey?: string;
+  readonly idempotencyKey: string;
 }
+
+/** Request body for `POST /collect`. `idempotencyKey` is required — see {@link IdempotencyParams}. */
+export type CollectParams = Omit<CollectParamsBase, "idempotencyKey"> & IdempotencyParams;
 
 /** The `202 Accepted` body from `POST /collect`. The STK prompt is now on the phone. */
 export interface CollectAck {
@@ -85,9 +112,9 @@ export interface CollectAck {
   readonly status: "pending";
   readonly checkoutRequestId: string;
   /**
-   * The `Idempotency-Key` that was actually sent: the one you passed, or the random one the SDK
-   * generated because you did not. Replaying this exact key returns this exact payment instead of
-   * charging again — so if you generated nothing, persist this before you retry.
+   * The `Idempotency-Key` that was actually sent: the one you passed, or — only if you opted out
+   * with `unsafeGeneratedIdempotencyKey` — the throwaway one the SDK minted. Replaying this exact
+   * key returns this exact payment instead of charging again.
    */
   readonly idempotencyKey: string;
 }

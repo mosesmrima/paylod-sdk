@@ -5,7 +5,7 @@
  * Theme, as ever: never report an unpaid charge as paid, never invite a second charge, never let a
  * credential reach a place it can be logged.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   Paylod,
   PaylodApiError,
@@ -122,10 +122,12 @@ describe("sibling A — collectAndWait() attaches the key to every post-acknowle
   });
 
   it("a GENERATED key is recoverable the same way", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { m, paylod } = collectThen({ throw: new TypeError("fetch failed") });
     const err = (await paylod
-      .collectAndWait({ amount: 1, phone: "0712345678" })
+      .collectAndWait({ amount: 1, phone: "0712345678", unsafeGeneratedIdempotencyKey: true })
       .catch((e) => e)) as PaylodConnectionError;
+    warn.mockRestore();
     const sent = m.calls[0]!.headers["idempotency-key"];
     expect(sent).toMatch(/^[0-9a-f-]{36}$/);
     expect(err.idempotencyKey).toBe(sent);
@@ -336,14 +338,14 @@ describe("sibling F — the simulator reuses the production validators, not weak
 
   it("simulate.collect() validates the ack schema production validates", async () => {
     const { paylod } = client([{ status: 200, json: { paymentId: "pay_1" } }]); // no checkoutRequestId
-    await expect(paylod.simulate.collect({})).rejects.toBeInstanceOf(PaylodApiError);
+    await expect(paylod.simulate.collect({ idempotencyKey: "t-35",})).rejects.toBeInstanceOf(PaylodApiError);
   });
 
   it("a well-formed simulated ack still works", async () => {
     const { paylod } = client([
       { status: 202, json: { ...ACK, outcomes: [] } },
     ]);
-    await expect(paylod.simulate.collect({})).resolves.toMatchObject({ paymentId: "pay_123" });
+    await expect(paylod.simulate.collect({ idempotencyKey: "t-34",})).resolves.toMatchObject({ paymentId: "pay_123" });
   });
 });
 

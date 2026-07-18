@@ -10,6 +10,8 @@
  * Nothing here imports the client, so both `client.ts` and `simulate.ts` can depend on it.
  */
 
+import { randomUUID } from "node:crypto";
+
 import { PaylodApiError, PaylodInvalidRequestError } from "./errors.js";
 import type { PaymentStatus } from "./types.js";
 
@@ -74,6 +76,95 @@ export function assertValidIdempotencyKey(key: string, what = "idempotencyKey"):
         "(a UUID or your attempt's primary key), not customer- or product-derived text.",
     );
   }
+}
+
+/**
+ * THE DOUBLE-CHARGE GUARD, resolved before a single byte leaves the process.
+ *
+ * A GENERATED KEY IS NOT IDEMPOTENCY. It is a fresh value on every invocation, so it collapses
+ * exactly nothing: a double-clicked Pay button, a refreshed tab, a redelivered queue job and a
+ * process restart mid-request each mint a NEW key and each raise a SEPARATE charge. The previous
+ * behaviour — generate one, warn ONCE per process — meant the protection was OFF by default and
+ * the warning was invisible in every production posture that matters (the second charge the
+ * worker handles, a log nobody reads, a `console.warn` swallowed by a logging shim). The one
+ * party that knows a retry is a retry is the caller, and a key minted inside the call cannot
+ * survive one by construction.
+ *
+ * So the key is REQUIRED. The only way to a generated one is to say so in the call itself, and it
+ * still warns EVERY time. Naming and semantics match the PHP SDK's `unsafeGeneratedIdempotencyKey`
+ * and the Python SDK's `unsafe_generated_idempotency_key`.
+ *
+ * @param what The calling surface, so the message names the actual method the developer called.
+ */
+export function resolveIdempotencyKey(
+  idempotencyKey: string | undefined,
+  unsafeGenerated: boolean | undefined,
+  what: string,
+): string {
+  if (idempotencyKey !== undefined) {
+    // A caller-supplied key is the double-charge guard — reject a blank/whitespace/control-char
+    // one loudly rather than silently drop protection.
+    assertValidIdempotencyKey(idempotencyKey, `${what}: idempotencyKey`);
+    return idempotencyKey;
+  }
+
+  // `!== true` and not a truthy test: `unsafeGeneratedIdempotencyKey: "false"` — what reading an
+  // env var gives you — must not open the unsafe path. Failing CLOSED here costs a clear error;
+  // failing open costs a customer a second charge.
+  if (unsafeGenerated !== true) {
+    throw new PaylodInvalidRequestError(
+      `${what} requires an \`idempotencyKey\`. Mint ONE KEY PER PAYMENT ATTEMPT — an id you ` +
+        "create when the customer presses Pay and PERSIST on that attempt — and pass it here. " +
+        "Without it this charge has no double-charge protection at all: a double-clicked button, " +
+        "a refreshed tab, a redelivered job or a process restart will fire a SECOND STK prompt " +
+        "and can charge your customer twice. A key the SDK generates for you is not idempotency " +
+        "— it is a different value on every call, so it collapses nothing.\n" +
+        "             const attempt = await db.attempts.create({ orderId: order.id });\n" +
+        "             await paylod.collectAndWait({ phone, amount, idempotencyKey: attempt.id });\n" +
+        "         Do NOT key on the order or the product. An order id is stable but never fresh: " +
+        "a retry after a wrong PIN replays the FAILED attempt, so that order can never be paid. " +
+        "A product id is worse — every customer after the first replays the first-ever payment. " +
+        "And `crypto.randomUUID()` at the call site is exactly equivalent to passing nothing.\n" +
+        "         If you genuinely want an unprotected charge (a scratch script, never " +
+        "production), pass `unsafeGeneratedIdempotencyKey: true` and accept that this call can " +
+        "double-charge. https://paylod.dev/docs/sdk#idempotency",
+    );
+  }
+
+  warnUnsafeGeneratedIdempotencyKey(what);
+  return randomUUID();
+}
+
+/**
+ * Warn on EVERY unprotected charge — never once per process, never once per call site.
+ *
+ * The old module-level `warnedMissingIdempotencyKey` flag meant a worker that handled a thousand
+ * unprotected charges warned about the FIRST one and stayed silent for the other 999, which is
+ * the exact scenario — a charge fired in a loop or a job handler — that the warning exists to
+ * flag. Each unprotected charge is a SEPARATE opportunity to double-charge a customer, so each
+ * one is announced.
+ *
+ * `console.warn` deliberately, NOT `process.emitWarning`. `emitWarning` routes through Node's
+ * warning machinery, which the default handler silences wholesale under `--no-warnings` or
+ * `NODE_OPTIONS=--no-warnings` and de-duplicates by code on the deprecation path — every one of
+ * those is a way for this warning to vanish in exactly the production posture where it matters.
+ * `console.warn` has no dedup and no global mute switch.
+ */
+function warnUnsafeGeneratedIdempotencyKey(what: string): void {
+  console.warn(
+    `[paylod] ${what} was called with unsafeGeneratedIdempotencyKey: true, so this charge is ` +
+      "NOT protected against being sent twice.\n" +
+      "         The SDK generated a key, and a generated key is not idempotency: it is a " +
+      "different value on every call, so it collapses nothing. A double-clicked Pay button, a " +
+      "refreshed tab, or a redelivered job will fire a SECOND STK prompt and can charge your " +
+      "customer twice.\n" +
+      "         Pass ONE KEY PER PAYMENT ATTEMPT — an id you mint when the customer presses Pay, " +
+      "and persist on that attempt:\n" +
+      "             const attempt = await db.attempts.create({ orderId: order.id });\n" +
+      "             await paylod.collectAndWait({ phone, amount, idempotencyKey: attempt.id });\n" +
+      "         This warning fires on EVERY such call, by design — each one is a separate " +
+      "chance to charge a customer twice. https://paylod.dev/docs/sdk#idempotency",
+  );
 }
 
 /**

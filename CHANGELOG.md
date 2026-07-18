@@ -3,6 +3,82 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.10.0
+
+**Breaking, and the reason for the version bump.** One finding, rated High by the independent
+reviewer against the Python SDK and confirmed here: the SDK generated an idempotency key when the
+caller omitted one. This release removes that behaviour on every surface that can move money.
+
+### Breaking changes
+
+- **`idempotencyKey` is now REQUIRED on `collect()`, `collectAndWait()`, `simulate.collect()` and
+  `simulate.pay()`.** Omitting it is a TypeScript compile error and a runtime
+  `PaylodInvalidRequestError`, thrown before a single byte leaves the process — no request is
+  dispatched, no phone number is normalized.
+
+  A GENERATED KEY IS NOT IDEMPOTENCY. It is a fresh value on every invocation, so it collapses
+  exactly nothing: a double-clicked Pay button, a refreshed tab, a redelivered queue job and a
+  process restart mid-request each minted a NEW key and each raised a SEPARATE charge — a second
+  STK prompt on a real customer's phone. Application-level and job-queue retry is explicitly in
+  this SDK's threat model, and it is precisely what a per-call generated key cannot survive: the
+  caller is the only party that knows a retry is a retry.
+
+  The old posture compounded it. The protection was OFF by default and the warning was emitted
+  once per process, so a worker that handled a thousand unprotected charges warned about the first
+  one and stayed silent for the other 999 — and a charge fired inside a loop or a job handler is
+  exactly the scenario the warning existed to flag.
+
+  **Migration.** Mint one id per payment attempt — where the attempt begins, and persisted — and
+  pass it. `tsc` finds every call site for you:
+
+  ```diff
+  - const ack = await paylod.collect({ amount, phone });
+  + const attempt = await db.attempts.create({ orderId: order.id });
+  + const ack = await paylod.collect({ amount, phone, idempotencyKey: attempt.id });
+  ```
+
+  In tests any stable literal works (`idempotencyKey: "t-1"`). Do NOT reach for
+  `crypto.randomUUID()` at the call site: it satisfies the type and the runtime check while
+  providing zero protection, which is the same bug wearing a disguise.
+
+- **`CollectParams` and `SimulateCollectParams` are now type aliases**, not interfaces —
+  `CollectParamsBase`/`SimulateCollectParamsBase` intersected with the new `IdempotencyParams`
+  union. All three are exported. Code that wrote `interface X extends CollectParams` must switch
+  to an intersection; ordinary callers are unaffected.
+
+- **`simulate.collect()` now requires its params argument.** `paylod.simulate.collect()` with no
+  arguments no longer compiles, because there is no key to pass in it.
+
+### The escape hatch
+
+`unsafeGeneratedIdempotencyKey: true` opts out and lets the SDK mint a throwaway key. Named to
+match the PHP SDK's `unsafeGeneratedIdempotencyKey` and the Python SDK's
+`unsafe_generated_idempotency_key` — the reference behaviour all four SDKs are converging on.
+
+It **warns on EVERY call**, never once per process and never once per call site. That detail is
+load-bearing: Python's default warning filter is "once per code location", which silently
+deduplicated the warning for charges fired inside a loop. Node has an equivalent trap in
+`process.emitWarning` — routed through the warning machinery, it is silenced wholesale by
+`--no-warnings` / `NODE_OPTIONS=--no-warnings` and de-duplicated by code on the deprecation path —
+so the warning is emitted with `console.warn`, which has no dedup and no global mute switch.
+Verified empirically against the built artifact: 50 opt-out calls from one call site in one
+process on one client produce 50 warnings and 50 distinct keys.
+
+The opt-out fails CLOSED on anything that is not literally `true`: `unsafeGeneratedIdempotencyKey:
+"false"` — what reading an environment variable gives you — throws rather than quietly opening the
+unsafe path.
+
+### Non-vacuity
+
+Five new mutations, all CAUGHT (48/48 for the suite as a whole): the required-key guard reverted on
+`collect()` and on `collectAndWait()` separately, the opt-out made to fail open on a truthy value,
+the simulator's collect made laxer than production, and the every-call warning reverted to
+once-per-process.
+
+Two of the new selectors initially matched ZERO tests — `-t` is a regex, so `collect()` is
+`collect` plus an empty group and the literal parentheses never match. The harness's liveness check
+caught it, which is exactly what it is for.
+
 ## 0.9.0
 
 Sixth independent review, conducted against the threat model in `SECURITY.md`. One Critical, three

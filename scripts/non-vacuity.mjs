@@ -424,6 +424,60 @@ const CASES = [
     replace: "  if (!Number.isInteger(toleranceSec) || toleranceSec <= 0) {",
     test: "refuses an ENORMOUS tolerance",
   },
+
+  // -- 0.10.0 -- idempotencyKey is REQUIRED on every money-moving surface -----------------------
+  {
+    id: "I1-required",
+    what: "collect() silently generates a key again instead of requiring one",
+    file: "src/validate.ts",
+    find: "  if (unsafeGenerated !== true) {",
+    replace: "  if (false) {",
+    // NO PARENTHESES in a selector: vitest treats `-t` as a REGEX, so "collect()" is
+    // "collect" plus an empty group and the literal parens never match. That is precisely how a
+    // selector silently covers zero tests while the runner exits 0 -- caught by the liveness check.
+    test: "with no idempotencyKey, before a single request is dispatched",
+  },
+  {
+    id: "I1-caw",
+    what: "collectAndWait() -- the sibling surface -- no longer requires a key either",
+    file: "src/validate.ts",
+    find: "  if (unsafeGenerated !== true) {",
+    replace: "  if (false) {",
+    test: "it is the call most people actually make",
+  },
+  {
+    id: "I1-failopen",
+    what: "the opt-out fails OPEN on a truthy non-true value (`\"false\"` from an env var)",
+    file: "src/validate.ts",
+    find: "  if (unsafeGenerated !== true) {",
+    replace: "  if (!unsafeGenerated) {",
+    test: "fails CLOSED on a truthy-but-not-true opt-out",
+  },
+  {
+    id: "I2-sim",
+    what: "the SIMULATOR's collect is laxer than production and generates a key unasked",
+    file: "src/simulate.ts",
+    find: `    const idempotencyKey = resolveIdempotencyKey(
+      params.idempotencyKey,
+      params.unsafeGeneratedIdempotencyKey,
+      "simulate.collect()",
+    );`,
+    replace: `    const idempotencyKey = resolveIdempotencyKey(
+      params.idempotencyKey,
+      true,
+      "simulate.collect()",
+    );`,
+    test: "a simulator laxer than production certifies a lie",
+  },
+  {
+    id: "I3-everycall",
+    what: "the unsafe-path warning goes back to once per process, so a charge in a LOOP warns once",
+    file: "src/validate.ts",
+    find: "function warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  console.warn(",
+    replace:
+      "let warnedOnce = false;\nfunction warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  if (warnedOnce) return;\n  warnedOnce = true;\n  console.warn(",
+    test: "emits N warnings for N unprotected calls from the SAME call site in ONE process",
+  },
 ];
 
 const results = [];

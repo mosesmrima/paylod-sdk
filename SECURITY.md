@@ -91,6 +91,13 @@ paid. A mismatch is indeterminate, never a verdict.
 
 ### 6. Double-charge through idempotency mishandling
 
+- `collect()`, `collectAndWait()`, `simulate.collect()` and `simulate.pay()` **require** a
+  caller-persisted `idempotencyKey`. A key the SDK generates for you is not idempotency: it is a
+  different value on every invocation, so it collapses nothing, and a double-clicked Pay button, a
+  refreshed tab, a redelivered queue job or a process restart each raise a separate charge. Mint
+  one key per payment *attempt* and persist it before calling. The unsafe path exists
+  (`unsafeGeneratedIdempotencyKey: true`), is named accordingly, and warns on **every** call — via
+  `console.warn`, which `--no-warnings` cannot silence and which does not de-duplicate.
 - `Idempotency-Key` is validated at the boundary: non-blank, printable ASCII without spaces, no
   control or zero-width characters, 255 bytes max. A key that is silently re-encoded or trimmed in
   transit stops matching the stored attempt, which removes the guard entirely.

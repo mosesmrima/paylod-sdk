@@ -52,7 +52,7 @@ describe("construction", () => {
     const m = mockFetch([{ status: 202, json: ACK }]);
     // The documented form. Everything else is defaulted.
     const paylod = new Paylod(KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
-    await paylod.collect({ amount: 1, phone: "0712345678" });
+    await paylod.collect({ idempotencyKey: "t-32", amount: 1, phone: "0712345678" });
     // The base URL is baked in: the caller never supplied one.
     expect(m.calls[0]!.url).toBe("https://paylod.dev/functions/v1/collect");
     expect(m.calls[0]!.headers.authorization).toBe(`Bearer ${KEY}`);
@@ -76,11 +76,11 @@ describe("construction", () => {
 
   it("defaults to the live base URL and allows an override", async () => {
     const a = client([{ status: 202, json: ACK }]);
-    await a.paylod.collect({ amount: 1, phone: "0712345678" });
+    await a.paylod.collect({ idempotencyKey: "t-31", amount: 1, phone: "0712345678" });
     expect(a.m.calls[0]!.url).toBe("https://paylod.dev/functions/v1/collect");
 
     const b = client([{ status: 202, json: ACK }], { baseUrl: "https://api.paylod.dev/v1/" });
-    await b.paylod.collect({ amount: 1, phone: "0712345678" });
+    await b.paylod.collect({ idempotencyKey: "t-30", amount: 1, phone: "0712345678" });
     expect(b.m.calls[0]!.url).toBe("https://api.paylod.dev/v1/collect");
   });
 });
@@ -88,7 +88,7 @@ describe("construction", () => {
 describe("collect", () => {
   it("posts a normalised body and returns the 202 ack", async () => {
     const { m, paylod } = client([{ status: 202, json: ACK }]);
-    const ack = await paylod.collect({ amount: 100, phone: "0712345678" });
+    const ack = await paylod.collect({ idempotencyKey: "t-29", amount: 100, phone: "0712345678" });
 
     expect(ack.paymentId).toBe("pay_123");
     expect(ack.status).toBe("pending");
@@ -108,20 +108,20 @@ describe("collect", () => {
     ["0110 123 456", "254110123456"],
   ])("normalises %s to %s", async (input, expected) => {
     const { m, paylod } = client([{ status: 202, json: ACK }]);
-    await paylod.collect({ amount: 5, phone: input });
+    await paylod.collect({ idempotencyKey: "t-28", amount: 5, phone: input });
     expect((m.calls[0]!.body as { phone: string }).phone).toBe(expected);
   });
 
   it("rejects bad input locally, before any network call", async () => {
     const { m, paylod } = client([{ status: 202, json: ACK }]);
-    await expect(paylod.collect({ amount: 10.5, phone: "0712345678" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-27", amount: 10.5, phone: "0712345678" })).rejects.toThrow(
       PaylodInvalidRequestError,
     );
-    await expect(paylod.collect({ amount: 0, phone: "0712345678" })).rejects.toThrow(/between 1/);
-    await expect(paylod.collect({ amount: 150_001, phone: "0712345678" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-26", amount: 0, phone: "0712345678" })).rejects.toThrow(/between 1/);
+    await expect(paylod.collect({ idempotencyKey: "t-25", amount: 150_001, phone: "0712345678" })).rejects.toThrow(
       /150000/,
     );
-    await expect(paylod.collect({ amount: 10, phone: "0812345678" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-24", amount: 10, phone: "0812345678" })).rejects.toThrow(
       PaylodInvalidRequestError,
     );
     expect(m.count).toBe(0);
@@ -129,7 +129,7 @@ describe("collect", () => {
 
   it("surfaces an API error with its status and decoded message", async () => {
     const { paylod } = client([{ status: 401, json: { error: "invalid API key" } }]);
-    const err = await paylod.collect({ amount: 10, phone: "0712345678" }).catch((e) => e);
+    const err = await paylod.collect({ idempotencyKey: "t-23", amount: 10, phone: "0712345678" }).catch((e) => e);
     expect(err).toBeInstanceOf(PaylodApiError);
     expect(err.status).toBe(401);
     expect(err.isAuthError).toBe(true);
@@ -138,12 +138,18 @@ describe("collect", () => {
 });
 
 describe("idempotency", () => {
-  it("generates an Idempotency-Key by default and returns it on the ack", async () => {
+  it("generates an Idempotency-Key ONLY under the explicit opt-out, and returns it on the ack", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { m, paylod } = client([{ status: 202, json: ACK }]);
-    const ack = await paylod.collect({ amount: 100, phone: "0712345678" });
+    const ack = await paylod.collect({
+      amount: 100,
+      phone: "0712345678",
+      unsafeGeneratedIdempotencyKey: true,
+    });
     const sent = m.calls[0]!.headers["idempotency-key"];
     expect(sent).toMatch(/^[0-9a-f-]{36}$/);
     expect(ack.idempotencyKey).toBe(sent);
+    warn.mockRestore();
   });
 
   it("uses a caller-supplied key verbatim", async () => {
@@ -156,8 +162,8 @@ describe("idempotency", () => {
 
   it("generates a DIFFERENT key per call, so two charges are two charges", async () => {
     const { m, paylod } = client([{ status: 202, json: ACK }]);
-    await paylod.collect({ amount: 100, phone: "0712345678" });
-    await paylod.collect({ amount: 100, phone: "0712345678" });
+    await paylod.collect({ idempotencyKey: "t-21", amount: 100, phone: "0712345678" });
+    await paylod.collect({ idempotencyKey: "t-20", amount: 100, phone: "0712345678" });
     expect(m.calls[0]!.headers["idempotency-key"]).not.toBe(
       m.calls[1]!.headers["idempotency-key"],
     );
@@ -169,7 +175,7 @@ describe("idempotency", () => {
       { status: 202, json: ACK },
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 2 });
-    const ack = await withFakeClock(() => paylod.collect({ amount: 100, phone: "0712345678" }));
+    const ack = await withFakeClock(() => paylod.collect({ idempotencyKey: "t-19", amount: 100, phone: "0712345678" }));
 
     expect(m.calls).toHaveLength(2);
     expect(m.calls[0]!.headers["idempotency-key"]).toBe(m.calls[1]!.headers["idempotency-key"]);
@@ -193,63 +199,166 @@ describe("idempotency", () => {
 });
 
 /**
- * The double-charge guard. An omitted `idempotencyKey` means the application can send the same
- * logical charge twice — the single most expensive mistake this SDK can let you make — so it has
- * to be audible. The warning is module-level "once per process" state, hence the fresh import.
+ * THE DOUBLE-CHARGE GUARD.
+ *
+ * `idempotencyKey` is REQUIRED. The SDK used to mint one when the caller omitted it and warn once
+ * per process — but a key minted inside the call is a fresh value on every call, so it collapses
+ * nothing, and the caller is the only party that knows a retry is a retry. Application-level and
+ * job-queue retry is explicitly in this SDK's threat model, and it is exactly what a per-call
+ * generated key cannot survive.
+ *
+ * The escape hatch is named for what it is, and it warns on EVERY call — never once per process,
+ * because a worker that handles a thousand unprotected charges in a loop must hear about all
+ * thousand. Each one is a separate chance to charge a customer twice.
  */
-describe("missing-idempotencyKey warning", () => {
-  async function freshClient(steps: Step[]) {
-    vi.resetModules();
-    const { Paylod: Fresh } = await import("../src/client.js");
-    const m = mockFetch(steps);
-    return { m, paylod: new Fresh({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true }) };
-  }
+describe("required idempotencyKey", () => {
+  const NO_REQUEST: Step[] = [];
 
-  it("warns when collect() is called with no idempotencyKey", async () => {
+  it("REFUSES collect() with no idempotencyKey, before a single request is dispatched", async () => {
+    const { m, paylod } = client(NO_REQUEST);
+
+    await expect(
+      // @ts-expect-error — omitting the key is a COMPILE error too; this proves the runtime guard.
+      paylod.collect({ amount: 100, phone: "0712345678" }),
+    ).rejects.toThrow(PaylodInvalidRequestError);
+
+    expect(m.calls).toHaveLength(0);
+  });
+
+  it("names the key, the danger and the escape hatch in the refusal", async () => {
+    const { paylod } = client(NO_REQUEST);
+    const err = await paylod
+      // @ts-expect-error — see above.
+      .collect({ amount: 100, phone: "0712345678" })
+      .catch((e: unknown) => e);
+    const message = String((err as Error).message);
+
+    expect(message).toContain("idempotencyKey");
+    expect(message).toContain("charge your customer twice");
+    expect(message).toContain("unsafeGeneratedIdempotencyKey");
+  });
+
+  it("REFUSES collectAndWait() too — it is the call most people actually make", async () => {
+    const { m, paylod } = client(NO_REQUEST);
+
+    await expect(
+      // @ts-expect-error — see above.
+      paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
+    ).rejects.toThrow(PaylodInvalidRequestError);
+
+    expect(m.calls).toHaveLength(0);
+  });
+
+  it("REFUSES simulate.collect() too — a simulator laxer than production certifies a lie", async () => {
+    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch, allowCustomFetch: true });
+
+    await expect(
+      // @ts-expect-error — see above.
+      paylod.simulate.collect({ amount: 100 }),
+    ).rejects.toThrow(PaylodInvalidRequestError);
+  });
+
+  it("REFUSES simulate.pay() too", async () => {
+    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch, allowCustomFetch: true });
+
+    await expect(
+      // @ts-expect-error — see above.
+      paylod.simulate.pay({ outcome: "approve" }),
+    ).rejects.toThrow(PaylodInvalidRequestError);
+  });
+
+  it("fails CLOSED on a truthy-but-not-true opt-out — `\"false\"` from an env var must not open it", async () => {
+    const { m, paylod } = client(NO_REQUEST);
+
+    for (const truthy of ["true", 1, "yes", {}]) {
+      await expect(
+        // @ts-expect-error — the type forbids these; the runtime must too.
+        paylod.collect({ amount: 100, phone: "0712345678", unsafeGeneratedIdempotencyKey: truthy }),
+      ).rejects.toThrow(PaylodInvalidRequestError);
+    }
+
+    expect(m.calls).toHaveLength(0);
+  });
+
+  it("stays silent, and dispatches, when the caller supplies a key", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
+    const { m, paylod } = client([{ status: 202, json: ACK }]);
 
-    await paylod.collect({ amount: 100, phone: "0712345678" });
+    await paylod.collect({ amount: 100, phone: "0712345678", idempotencyKey: "order-1042" });
+
+    expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-1042");
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
+describe("unsafeGeneratedIdempotencyKey warns on EVERY call", () => {
+  it("warns once for one opt-out call, naming the flag", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { paylod } = client([{ status: 202, json: ACK }]);
+
+    await paylod.collect({ amount: 100, phone: "0712345678", unsafeGeneratedIdempotencyKey: true });
 
     expect(warn).toHaveBeenCalledTimes(1);
     const msg = String(warn.mock.calls[0]![0]);
-    expect(msg).toContain("idempotencyKey");
+    expect(msg).toContain("unsafeGeneratedIdempotencyKey");
     expect(msg).toContain("charge your customer twice");
     warn.mockRestore();
   });
 
-  it("warns only ONCE, however many unprotected calls follow", async () => {
+  /**
+   * THE REGRESSION THIS EXISTS FOR. The old warner was module-level `warnedMissingIdempotencyKey`
+   * state, so N charges in a loop produced exactly ONE warning — and a charge in a loop is the
+   * precise scenario the warning is for. N calls, N warnings, from ONE call site, in ONE process,
+   * on ONE client. No `vi.resetModules()`: the point is that no per-process state exists to reset.
+   */
+  it("emits N warnings for N unprotected calls from the SAME call site in ONE process", async () => {
+    const N = 25;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
+    const { m, paylod } = client(Array.from({ length: N }, () => ({ status: 202, json: ACK }) as Step));
 
-    await paylod.collect({ amount: 100, phone: "0712345678" });
-    await paylod.collect({ amount: 100, phone: "0712345678" });
-    await paylod.collect({ amount: 100, phone: "0712345678" });
+    for (let i = 0; i < N; i++) {
+      await paylod.collect({ amount: 100, phone: "0712345678", unsafeGeneratedIdempotencyKey: true });
+    }
 
-    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(N);
+    expect(m.calls).toHaveLength(N);
+    // And every generated key is DIFFERENT, which is the whole reason a generated key is not
+    // idempotency: these N calls are N separate charges to the API.
+    const keys = new Set(m.calls.map((c) => c.headers["idempotency-key"]));
+    expect(keys.size).toBe(N);
     warn.mockRestore();
   });
 
-  it("stays silent when the caller supplies a key", async () => {
+  it("warns on EVERY call across separate client instances too", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { paylod } = await freshClient([{ status: 202, json: ACK }]);
-
-    await paylod.collect({ amount: 100, phone: "0712345678", idempotencyKey: "order-1042" });
-
-    expect(warn).not.toHaveBeenCalled();
+    for (let i = 0; i < 3; i++) {
+      const { paylod } = client([{ status: 202, json: ACK }]);
+      await paylod.collect({ amount: 1, phone: "0712345678", unsafeGeneratedIdempotencyKey: true });
+    }
+    expect(warn).toHaveBeenCalledTimes(3);
     warn.mockRestore();
   });
 
-  it("warns via collectAndWait() too — it is the call most people actually make", async () => {
+  it("warns via collectAndWait() and simulate.collect() as well", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { paylod } = await freshClient([
+    const { paylod } = client([
       { status: 202, json: ACK },
       { status: 200, json: payment({ status: "success", mpesaReceipt: "UG1F3A1U7J" }) },
     ]);
 
-    await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
-
+    await paylod.collectAndWait({ amount: 100, phone: "0712345678", unsafeGeneratedIdempotencyKey: true });
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain("collect()");
+
+    const sim = new Paylod({
+      apiKey: KEY,
+      fetch: mockFetch([{ status: 202, json: { ...ACK, outcomes: [] } }]).fetch,
+      allowCustomFetch: true,
+    });
+    await sim.simulate.collect({ amount: 1, unsafeGeneratedIdempotencyKey: true });
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(String(warn.mock.calls[1]![0])).toContain("simulate.collect()");
     warn.mockRestore();
   });
 });
@@ -279,7 +388,7 @@ describe("collectAndWait", () => {
 
     const onPoll = vi.fn();
     const r = await withFakeClock(() =>
-      paylod.collectAndWait({ amount: 100, phone: "0712345678" }, { onPoll }),
+      paylod.collectAndWait({ idempotencyKey: "t-13", amount: 100, phone: "0712345678" }, { onPoll }),
     );
 
     expect(r.status).toBe("succeeded");
@@ -304,7 +413,7 @@ describe("collectAndWait", () => {
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const r = await withFakeClock(() =>
-      paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
+      paylod.collectAndWait({ idempotencyKey: "t-12", amount: 100, phone: "0712345678" }),
     );
 
     // Everything a UI needs, with no `if` over result codes:
@@ -327,7 +436,7 @@ describe("collectAndWait", () => {
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const r = await withFakeClock(() =>
-      paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
+      paylod.collectAndWait({ idempotencyKey: "t-11", amount: 100, phone: "0712345678" }),
     );
 
     expect(r.status).toBe("cancelled"); // not lumped in with "failed"
@@ -355,7 +464,7 @@ describe("collectAndWait", () => {
       ]);
       const paylod = new Paylod(KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
       const r = await withFakeClock(() =>
-        paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
+        paylod.collectAndWait({ idempotencyKey: "t-10", amount: 100, phone: "0712345678" }),
       );
 
       // If the SDK had trusted `status: "failed"`, this payment would have been reported as a
@@ -391,7 +500,7 @@ describe("collectAndWait", () => {
 
     const err = await withFakeClock(() =>
       paylod
-        .collectAndWait({ amount: 100, phone: "0712345678" }, { timeoutMs: 8_000 })
+        .collectAndWait({ idempotencyKey: "t-9", amount: 100, phone: "0712345678" }, { timeoutMs: 8_000 })
         .catch((e) => e),
     );
 
@@ -409,7 +518,7 @@ describe("collectAndWait", () => {
       { json: payment({ status: "success", mpesaReceipt: "R1", resultCode: 0 }) },
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
-    await withFakeClock(() => paylod.collectAndWait({ amount: 1, phone: "0712345678" }));
+    await withFakeClock(() => paylod.collectAndWait({ idempotencyKey: "t-8", amount: 1, phone: "0712345678" }));
     expect(m.count).toBe(3); // collect + 2 status reads, no more
   });
 });
@@ -447,11 +556,11 @@ describe("decodeError", () => {
 describe("phone normalisation edge cases", () => {
   it("rejects empty, non-Kenyan, and wrong-length numbers", async () => {
     const { paylod } = client([]);
-    await expect(paylod.collect({ amount: 1, phone: "" })).rejects.toThrow(/required/);
-    await expect(paylod.collect({ amount: 1, phone: "+1 415 555 0100" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-7", amount: 1, phone: "" })).rejects.toThrow(/required/);
+    await expect(paylod.collect({ idempotencyKey: "t-6", amount: 1, phone: "+1 415 555 0100" })).rejects.toThrow(
       PaylodInvalidRequestError,
     );
-    await expect(paylod.collect({ amount: 1, phone: "07123" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-5", amount: 1, phone: "07123" })).rejects.toThrow(
       PaylodInvalidRequestError,
     );
   });
@@ -459,10 +568,10 @@ describe("phone normalisation edge cases", () => {
   it("rejects over-long accountReference / description before the network", async () => {
     const { m, paylod } = client([]);
     await expect(
-      paylod.collect({ amount: 1, phone: "0712345678", accountReference: "x".repeat(13) }),
+      paylod.collect({ idempotencyKey: "t-4", amount: 1, phone: "0712345678", accountReference: "x".repeat(13) }),
     ).rejects.toThrow(/12 characters/);
     await expect(
-      paylod.collect({ amount: 1, phone: "0712345678", description: "x".repeat(65) }),
+      paylod.collect({ idempotencyKey: "t-3", amount: 1, phone: "0712345678", description: "x".repeat(65) }),
     ).rejects.toThrow(/64 characters/);
     expect(m.count).toBe(0);
   });
@@ -482,7 +591,7 @@ describe("retries", () => {
       { status: 202, json: ACK },
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 2 });
-    const ack = await withFakeClock(() => paylod.collect({ amount: 1, phone: "0712345678" }));
+    const ack = await withFakeClock(() => paylod.collect({ idempotencyKey: "t-2", amount: 1, phone: "0712345678" }));
     expect(ack.paymentId).toBe("pay_123");
     expect(m.count).toBe(2);
   });
@@ -490,7 +599,7 @@ describe("retries", () => {
   it("does not retry a 422 validation error from the server", async () => {
     const m = mockFetch([{ status: 422, json: { error: "invalid Kenyan phone number" } }]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 3 });
-    await expect(paylod.collect({ amount: 1, phone: "0712345678" })).rejects.toThrow(
+    await expect(paylod.collect({ idempotencyKey: "t-1", amount: 1, phone: "0712345678" })).rejects.toThrow(
       PaylodApiError,
     );
     expect(m.count).toBe(1);

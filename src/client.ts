@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   PaylodApiError,
   PaylodConfigError,
@@ -18,7 +17,7 @@ import { assertSandboxKey, Simulator } from "./simulate.js";
 import {
   assertCollectAck,
   assertPaymentBody,
-  assertValidIdempotencyKey,
+  resolveIdempotencyKey,
   assertWholeNonNegative,
   assertWholePositiveMs,
 } from "./validate.js";
@@ -59,35 +58,6 @@ const MAX_UNBOUNDED_SLEEP_MS = 60_000;
 const POLL_SCHEDULE_MS = [1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000] as const;
 
 const MAX_AMOUNT = 150_000;
-
-/**
- * Warn at most once per process. A double-charge is a money bug, so it earns a loud warning —
- * but one that fires on every call in a hot checkout path would just be noise people filter out.
- */
-let warnedMissingIdempotencyKey = false;
-
-function warnMissingIdempotencyKey(): void {
-  if (warnedMissingIdempotencyKey) return;
-  warnedMissingIdempotencyKey = true;
-  console.warn(
-    "[paylod] collect() was called without an `idempotencyKey`, so this charge is not protected " +
-      "against being sent twice.\n" +
-      "         A double-clicked Pay button, a refreshed tab, or a redelivered job will fire a " +
-      "SECOND STK prompt and can charge your customer twice.\n" +
-      "         Pass ONE KEY PER PAYMENT ATTEMPT — an id you mint when the customer presses Pay, " +
-      "and persist on that attempt:\n" +
-      "             const attempt = await db.attempts.create({ orderId: order.id });\n" +
-      "             paylod.collectAndWait({ phone, amount, idempotencyKey: attempt.id })\n" +
-      "         Do NOT key on the order or the product. An order id is stable but never fresh: a " +
-      "retry after a wrong PIN replays the FAILED attempt, so that order can never be paid. A " +
-      "product id is worse — every customer after the first replays the first-ever payment, and " +
-      "nobody after customer one is charged at all.\n" +
-      "         Do NOT generate the key inside the call either (`crypto.randomUUID()` at the call " +
-      "site is exactly equivalent to passing nothing — it just hides this warning).\n" +
-      "         Duplicates of one attempt collapse into one payment and one prompt. A genuine " +
-      "retry is a NEW attempt and needs a NEW key. https://paylod.dev/docs/sdk#idempotency",
-  );
-}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -745,19 +715,23 @@ export class Paylod {
    * retry signal — read the payment status ({@link check}), and only if nothing happened start a
    * new attempt with a **new** key. For money, at-most-once beats at-least-once.
    *
-   * Omit the key and the SDK generates a fresh one per call. That still makes an internal
-   * *network* retry of this one call safe, but it does nothing about your application sending the
-   * same logical charge twice — a double-clicked button, a refreshed tab, a redelivered job —
-   * which is by far the more common way a customer gets charged twice. The SDK warns once if you
-   * omit it.
+   * **The key is required** — omitting it is a compile error and a runtime `throw`, not a warning.
+   * The SDK used to generate one and warn once per process; that made the protection off by
+   * default, because a key minted inside the call is a fresh value on every call and therefore
+   * collapses nothing. Only the caller knows a retry is a retry. If you genuinely want an
+   * unprotected charge (a scratch script, never production), pass
+   * `unsafeGeneratedIdempotencyKey: true` — it warns on EVERY call.
    */
   async collect(params: CollectParams, options: { signal?: AbortSignal } = {}): Promise<CollectAck> {
+    // RESOLVED BEFORE THE BODY IS BUILT. A caller who omits the key must hear about the key, not
+    // about whichever body field happens to be validated first — and a charge with no
+    // double-charge protection must not get as far as normalizing a phone number.
+    const idempotencyKey = resolveIdempotencyKey(
+      params.idempotencyKey,
+      params.unsafeGeneratedIdempotencyKey,
+      "collect()",
+    );
     const body = this.#buildCollectBody(params);
-    if (params.idempotencyKey === undefined) warnMissingIdempotencyKey();
-    // A caller-supplied key is the double-charge guard — reject a blank/whitespace/control-char
-    // one loudly rather than silently drop protection. A generated key is always well-formed.
-    else assertValidIdempotencyKey(params.idempotencyKey);
-    const idempotencyKey = params.idempotencyKey ?? randomUUID();
 
     try {
       // Simulator mode (`new Paylod(testKey, { simulate: true })`): same call, same ack, no handset.

@@ -97,7 +97,7 @@ describe("simulate — the live-key fence", () => {
     const { spy, restore } = watchGlobalFetch();
     try {
       const paylod = new Paylod(LIVE_KEY, { maxRetries: 0 });
-      await expect(paylod.simulate.collect()).rejects.toThrow(PaylodSandboxOnlyError);
+      await expect(paylod.simulate.collect({ idempotencyKey: "t-s1" })).rejects.toThrow(PaylodSandboxOnlyError);
       // The whole point: it never even tried.
       expect(spy).not.toHaveBeenCalled();
     } finally {
@@ -112,7 +112,7 @@ describe("simulate — the live-key fence", () => {
       await expect(paylod.simulate.outcome("pay_1", "approve")).rejects.toThrow(
         PaylodSandboxOnlyError,
       );
-      await expect(paylod.simulate.pay({ outcome: "approve" })).rejects.toThrow(
+      await expect(paylod.simulate.pay({ idempotencyKey: "t-40", outcome: "approve" })).rejects.toThrow(
         PaylodSandboxOnlyError,
       );
       expect(spy).not.toHaveBeenCalled();
@@ -125,8 +125,8 @@ describe("simulate — the live-key fence", () => {
     const { restore } = watchGlobalFetch();
     try {
       const paylod = new Paylod(LIVE_KEY, {});
-      await expect(paylod.simulate.collect()).rejects.toThrow(/production \(mp_live_\) key/i);
-      await expect(paylod.simulate.collect()).rejects.toThrow(/mp_test_ key/i);
+      await expect(paylod.simulate.collect({ idempotencyKey: "t-s2" })).rejects.toThrow(/production \(mp_live_\) key/i);
+      await expect(paylod.simulate.collect({ idempotencyKey: "t-s3" })).rejects.toThrow(/mp_test_ key/i);
     } finally {
       restore();
     }
@@ -148,7 +148,7 @@ describe("simulate.collect", () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
     const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
-    const sim = await paylod.simulate.collect({ phone: "0712345678", amount: 250, accountReference: "order-1" });
+    const sim = await paylod.simulate.collect({ idempotencyKey: "t-39", phone: "0712345678", amount: 250, accountReference: "order-1" });
 
     expect(m.calls[0]!.url).toContain("/simulate/collect");
     expect(m.calls[0]!.body).toEqual({ phone: "254712345678", amount: 250, accountRef: "order-1" });
@@ -163,7 +163,7 @@ describe("simulate.collect", () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
     const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
-    await paylod.simulate.collect();
+    await paylod.simulate.collect({ idempotencyKey: "t-s4" });
     expect(m.calls[0]!.body).toEqual({ phone: "254708374149", amount: 1 });
   });
 
@@ -171,7 +171,7 @@ describe("simulate.collect", () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
     const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
-    await expect(paylod.simulate.collect({ amount: 1.5 })).rejects.toThrow(
+    await expect(paylod.simulate.collect({ idempotencyKey: "t-38", amount: 1.5 })).rejects.toThrow(
       PaylodInvalidRequestError,
     );
     expect(m.calls.length).toBe(0);
@@ -252,7 +252,7 @@ describe("simulate.pay — collect + outcome in one call", () => {
     ]);
     const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
-    const result = await paylod.simulate.pay({ amount: 99, outcome: "user_cancelled" });
+    const result = await paylod.simulate.pay({ idempotencyKey: "t-37", amount: 99, outcome: "user_cancelled" });
 
     expect(m.calls.map((c) => c.url.split("/functions/v1")[1])).toEqual([
       "/simulate/collect",

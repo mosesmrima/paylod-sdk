@@ -23,12 +23,11 @@
  */
 
 import { PaylodInvalidRequestError, PaylodSandboxOnlyError } from "./errors.js";
-import { randomUUID } from "node:crypto";
-import { assertCollectAck, assertPaymentBody, assertValidIdempotencyKey } from "./validate.js";
+import { assertCollectAck, assertPaymentBody, resolveIdempotencyKey } from "./validate.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
-import type { Payment } from "./types.js";
+import type { IdempotencyParams, Payment } from "./types.js";
 
 /**
  * The five things that can happen to an STK prompt, as a typed union — a typo is a compile error,
@@ -62,8 +61,8 @@ export const SIM_OUTCOMES = [
   "timeout",
 ] as const satisfies readonly SimOutcomeId[];
 
-/** What `POST /simulate/collect` accepts. */
-export interface SimulateCollectParams {
+/** What `POST /simulate/collect` accepts, minus the idempotency pair. */
+export interface SimulateCollectParamsBase {
   /** Any Kenyan format. Nothing is sent to it — no handset is involved. Defaults to a test number. */
   readonly phone?: string;
   /** Whole KES. Defaults to `1`. */
@@ -82,10 +81,17 @@ export interface SimulateCollectParams {
    * forwarded here rather than dropped.
    *
    * The simulator runs the same idempotency layer production does, which is what lets a "a
-   * double-click must not charge twice" test actually prove something.
+   * double-click must not charge twice" test actually prove something — and for the same reason
+   * it is REQUIRED here exactly as it is on `collect()`. A simulator with a laxer idempotency
+   * contract than production certifies a guarantee that is not in force. In a test the key is
+   * usually just a literal: `idempotencyKey: "t-1"`.
    */
-  readonly idempotencyKey?: string;
+  readonly idempotencyKey: string;
 }
+
+/** What `POST /simulate/collect` accepts. See {@link IdempotencyParams}. */
+export type SimulateCollectParams = Omit<SimulateCollectParamsBase, "idempotencyKey"> &
+  IdempotencyParams;
 
 /** One outcome the simulator will accept for a given payment, as the backend advertises it. */
 export interface SimOutcomeChoice {
@@ -225,10 +231,25 @@ export class Simulator {
    * {@link outcome} — which is exactly what a live prompt does while a customer stares at it.
    */
   async collect(
-    params: SimulateCollectParams = {},
+    params: SimulateCollectParams,
     options: { signal?: AbortSignal } = {},
   ): Promise<SimulatedPayment> {
     assertSandboxKey(this.#apiKey, "simulate.collect()");
+
+    // RESOLVED FIRST, exactly as production `collect()` does. A caller who omits the key must
+    // hear about the key rather than about whichever other field is validated first.
+    // THE production resolver, not a copy of it, and not a weaker rule. The simulator exists so a
+    // test can prove "a double-click cannot charge twice" against the code path production runs —
+    // which means the simulator's idempotency contract must be production's, exactly. It used to
+    // be laxer twice over: a hand-rolled charset check that admitted keys production rejects, and
+    // then a silent `?? randomUUID()` for an omitted key. Either one lets a test go green on a
+    // guarantee that is not actually in force. So the key is required HERE too, with the same
+    // opt-out, the same message and the same every-call warning.
+    const idempotencyKey = resolveIdempotencyKey(
+      params.idempotencyKey,
+      params.unsafeGeneratedIdempotencyKey,
+      "simulate.collect()",
+    );
 
     const amount = params.amount ?? 1;
     if (!Number.isInteger(amount) || amount <= 0) {
@@ -236,21 +257,6 @@ export class Simulator {
         `simulate.collect(): amount must be a positive whole number of KES (got ${amount}).`,
       );
     }
-    // THE production validator, not a copy of it. The copy that used to live here checked only C0
-    // controls and DEL, so the simulator accepted keys production rejects outright - C1 controls,
-    // Unicode zero-width characters, non-ASCII, and over-long keys. That is the one divergence a
-    // simulator must never have: a test written to prove "a double-click cannot charge twice"
-    // would pass here against a key that fails in production, certifying a guarantee that is not
-    // actually in force. One validator, both surfaces.
-    if (params.idempotencyKey !== undefined) {
-      assertValidIdempotencyKey(params.idempotencyKey, "simulate.collect(): idempotencyKey");
-    }
-    // Production `collect()` generates a key when the caller omits one, so a network retry of a
-    // single call cannot create two payments. This surface did not, so an omitted key meant NO
-    // Idempotency-Key header at all and a retried simulate-collect really could create a second
-    // simulated payment. A simulator whose double-charge behaviour is weaker than production's is
-    // precisely the divergence that makes a green "a double-click cannot charge twice" test a lie.
-    const idempotencyKey = params.idempotencyKey ?? randomUUID();
 
     const body: Record<string, unknown> = {
       phone: params.phone ? normalizePhone(params.phone) : DEFAULT_SIM_PHONE,
@@ -365,8 +371,10 @@ export class Simulator {
     params: SimulateCollectParams & { readonly outcome: SimOutcomeId },
     options: { signal?: AbortSignal } = {},
   ): Promise<SimulatedOutcome> {
-    const { outcome, ...collectParams } = params;
-    const created = await this.collect(collectParams, options);
+    // Rebuilt rather than spread-through: a rest element over a union widens the idempotency pair
+    // back into "both optional", which is precisely the shape the required key exists to forbid.
+    const { outcome, ...rest } = params;
+    const created = await this.collect(rest as SimulateCollectParams, options);
     return this.outcome(created.paymentId, outcome, options);
   }
 }

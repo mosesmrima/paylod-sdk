@@ -35,6 +35,7 @@ export {
   type SimOutcomeId,
   type SimOutcomeChoice,
   type SimulateCollectParams,
+  type SimulateCollectParamsBase,
   type SimulatedOutcome,
   type SimulatedPayment,
 } from "./simulate.js";
@@ -95,6 +96,8 @@ export {
 export type {
   CollectAck,
   CollectParams,
+  CollectParamsBase,
+  IdempotencyParams,
   Payment,
   PaymentStatus,
   PaylodOptions,

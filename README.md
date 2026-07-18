@@ -38,9 +38,10 @@ else              toast(outcome.message);    // already decoded, already human
 That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
 
 > [!WARNING]
-> **Pass `idempotencyKey`, and mint one per payment attempt.** Duplicates of that attempt — a
-> double-clicked Pay button, a refreshed tab, a redelivered job — collapse into **one** prompt and
-> **one** charge. Omit it and every call is a new charge: two clicks, two prompts, two debits.
+> **`idempotencyKey` is REQUIRED, and you mint one per payment attempt.** Duplicates of that
+> attempt — a double-clicked Pay button, a refreshed tab, a redelivered job — collapse into **one**
+> prompt and **one** charge. Without it every call is a new charge: two clicks, two prompts, two
+> debits — which is why the SDK no longer generates one for you.
 >
 > Do **not** key on the order or the product: that replays an old payment instead of making a new
 > one. A retry after a wrong PIN is a new charge and needs a **new** key.
@@ -75,7 +76,7 @@ This SDK is not here to save you those lines. It's here for the five things that
 | The thing | What goes wrong with hand-rolled `fetch` | What you get here |
 |---|---|---|
 | **Async settlement** | `/collect` returns `202 pending`. The customer hasn't typed their PIN yet. People hand-roll a `while (true)` poll, hammer the API every 200 ms, or never handle the case where the customer just walks away. | `collectAndWait()` — jittered backoff (1s → 5s), a deadline, and a distinct, loud `PaylodTimeoutError`. |
-| **Idempotency** | A retry (or a nervous double-click, or a Lambda re-invoke) without an `Idempotency-Key` sends a **second STK push**. The customer pays twice. Most people forget the header entirely. | A key is sent on **every** `collect()` and reused across internal retries. Pass one per payment attempt and duplicates of that attempt — double-click, refresh, redelivered job — collapse into one charge and one prompt. |
+| **Idempotency** | A retry (or a nervous double-click, or a Lambda re-invoke) without an `Idempotency-Key` sends a **second STK push**. The customer pays twice. Most people forget the header entirely. | `idempotencyKey` is **required** — the compiler will not let you forget it. Pass one per payment attempt and duplicates of that attempt — double-click, refresh, redelivered job — collapse into one charge and one prompt. |
 | **Webhook signatures** | HMAC over `${timestamp}.${rawBody}`, constant-time compare, timestamp tolerance, and the raw body must survive your JSON middleware. Every one of those is easy to get subtly, silently wrong — and getting it wrong means anyone can forge a "payment succeeded". | `paylod.webhook(handler)` — verified, typed, and it shouts at you if your body parser ate the raw bytes. |
 | **Error decoding** | You end up writing `switch (resultCode) { case 1032: ... case 2001: ... }` from a forum post, with wrong text. (`2001` is a *wrong PIN* — it is **not** a credentials error, despite what the raw `ResultDesc` implies.) | `outcome.message` — already decoded, from the same catalog the API uses. Render it directly. |
 | **Phone formats** | Customers give you `0712…`, `+254712…`, `254712…`, `0712 345 678`. Daraja accepts exactly one of those. | Normalised locally, before the request leaves your process. |
@@ -167,8 +168,8 @@ const ack = await paylod.collect({
   idempotencyKey: attempt.id,     // PASS THIS. One key per payment ATTEMPT — not the order, and
                                   //   never the product. Duplicates of that attempt collapse into
                                   //   one payment and one prompt. A retry after a wrong PIN is a
-                                  //   NEW attempt and needs a NEW key. Omit it and the SDK warns,
-                                  //   because every call then becomes a new charge.
+                                  //   NEW attempt and needs a NEW key. REQUIRED — omitting it is
+                                  //   a compile error and a runtime throw.
   accountReference: "order-42",   // optional, ≤ 12 chars — your correlation id, returned as
                                   //   `accountRef`. Shown to the payer only on a Paybill
                                   //   (it is the account number); a Till never displays it.
@@ -210,7 +211,7 @@ Poll an existing payment until it settles.
 
 ```ts
 const outcome = await paylod.collectAndWait(
-  { amount: 100, phone: "0712345678" },
+  { amount: 100, phone: "0712345678", idempotencyKey: attempt.id },
   {
     timeoutMs: 120_000,                    // default; STK prompts expire around 60s
     onPoll: (p) => console.log(p.status),  // called on each pending snapshot
@@ -276,7 +277,9 @@ if (outcome.paid) await fulfilOrder(outcome.receipt);
 
 ```ts
 try {
-  const outcome = await paylod.collectAndWait({ amount: 100, phone: "0712345678" });
+  const outcome = await paylod.collectAndWait({
+    amount: 100, phone: "0712345678", idempotencyKey: attempt.id,
+  });
   // ...
 } catch (err) {
   if (err instanceof PaylodTimeoutError) {
@@ -320,7 +323,7 @@ Your failure paths are where payment bugs live, and testing them used to mean fi
 ```ts
 const paylod = new Paylod(process.env.PAYLOD_TEST_KEY!);   // mp_test_… key
 
-const outcome = await paylod.simulate.pay({ outcome: "wrong_pin" });
+const outcome = await paylod.simulate.pay({ outcome: "wrong_pin", idempotencyKey: "t-1" });
 
 outcome.status;     // "failed"
 outcome.message;    // "That M-Pesa PIN was incorrect. Please try again and enter the right PIN."
@@ -344,7 +347,7 @@ That is an ordinary `PaymentOutcome` — the identical object `check()` and `wai
 Split it in two and put your handler in the middle. The payment id is a real one, so your poller, webhook route and UI all run unchanged:
 
 ```ts
-const sim = await paylod.simulate.collect({ amount: 250 });
+const sim = await paylod.simulate.collect({ amount: 250, idempotencyKey: "t-1" });
 await paylod.simulate.outcome(sim.paymentId, "insufficient_funds");
 
 const view = await readCheckout(sim.paymentId);   // ← your code, verbatim
@@ -517,31 +520,49 @@ A timeout is not evidence that the money did not move; it is the absence of evid
 
 All four are `PaylodApiError` with `.isIdempotencyConflict === true`; the three getters above tell you *which* `409` you have, and only one of them is your bug.
 
-### What happens if you omit it
+### You cannot omit it
 
-The SDK generates a fresh UUID per call and returns it on the ack:
+`idempotencyKey` is **required** — since 0.10.0, omitting it is a TypeScript compile error and a runtime `PaylodInvalidRequestError`, thrown before a single byte leaves the process:
 
 ```ts
-const ack = await paylod.collect({ amount: 100, phone: "0712345678" });
-ack.idempotencyKey; // persist it on the attempt — retrying THAT attempt with THAT key collapses
-                    // into the original payment. A genuinely new attempt needs a new key.
+await paylod.collect({ amount: 100, phone: "0712345678" });
+// PaylodInvalidRequestError: collect() requires an `idempotencyKey`. …
 ```
 
-That protects an internal *network* retry of that one call. It does **nothing** about your application sending the same logical charge twice:
+Earlier versions generated a key for you and warned once per process. That was the wrong default. A key minted **inside** the call is a different value on every call, so it collapses nothing — and the party that knows a retry is a retry is you, not the SDK:
 
-| What the user does | With a per-attempt key | Without |
+| What the user does | With a per-attempt key | With a key the SDK generates per call |
 | --- | --- | --- |
 | Double-clicks **Pay** | 1 prompt, 1 charge | **2 prompts, 2 charges** |
 | Refreshes the tab and re-submits | 1 prompt, 1 charge | **2 prompts, 2 charges** |
 | Your job queue retries the handler | 1 prompt, 1 charge | **2 prompts, 2 charges** |
 
-A double-clicked button is by far the most common way a real customer gets double-charged, so the SDK emits a one-time `console.warn` when you call `collect()` / `collectAndWait()` without a key. The only way to silence it is to pass a real one.
+### Migrating from 0.9.x
+
+Every `collect()`, `collectAndWait()`, `simulate.collect()` and `simulate.pay()` call site needs a key. The compiler finds all of them for you — run `tsc` and fix what it flags.
+
+```diff
+- const ack = await paylod.collect({ amount, phone });
++ const attempt = await db.attempts.create({ orderId: order.id });
++ const ack = await paylod.collect({ amount, phone, idempotencyKey: attempt.id });
+```
+
+If you have no natural per-attempt id yet, mint one where the attempt *begins* — the request handler, the job payload, the button press — and persist it. It has to outlive the call, which is the one thing a key generated inside the call can never do.
+
+In tests, any stable literal works: `idempotencyKey: "t-1"`.
+
+### The escape hatch
+
+If you genuinely want an unprotected charge — a scratch script, never production — say so in the call:
+
+```ts
+await paylod.collect({ amount, phone, unsafeGeneratedIdempotencyKey: true });
+```
+
+The SDK mints a throwaway key and **warns on every single call**, not once per process. That is deliberate: a worker firing a thousand unprotected charges in a loop is exactly the case a once-per-process warning hid, and each of those thousand is a separate chance to charge a customer twice. The warning goes to `console.warn` rather than `process.emitWarning` so that `--no-warnings` cannot silence it.
 
 > [!WARNING]
-> Do **not** silence the warning with `idempotencyKey: crypto.randomUUID()` or `Date.now()` **at
-> the call site**. A key that changes on every call is exactly equivalent to having no key at all
-> — it just hides the warning telling you the customer is exposed. A random UUID is a perfectly
-> good key; it just has to be minted **once per attempt** and stored, not generated inside the call.
+> `idempotencyKey: crypto.randomUUID()` **at the call site** is the same bug wearing a disguise — it satisfies the type and the runtime check while providing exactly zero protection. A random UUID is a perfectly good key; it just has to be minted **once per attempt** and stored, not generated inside the call.
 
 ---
 
@@ -554,7 +575,7 @@ import {
 } from "@paylod/node";
 
 try {
-  const outcome = await paylod.collectAndWait({ amount, phone });
+  const outcome = await paylod.collectAndWait({ amount, phone, idempotencyKey: attempt.id });
 
   // No branching over result codes. The outcome is already renderable.
   return {
@@ -606,7 +627,7 @@ const paylod = new Paylod({ apiKey: "mp_test_x", fetch: myMockFetch });
 ```ts
 // 0.1 — you branched, then reached into a decoded error to find a string to show
 const paylod = new Paylod({ apiKey: process.env.PAYLOD_API_KEY });
-const result = await paylod.collectAndWait({ amount, phone });
+const result = await paylod.collectAndWait({ amount, phone, idempotencyKey: attempt.id });
 if (result.ok) fulfil(result.receipt);
 else {
   toast(result.error.customerMessage);
@@ -615,7 +636,7 @@ else {
 
 // 0.2 — the outcome is already renderable
 const paylod = new Paylod(process.env.PAYLOD_API_KEY!);
-const outcome = await paylod.collectAndWait({ amount, phone });
+const outcome = await paylod.collectAndWait({ amount, phone, idempotencyKey: attempt.id });
 if (outcome.paid) fulfil(outcome.receipt);
 else toast(outcome.message);
 if (outcome.retryable) showRetry();
