@@ -82,32 +82,54 @@ const SETTLED: Record<SimOutcomeId, Record<string, unknown>> = {
 };
 
 describe("simulate — the live-key fence", () => {
-  it("refuses a mp_live_ key on simulate.collect(), before any request is sent", async () => {
-    const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(LIVE_KEY, { fetch: m.fetch, maxRetries: 0 });
+  // A live key can no longer be paired with an injected `fetch` at all — that is the ROOT-1 gate,
+  // and it means these tests exercise the fence against the SDK's own transport, which is a
+  // stronger claim than the old ones made. `globalThis.fetch` is spied on instead, so "no request
+  // was sent" is asserted about the real dispatch path rather than about a stub.
+  function watchGlobalFetch() {
+    const spy = vi.fn(async () => new Response("{}", { status: 200 }));
+    const original = globalThis.fetch;
+    globalThis.fetch = spy as unknown as typeof globalThis.fetch;
+    return { spy, restore: () => { globalThis.fetch = original; } };
+  }
 
-    await expect(paylod.simulate.collect()).rejects.toThrow(PaylodSandboxOnlyError);
-    // The whole point: it never even tried.
-    expect(m.calls.length).toBe(0);
+  it("refuses a mp_live_ key on simulate.collect(), before any request is sent", async () => {
+    const { spy, restore } = watchGlobalFetch();
+    try {
+      const paylod = new Paylod(LIVE_KEY, { maxRetries: 0 });
+      await expect(paylod.simulate.collect()).rejects.toThrow(PaylodSandboxOnlyError);
+      // The whole point: it never even tried.
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
   });
 
   it("refuses a mp_live_ key on simulate.outcome() and simulate.pay(), with no request sent", async () => {
-    const m = mockFetch([{ status: 200, json: SETTLED.approve }]);
-    const paylod = new Paylod(LIVE_KEY, { fetch: m.fetch, maxRetries: 0 });
-
-    await expect(paylod.simulate.outcome("pay_1", "approve")).rejects.toThrow(
-      PaylodSandboxOnlyError,
-    );
-    await expect(paylod.simulate.pay({ outcome: "approve" })).rejects.toThrow(
-      PaylodSandboxOnlyError,
-    );
-    expect(m.calls.length).toBe(0);
+    const { spy, restore } = watchGlobalFetch();
+    try {
+      const paylod = new Paylod(LIVE_KEY, { maxRetries: 0 });
+      await expect(paylod.simulate.outcome("pay_1", "approve")).rejects.toThrow(
+        PaylodSandboxOnlyError,
+      );
+      await expect(paylod.simulate.pay({ outcome: "approve" })).rejects.toThrow(
+        PaylodSandboxOnlyError,
+      );
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
   });
 
   it("says WHY, and does not imply the key is broken", async () => {
-    const paylod = new Paylod(LIVE_KEY, { fetch: mockFetch([]).fetch });
-    await expect(paylod.simulate.collect()).rejects.toThrow(/production \(mp_live_\) key/i);
-    await expect(paylod.simulate.collect()).rejects.toThrow(/mp_test_ key/i);
+    const { restore } = watchGlobalFetch();
+    try {
+      const paylod = new Paylod(LIVE_KEY, {});
+      await expect(paylod.simulate.collect()).rejects.toThrow(/production \(mp_live_\) key/i);
+      await expect(paylod.simulate.collect()).rejects.toThrow(/mp_test_ key/i);
+    } finally {
+      restore();
+    }
   });
 
   it("refuses to CONSTRUCT a simulate-mode client with a live key", () => {
@@ -124,7 +146,7 @@ describe("simulate — the live-key fence", () => {
 describe("simulate.collect", () => {
   it("POSTs /simulate/collect with a normalised phone and returns a real pending payment", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     const sim = await paylod.simulate.collect({ phone: "0712345678", amount: 250, accountReference: "order-1" });
 
@@ -139,7 +161,7 @@ describe("simulate.collect", () => {
 
   it("needs no arguments at all — no phone, no amount", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     await paylod.simulate.collect();
     expect(m.calls[0]!.body).toEqual({ phone: "254708374149", amount: 1 });
@@ -147,7 +169,7 @@ describe("simulate.collect", () => {
 
   it("rejects a nonsense amount locally", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     await expect(paylod.simulate.collect({ amount: 1.5 })).rejects.toThrow(
       PaylodInvalidRequestError,
@@ -159,7 +181,7 @@ describe("simulate.collect", () => {
 describe("simulate.outcome — the same PaymentOutcome the rest of the SDK returns", () => {
   const drive = async (outcome: SimOutcomeId) => {
     const m = mockFetch([{ status: 200, json: SETTLED[outcome] }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const result = await paylod.simulate.outcome("pay_sim_1", outcome);
     return { result, m };
   };
@@ -217,7 +239,7 @@ describe("simulate.outcome — the same PaymentOutcome the rest of the SDK retur
   });
 
   it("requires a paymentId", async () => {
-    const paylod = new Paylod(TEST_KEY, { fetch: mockFetch([]).fetch });
+    const paylod = new Paylod(TEST_KEY, { fetch: mockFetch([]).fetch, allowCustomFetch: true });
     await expect(paylod.simulate.outcome("", "approve")).rejects.toThrow(PaylodInvalidRequestError);
   });
 });
@@ -228,7 +250,7 @@ describe("simulate.pay — collect + outcome in one call", () => {
       { status: 202, json: SIM_ACK },
       { status: 200, json: SETTLED.user_cancelled },
     ]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     const result = await paylod.simulate.pay({ amount: 99, outcome: "user_cancelled" });
 
@@ -245,7 +267,7 @@ describe("simulate.pay — collect + outcome in one call", () => {
 describe("simulate mode — the integrator's OWN collect() path, unchanged", () => {
   it("collect() creates a simulated payment instead of ringing a phone", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
 
     // This is the caller's production code, verbatim.
     const ack = await paylod.collect({
@@ -268,7 +290,7 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
   // the header goes out, and the backend replays the first payment.
   it("simulate mode SENDS the Idempotency-Key header (it used to be dropped)", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
     await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
     expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-1042");
   });
@@ -279,7 +301,7 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
       { status: 202, json: SIM_ACK },
       { status: 202, json: SIM_ACK },
     ]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
 
     const a = await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
     const b = await paylod.collect({ amount: 250, phone: "0712345678", idempotencyKey: "order-1042" });
@@ -298,7 +320,7 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
   // These two fail against 0.3.0, which forwarded only { phone, amount, accountReference, key }.
   it("simulate mode forwards the FULL body — `description` and `metadata` included", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
 
     await paylod.collect({
       amount: 250,
@@ -321,7 +343,7 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
       { status: 202, json: SIM_ACK },
       { status: 409, json: { error: "Idempotency-Key was reused with a different request body" } },
     ]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
 
     const base = { amount: 250, phone: "0712345678", idempotencyKey: "attempt-1" } as const;
     await paylod.collect({ ...base, metadata: { attemptId: "a1" } });
@@ -343,14 +365,14 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
 
   it("simulate.collect() forwards an explicit idempotencyKey", async () => {
     const m = mockFetch([{ status: 202, json: SIM_ACK }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     await paylod.simulate.collect({ amount: 5, idempotencyKey: "order-7" });
     expect(m.calls[0]!.headers["idempotency-key"]).toBe("order-7");
   });
 
   it("without `simulate`, collect() still goes to the real /collect", async () => {
     const m = mockFetch([{ status: 202, json: { paymentId: "p", status: "pending", checkoutRequestId: "c" } }]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     await paylod.collect({ amount: 1, phone: "0712345678", idempotencyKey: "k" });
     expect(m.calls[0]!.url.endsWith("/functions/v1/collect")).toBe(true);
   });
@@ -363,7 +385,7 @@ describe("simulate mode — the integrator's OWN collect() path, unchanged", () 
         json: { id: "pay_sim_1", status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0, resultDesc: "ok" },
       },
     ]);
-    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, maxRetries: 0, simulate: true });
+    const paylod = new Paylod(TEST_KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, simulate: true });
 
     const outcome = await paylod.collectAndWait({
       amount: 1,
@@ -386,7 +408,7 @@ describe("SIM_OUTCOMES", () => {
       "user_cancelled",
       "timeout",
     ]);
-    const paylod = new Paylod(TEST_KEY, { fetch: vi.fn() as never });
+    const paylod = new Paylod(TEST_KEY, { fetch: vi.fn() as never, allowCustomFetch: true });
     expect([...paylod.simulate.outcomes]).toEqual([...SIM_OUTCOMES]);
   });
 });

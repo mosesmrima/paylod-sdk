@@ -157,8 +157,30 @@ export interface PaylodOptions {
   readonly timeoutMs?: number;
   /** Retries for *idempotent/transient* failures (network, 5xx, 429). Default 2. */
   readonly maxRetries?: number;
-  /** Inject a fetch implementation (tests, proxies, instrumentation). */
+  /**
+   * **Test-only.** Inject a fetch implementation (a mock server, a recorded fixture).
+   *
+   * Requires {@link allowCustomFetch} to be `true`, and is refused unconditionally with a live
+   * (`mp_live_`) key — the same posture as {@link allowInsecureBaseUrl}.
+   *
+   * The reason it is gated: a custom fetch receives your API key, a bearer credential, on every
+   * request. It can ignore the `redirect: "manual"` this SDK sets, follow a cross-origin redirect
+   * itself, and hand back an ordinary `200` — by which point the key has already been replayed to
+   * another host, and inspecting the final response cannot undo that. Origin pinning and redirect
+   * refusal still run inside the SDK's transport even through this seam, but the only real
+   * protection for a production key is that it can never reach caller code at all.
+   *
+   * This is NOT an extension point for proxies, retries or instrumentation. Use `timeoutMs` /
+   * `maxRetries`, or configure an agent on the runtime.
+   */
   readonly fetch?: typeof globalThis.fetch;
+  /**
+   * **Test-only.** Required alongside {@link fetch}. Refused with an `mp_live_` key.
+   *
+   * Deliberately explicit: routing a bearer credential through caller-supplied code is a decision
+   * that should appear in the diff, not something that happens because an option was set.
+   */
+  readonly allowCustomFetch?: boolean;
   /**
    * **Simulator mode — for tests.** `collect()` and `collectAndWait()` create a *simulated*
    * payment instead of ringing a phone. Nothing else changes: a real sandbox payment row, real

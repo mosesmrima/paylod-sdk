@@ -3,6 +3,7 @@ import {
   PaylodApiError,
   PaylodConfigError,
   PaylodConnectionError,
+  PaylodError,
   PaylodInvalidRequestError,
   PaylodTimeoutError,
 } from "./errors.js";
@@ -13,12 +14,13 @@ import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
 import { assertSandboxKey, Simulator } from "./simulate.js";
 import {
-  assertCollectAckShape,
-  assertPaymentShape,
+  assertCollectAck,
+  assertPaymentBody,
   assertValidIdempotencyKey,
   assertWholeNonNegative,
   assertWholePositiveMs,
 } from "./validate.js";
+import { assertSecureBaseUrl, monotonicNowMs, Transport } from "./transport.js";
 import type {
   CollectAck,
   CollectParams,
@@ -117,7 +119,7 @@ interface RequestOptions {
   readonly idempotencyKey?: string;
   readonly signal?: AbortSignal;
   /**
-   * Absolute deadline (`Date.now()` ms) for the WHOLE operation. Each in-flight request is capped
+   * Absolute deadline on the MONOTONIC clock ({@link monotonicNowMs}) for the WHOLE operation. Each in-flight request is capped
    * to the remaining time, and every backoff / `Retry-After` sleep is clamped to it — so a
    * `wait()` cannot overrun its `timeoutMs` by a full request timeout per poll.
    */
@@ -135,7 +137,11 @@ interface RequestOptions {
  */
 const IN_PROGRESS_409_RE = /already in progress/i;
 
-/** The wall clock, in one place. (`Date` is what the fake-timer test harness controls.) */
+/**
+ * The WALL clock. Used only where a wall-clock reading is the correct one: comparing against an
+ * HTTP-date `Retry-After`, which is an absolute civil time the server named. Operation deadlines
+ * use {@link monotonicNowMs} instead — see `#remaining`.
+ */
 function nowMs(): number {
   return Date.now();
 }
@@ -183,166 +189,54 @@ export function parseRetryAfterMs(raw: string | null | undefined, now: number = 
 }
 
 /**
- * If the SDK generated the idempotency key (or even if the caller supplied it), a failed collect
- * MUST hand the effective key back on the error so the caller can retry with the SAME key rather
- * than mint a fresh one and double-charge. Best-effort: never clobber a key an error already set.
+ * Guarantee that whatever escapes a money-moving call CARRIES THE EFFECTIVE IDEMPOTENCY KEY.
+ *
+ * This is the single most important field on a failed charge: it is what lets a caller retry the
+ * SAME attempt instead of minting a fresh key and double-charging. So "best effort" is not good
+ * enough, and best effort is exactly what the previous version was — it MUTATED the thrown value
+ * in place and gave up silently in two cases that both drop the key on the floor:
+ *
+ *   • A PRIMITIVE. `throw "boom"` / `throw undefined` is legal JavaScript, and a caller-supplied
+ *     `fetch`, an interceptor or an instrumentation wrapper can throw one. `typeof err === "object"`
+ *     was false, so nothing was attached and nothing was reported — the key vanished.
+ *   • A FROZEN or read-only error. The assignment threw, the `catch {}` swallowed it, and the
+ *     caller received an error that silently lacked the one field they needed.
+ *
+ * Mutating a value we do not own is also wrong on its own terms: the error may be shared, may be
+ * a frozen singleton, and may already be observed elsewhere. So instead of mutating, we NORMALISE
+ * — every failure leaves this SDK as a `PaylodError` subclass that is guaranteed to carry the key.
+ *
+ * An error that already carries the key (the common case: `PaylodApiError` built with it) is
+ * returned untouched, so nothing is re-wrapped needlessly and `instanceof` checks keep working.
  */
-function attachIdempotencyKey(err: unknown, key: string): void {
-  if (
-    err &&
-    typeof err === "object" &&
-    (err as { idempotencyKey?: unknown }).idempotencyKey === undefined
-  ) {
+function withIdempotencyKey(err: unknown, key: string, redact: (s: string) => string): unknown {
+  // Already correct — the overwhelmingly common path. Never clobber a key an error already set.
+  if (err instanceof PaylodError && err.idempotencyKey !== undefined) return err;
+
+  if (err instanceof PaylodError) {
+    // One of ours, but raised before the key was known. Try the cheap in-place assignment; if the
+    // object is frozen, fall through to wrapping rather than silently losing the key.
     try {
-      (err as { idempotencyKey?: string }).idempotencyKey = key;
+      err.idempotencyKey = key;
+      if (err.idempotencyKey === key) return err;
     } catch {
-      /* frozen error object — nothing more we can do */
+      /* frozen — wrap below */
     }
   }
-}
 
-/**
- * The ONE origin a paylod key may ever be sent to.
- *
- * HTTPS alone is NOT enough. `https://` proves only that the transport is encrypted — it says
- * nothing about WHO is on the other end, so any `https://evil.example` baseUrl (from a bad env
- * var, a typo, a poisoned config, a copy-pasted "staging" URL) would happily receive a live
- * bearer key over a perfectly valid TLS connection. An allowlist is what makes the key
- * un-exfiltratable by configuration.
- */
-const ALLOWED_HOSTS = new Set(["paylod.dev", "api.paylod.dev"]);
-
-/** Ports we accept on the canonical origin. Anything else is a redirect to somebody's listener. */
-const ALLOWED_PORTS = new Set(["", "443"]);
-
-/** RFC1918 / link-local / CGNAT / loopback literals — never a legitimate paylod origin. */
-function isPrivateOrLoopbackHost(host: string): boolean {
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
-  if (host === "::1" || host === "[::1]") return true;
-  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10), in bracketed or bare form.
-  const bare = host.replace(/^\[|\]$/g, "");
-  if (/^f[cd][0-9a-f]{2}:/i.test(bare) || /^fe[89ab][0-9a-f]:/i.test(bare)) return true;
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(bare);
-  if (!v4) return false;
-  const [a, b] = [Number(v4[1]), Number(v4[2])];
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 169 && b === 254) return true; // link-local / cloud metadata (169.254.169.254)
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return true; // any other bare IPv4 literal: the canonical origin is a NAME, never an IP
-}
-
-/**
- * Render a base URL for an ERROR MESSAGE with any userinfo stripped.
- *
- * `https://user:hunter2@host/` carries a live credential in the URL itself, and the very error
- * that rejects it used to echo the whole string back — into the exception message, the stack that
- * gets logged, and whatever error tracker receives it. The check that exists to stop a credential
- * leaking must not be the thing that leaks it, so the userinfo is replaced before interpolation.
- */
-function safeUrl(raw: string): string {
-  try {
-    const u = new URL(raw);
-    if (u.username === "" && u.password === "") return raw;
-    u.username = "";
-    u.password = "";
-    return u.toString().replace("://", "://[redacted]@");
-  } catch {
-    // Unparseable: never echo a string we cannot reason about.
-    return "[unparseable url]";
-  }
-}
-
-/**
- * Enforce that `baseUrl` is the canonical paylod origin.
- *
- * Checks, in order: parseable; no embedded credentials (`https://user:pass@host` — userinfo is
- * both a credential leak and a classic host-confusion trick); a real host; no query or fragment
- * (a baseUrl is a prefix, and a trailing `?x=` silently corrupts every path built on it); an
- * allowlisted host on an expected port; and no private/loopback address.
- *
- * The single exception is the explicit, test-only loopback opt-in — which remains forbidden with
- * a live (`mp_live_`) key, so a production credential can never reach a local listener either.
- */
-function assertSecureBaseUrl(baseUrl: string, apiKey: string, allowInsecure: boolean): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    throw new PaylodConfigError(`baseUrl is not a valid URL: "${safeUrl(baseUrl)}".`);
-  }
-
-  const isLive = apiKey.startsWith("mp_live_");
-  const host = parsed.hostname.toLowerCase();
-
-  if (parsed.username !== "" || parsed.password !== "") {
-    throw new PaylodConfigError(
-      `baseUrl must not embed credentials (got "${safeUrl(baseUrl)}"). A "user:pass@host" URL leaks those ` +
-        `credentials into logs and is a standard host-confusion trick.`,
-    );
-  }
-  if (host === "") {
-    throw new PaylodConfigError(`baseUrl has no host: "${safeUrl(baseUrl)}".`);
-  }
-  if (parsed.search !== "" || parsed.hash !== "") {
-    throw new PaylodConfigError(
-      `baseUrl must not carry a query string or fragment (got "${safeUrl(baseUrl)}"). It is a path prefix; ` +
-        `a trailing "?..." would corrupt every request path built from it.`,
-    );
-  }
-
-  // Test-only escape hatch: loopback — over http OR https — explicitly opted into, and NEVER with
-  // a live key. https loopback needs the same opt-in as http: a local listener holding a valid
-  // certificate is still not paylod, so TLS alone must not buy it a pass.
-  const isLoopback =
-    host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
-  const loopbackOptIn = isLoopback && allowInsecure && !isLive;
-
-  // PROTOCOL IS CHECKED FIRST, BEFORE the loopback opt-in can return.
-  //
-  // It used to be checked after, and the loopback branch returned early — so the opt-in did not
-  // merely relax the *origin* rule, it waved through any scheme at all. `ftp://127.0.0.1/`,
-  // `ws://localhost/` and `gopher://[::1]/` were all accepted as base URLs, and the client would
-  // then hand a bearer key to whatever `fetch` made of them. The opt-in exists to permit a local
-  // HTTP mock, and that is the entire licence it carries: https everywhere, or http on loopback
-  // when explicitly opted into with a non-live key. Every other scheme is refused outright.
-  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopbackOptIn)) {
-    throw new PaylodConfigError(
-      `baseUrl must use https:// (got protocol "${parsed.protocol}" in "${safeUrl(baseUrl)}"). ` +
-        `Plaintext HTTP would transmit your API key in the clear, and any other scheme ` +
-        `(ftp, ws, gopher, file, data…) is not something this SDK will ever speak. Loopback HTTP ` +
-        `(localhost, 127.0.0.1, ::1) is allowed ONLY with { allowInsecureBaseUrl: true } and ` +
-        `NEVER with an mp_live_ key.`,
-    );
-  }
-
-  if (isLoopback) {
-    if (loopbackOptIn) return;
-    throw new PaylodConfigError(
-      `baseUrl points at loopback ("${safeUrl(baseUrl)}"). That is allowed ONLY with ` +
-        `{ allowInsecureBaseUrl: true }, and NEVER with an mp_live_ key — a production ` +
-        `credential must never be addressed to a local listener.`,
-    );
-  }
-
-  if (!ALLOWED_HOSTS.has(host)) {
-    throw new PaylodConfigError(
-      `baseUrl host "${host}" is not a paylod origin (got "${safeUrl(baseUrl)}"). Your API key is a bearer ` +
-        `credential: it is sent on every request, so it may only ever be addressed to ` +
-        `${[...ALLOWED_HOSTS].join(" or ")}. HTTPS alone does not make an arbitrary host safe.`,
-    );
-  }
-  if (!ALLOWED_PORTS.has(parsed.port)) {
-    throw new PaylodConfigError(
-      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${safeUrl(baseUrl)}").`,
-    );
-  }
-  if (isPrivateOrLoopbackHost(host)) {
-    throw new PaylodConfigError(
-      `baseUrl must not point at a private, loopback or link-local address (got "${safeUrl(baseUrl)}").`,
-    );
-  }
+  // Anything else: a foreign Error, a frozen error, or a thrown primitive. Wrap it in an SDK error
+  // that definitely carries the key. The state of the charge is unknown, so this is INDETERMINATE
+  // — the caller must read the payment with this key, never blind-retry with a new one.
+  // Redacted: a foreign error from a caller-supplied fetch can easily quote the request headers,
+  // and the bearer key with them.
+  const detail = redact(err instanceof Error ? err.message : String(err));
+  const wrapped = new PaylodConnectionError(
+    `The charge attempt failed and its state is INDETERMINATE (${detail}). Read the payment ` +
+      "with this error's idempotencyKey before starting any new attempt; do NOT mint a fresh " +
+      "key, which risks charging the customer a second time.",
+  );
+  wrapped.idempotencyKey = key;
+  return wrapped;
 }
 
 /**
@@ -371,7 +265,11 @@ export class Paylod {
   readonly #webhookSecret: string | undefined;
   readonly #timeoutMs: number;
   readonly #maxRetries: number;
-  readonly #fetch: typeof globalThis.fetch;
+  /**
+   * The credentialed transport. NOT replaceable: the API key lives inside it, and this class
+   * hands it a method, a path and a body — never headers, never a URL, never the key.
+   */
+  readonly #transport: Transport;
   readonly #simulate: boolean;
 
   /**
@@ -441,13 +339,49 @@ export class Paylod {
         ? DEFAULT_MAX_RETRIES
         : assertWholeNonNegative(options.maxRetries, "maxRetries");
 
-    const f = options.fetch ?? globalThis.fetch;
-    if (typeof f !== "function") {
-      throw new PaylodConfigError(
-        "No global fetch available. Use Node 18+, or pass `new Paylod(key, { fetch })`.",
-      );
+    // ── The fetch seam: test-only, and never with a live key ──────────────────────────────
+    //
+    // An injected `fetch` receives the Authorization header on every request. It can ignore
+    // `redirect: "manual"`, follow a cross-origin 302 itself, and return an ordinary 2xx — at
+    // which point the bearer key has already been replayed to another host and no amount of
+    // inspecting the final response can undo it. So this seam is now gated exactly the way
+    // `allowInsecureBaseUrl` is: an explicit opt-in, refused outright for `mp_live_` keys.
+    //
+    // The gate is on the OPTION, not on its value: passing `fetch: undefined` explicitly is
+    // indistinguishable from omitting it, and both mean "use the SDK's own transport".
+    if (options.fetch !== undefined) {
+      if (options.allowCustomFetch !== true) {
+        throw new PaylodConfigError(
+          "Passing `fetch` also requires `allowCustomFetch: true`. A custom fetch implementation " +
+            "receives your API key — a bearer credential — on every request, and can follow a " +
+            "cross-origin redirect that replays it to another host before this SDK ever sees the " +
+            "response. It exists for TESTS ONLY (a mock server, a recorded fixture), so it must " +
+            "be opted into deliberately: `new Paylod(key, { fetch, allowCustomFetch: true })`. " +
+            "It is refused entirely for mp_live_ keys. If you are trying to add a proxy, a " +
+            "timeout or instrumentation, use `timeoutMs`/`maxRetries` or an agent configured on " +
+            "the runtime instead — do not route a live credential through your own code.",
+        );
+      }
+      if (this.#apiKey.startsWith("mp_live_")) {
+        throw new PaylodConfigError(
+          "`fetch` may never be used with an mp_live_ key, with or without `allowCustomFetch`. " +
+            "Your production API key can move money, and a caller-supplied fetch receives it on " +
+            "every request. Use an mp_test_ key for tests that need to stub the transport.",
+        );
+      }
+      if (typeof options.fetch !== "function") {
+        throw new PaylodConfigError("`fetch` must be a function.");
+      }
     }
-    this.#fetch = f;
+
+    // The transport OWNS the credential from here on. Origin pinning and redirect refusal live
+    // inside it and run on every dispatch, including through the test seam.
+    this.#transport = new Transport({
+      apiKey: this.#apiKey,
+      baseUrl: this.#baseUrl,
+      redact: (s) => this.#redact(s),
+      testFetch: options.fetch,
+    });
 
     // Simulator mode is a TEST posture, so it is fenced off from production at CONSTRUCTION time.
     // A client that could simulate with a live key must never come into existence — failing here
@@ -469,6 +403,9 @@ export class Paylod {
         // cannot double-charge" test would pass while proving the opposite.
         ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
+        // The simulator's validators run INSIDE the request, so they see the real HTTP status and
+        // run on exactly the same path production's do.
+        ...(opts.validate ? { validate: opts.validate } : {}),
       }),
     );
   }
@@ -494,7 +431,18 @@ export class Paylod {
    * in the structure — keys included, since a secret can appear as an object key too.
    */
   #redactDeep(value: unknown, depth = 0): unknown {
-    if (depth > 8) return value; // pathological nesting — stop rather than blow the stack
+    // DEPTH LIMIT: too deep to walk means REDACT WHOLESALE, never pass through.
+    //
+    // This used to `return value` unchanged past depth 8, which inverted the guarantee at exactly
+    // the point it mattered: a body nested deeply enough — trivially arranged by anything
+    // upstream that echoes a request, and trivially reached by a proxy's error envelope wrapping
+    // the original payload a few layers down — carried the bearer key through the redactor
+    // untouched and into `PaylodApiError.body`, which is the field people log wholesale. The
+    // guard against blowing the stack became a hole that leaks the credential.
+    //
+    // The safe answer at the limit is to drop the subtree, not to emit it. Anything past the
+    // limit is diagnostic detail of vanishing value; the key is not.
+    if (depth > 8) return "[redacted: structure too deeply nested to scan]";
     if (typeof value === "string") return this.#redact(value);
     if (Array.isArray(value)) return value.map((v) => this.#redactDeep(v, depth + 1));
     if (value !== null && typeof value === "object") {
@@ -507,9 +455,17 @@ export class Paylod {
     return value;
   }
 
-  /** Remaining time to the deadline, or `undefined` when there is no deadline. */
+  /**
+   * Remaining time to the deadline, or `undefined` when there is no deadline.
+   *
+   * Measured on the MONOTONIC clock. Deadlines used to be wall-clock (`Date.now()`), which an NTP
+   * correction, a DST jump, a VM resuming from suspend or an operator setting the clock can move
+   * arbitrarily: a backwards step makes a deadline recede so `wait()` polls a payment far past
+   * the timeout the caller asked for, and a forwards step expires a live charge early and reports
+   * it as timed out. Neither is acceptable around money.
+   */
   #remaining(deadlineMs: number | undefined): number | undefined {
-    return deadlineMs === undefined ? undefined : deadlineMs - nowMs();
+    return deadlineMs === undefined ? undefined : deadlineMs - monotonicNowMs();
   }
 
   /**
@@ -547,57 +503,43 @@ export class Paylod {
         perRequestTimeout = Math.min(perRequestTimeout, remaining);
       }
 
-      const timer = new AbortController();
-      const to = setTimeout(() => timer.abort(), perRequestTimeout);
-      const onOuterAbort = () => timer.abort();
-      opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
-
-      let res: Response;
+      // THE DISPATCH. Method, path and body — no headers, no URL, no credential. The transport
+      // adds the Authorization header from its own private field, pins the origin, refuses
+      // redirects, and reads the body inside the timeout window. None of that is skippable here.
+      let res: Awaited<ReturnType<Transport["send"]>>;
       try {
-        const headers: Record<string, string> = {
-          authorization: `Bearer ${this.#apiKey}`,
-          accept: "application/json",
-        };
-        if (opts.body !== undefined) headers["content-type"] = "application/json";
-        // Sent on every mutating call — this is what makes a retry safe.
-        if (opts.idempotencyKey) headers["idempotency-key"] = opts.idempotencyKey;
-
-        res = await this.#fetch(url, {
+        res = await this.#transport.send({
           method: opts.method,
-          headers,
-          body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-          signal: timer.signal,
-          // Never auto-follow a redirect: a cross-origin 3xx would replay the Authorization header
-          // to another host. We inspect and refuse it ourselves instead.
-          redirect: "manual",
+          path: opts.path,
+          ...(opts.body !== undefined ? { body: opts.body } : {}),
+          ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+          timeoutMs: perRequestTimeout,
+          ...(opts.signal ? { signal: opts.signal } : {}),
         });
       } catch (e) {
+        // A redirect / origin refusal is a security decision, not a network blip. Retrying it
+        // would just re-send the credential at the same wrong place.
+        if (e instanceof PaylodConnectionError && /redirect|pinned paylod origin/i.test(e.message)) {
+          throw e;
+        }
         lastError = new PaylodConnectionError(
           this.#redact(
             `Could not reach paylod at ${url}: ${e instanceof Error ? e.message : String(e)}`,
           ),
-          { cause: e },
+          // NOTE: the original exception is deliberately NOT attached as `cause`.
+          //
+          // The message above is redacted; the cause was not, and `cause` is walked by every
+          // error reporter, logger and `util.inspect` in existence. A lower-level fetch/undici
+          // exception routinely carries the request it failed on — headers included — so
+          // attaching it re-exposed the very bearer key the redaction just removed, one property
+          // deeper. A sanitised error that drags its unsanitised source along is not sanitised.
+          // The redacted message retains the diagnostic content that is safe to keep.
         );
         if (opts.signal?.aborted) throw lastError;
         continue; // network blip → retry
-      } finally {
-        clearTimeout(to);
-        opts.signal?.removeEventListener("abort", onOuterAbort);
       }
 
-      // A redirect is never expected from the API. Refuse it rather than follow it to a host that
-      // would receive the bearer token. Not retryable — a redirect loop is not a transient blip.
-      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
-        throw new PaylodConnectionError(
-          this.#redact(
-            `paylod returned an unexpected redirect (HTTP ${res.status || "opaque"}) from ${url}. ` +
-              `Refusing to follow it — a cross-origin redirect could leak your Authorization header ` +
-              `to another host.`,
-          ),
-        );
-      }
-
-      const text = await res.text().catch(() => "");
+      const text = res.text;
       let parsed: unknown;
       try {
         parsed = text ? JSON.parse(text) : null;
@@ -636,7 +578,7 @@ export class Paylod {
       // Honour Retry-After, in either RFC 9110 form. The ONLY bounds applied are the operation
       // deadline and, when there is none, the unbounded-sleep ceiling — both inside #boundedSleep.
       // If the header is absent, the top-of-loop backoff covers the wait.
-      const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+      const retryAfterMs = parseRetryAfterMs(res.retryAfter);
       if (retryAfterMs !== undefined && retryAfterMs > 0) {
         await this.#boundedSleep(retryAfterMs, opts.deadlineMs, opts.signal);
       }
@@ -780,14 +722,18 @@ export class Paylod {
         // A 2xx we cannot fully read is INDETERMINATE: the charge may have moved. The check is on
         // the COMPLETE ack — paymentId, checkoutRequestId and status — because a partial check is
         // a partial guarantee, and it is the shared validator the simulator runs too.
-        validate: (parsed, status) => assertCollectAckShape(parsed, status, idempotencyKey),
+        validate: (parsed, status) =>
+          assertCollectAck(parsed, {
+            httpStatus: status,
+            idempotencyKey,
+            redactBody: (b) => this.#redactDeep(b),
+          }),
       });
       return { ...ack, idempotencyKey };
     } catch (err) {
       // Whatever went wrong (network, timeout, 5xx, malformed 2xx), the caller MUST be able to
       // recover the effective key and retry with the SAME one — a fresh key would double-charge.
-      attachIdempotencyKey(err, idempotencyKey);
-      throw err;
+      throw withIdempotencyKey(err, idempotencyKey, (m) => this.#redact(m));
     }
   }
 
@@ -806,7 +752,14 @@ export class Paylod {
       // rather than return a half-populated Payment that `toOutcome` would then classify. The
       // whole shape is checked, not just the id: a `status` field outside the known set is exactly
       // the case where guessing turns into fulfilling an unpaid order.
-      validate: (parsed, status) => assertPaymentShape(parsed, status),
+      // ID BINDING: the body must describe the payment we ASKED about. A response that answers
+      // a different question tells us nothing about this one, however well-formed it is.
+      validate: (parsed, status) =>
+        assertPaymentBody(parsed, {
+          httpStatus: status,
+          expectedId: paymentId,
+          redactBody: (b) => this.#redactDeep(b),
+        }),
     });
   }
 
@@ -840,7 +793,7 @@ export class Paylod {
       options.timeoutMs === undefined
         ? DEFAULT_WAIT_TIMEOUT_MS
         : assertWholePositiveMs(options.timeoutMs, "wait timeoutMs");
-    const startedAt = nowMs();
+    const startedAt = monotonicNowMs();
     const deadline = startedAt + timeoutMs;
 
     let last: Payment | undefined;
@@ -857,11 +810,11 @@ export class Paylod {
       options.onPoll?.(payment);
 
       const delay = pollDelay(attempt);
-      if (nowMs() + delay >= deadline) break;
+      if (monotonicNowMs() + delay >= deadline) break;
       await sleep(delay, options.signal);
     }
 
-    throw new PaylodTimeoutError(paymentId, last as Payment, nowMs() - startedAt);
+    throw new PaylodTimeoutError(paymentId, last as Payment, monotonicNowMs() - startedAt);
   }
 
   /**
@@ -905,8 +858,7 @@ export class Paylod {
       // catching that error has a charge that is very possibly LIVE and no key to read it with —
       // so the natural recovery is to mint a fresh key and call again, which is a second STK
       // prompt for a payment that may already be settling. The key must ride the error out.
-      attachIdempotencyKey(err, ack.idempotencyKey);
-      throw err;
+      throw withIdempotencyKey(err, ack.idempotencyKey, (m) => this.#redact(m));
     }
   }
 

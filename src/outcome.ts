@@ -28,11 +28,8 @@
  *    rather than folding a timeout into `status: "failed"`, because a customer staring at a
  *    live prompt may still pay, and a merchant who cancels that order loses real money.
  */
-import {
-  type DecodedError,
-  classifyStkResult,
-  decodeDarajaResult,
-} from "./daraja-catalog.js";
+import { type DecodedError, decodeDarajaResult } from "./daraja-catalog.js";
+import { judge } from "./semantics.js";
 import type { Payment } from "./types.js";
 
 /**
@@ -134,71 +131,21 @@ export function pendingOutcome(paymentId: string): PaymentOutcome {
  */
 export function toOutcome(payment: Payment): PaymentOutcome {
   const hasCode = payment.resultCode !== null && payment.resultCode !== undefined;
-  const detail = hasCode
-    ? decodeDarajaResult(payment.resultCode, payment.resultDesc)
-    : null;
+  const detail = hasCode ? decodeDarajaResult(payment.resultCode, payment.resultDesc) : null;
   const code = detail?.code ?? null;
-
-  // When M-Pesa has given us a code, the CLASSIFIER is authoritative and the raw `status` field
-  // must NOT override it. A row marked status:"success" that carries a pending code (4999) or a
-  // failure code (1032) must never be reported as paid. Before there is a code, the API's own
-  // status is all we have.
-  const classified = hasCode ? classifyStkResult(payment.resultCode, payment.resultDesc) : null;
-
   const base = { paymentId: payment.id, code, detail, payment } as const;
 
-  // A genuine contradiction between two TERMINAL signals — the raw status says success while the
-  // code classifies as a failure, or vice versa. Neither can be trusted, so the payment is
-  // INDETERMINATE: not paid, not safe to charge again. (A `pending` classification is NOT a
-  // contradiction — it just means "still in flight, keep polling".)
-  const contradictory =
-    classified !== null &&
-    ((classified === "success" && payment.status === "failed") ||
-      (classified === "failed" && payment.status === "success"));
+  // ── The whole decision, in one call ────────────────────────────────────────────────────
+  //
+  // Everything about "is this paid?" now lives in `semantics.ts` and is expressed as one total
+  // table over (claim, evidence). This function no longer decides anything; it RENDERS. That
+  // separation is the point: the rules used to be spread across a `contradictory` boolean, a
+  // `classified ?? status` fallback chain and an evidence check nested inside the success branch,
+  // and the gaps between those three were where `{ status: "pending", resultCode: 0 }` came back
+  // paid and a receipt on a failed row came back `retryable: true`.
+  const { verdict } = judge(payment);
 
-  if (contradictory) {
-    return {
-      ...base,
-      status: "pending",
-      paid: false,
-      retryable: false,
-      receipt: null,
-      message: INDETERMINATE,
-    };
-  }
-
-  const outcome =
-    classified ??
-    (payment.status === "success"
-      ? "success"
-      : payment.status === "failed"
-        ? "failed"
-        : "pending");
-
-  if (outcome === "success") {
-    // `paid: true` REQUIRES EVIDENCE, not an assertion.
-    //
-    // A bare `{ id, status: "success" }` is a claim with nothing behind it. M-Pesa proves a
-    // payment two ways — a confirmation receipt, or result code 0 — and a body carrying neither
-    // is not a settled payment we can act on: it is a response we cannot corroborate, from a
-    // stubbed endpoint, a truncated row, a proxy's cached envelope, or a compromised upstream.
-    // Trusting the string alone means fulfilling an order on the strength of six characters of
-    // JSON that anyone in the path can write. So an unevidenced success is treated exactly like
-    // any other unprovable state: INDETERMINATE — never paid, never safe to charge again, and
-    // surfaced as pending so `wait()` keeps polling and lets the receipt (or the webhook) settle
-    // it, rather than reporting a false success a merchant would act on immediately.
-    const hasReceipt = typeof payment.mpesaReceipt === "string" && payment.mpesaReceipt.trim() !== "";
-    const provenByCode = classified === "success";
-    if (!hasReceipt && !provenByCode) {
-      return {
-        ...base,
-        status: "pending",
-        paid: false,
-        retryable: false,
-        receipt: null,
-        message: INDETERMINATE,
-      };
-    }
+  if (verdict === "paid") {
     return {
       ...base,
       status: "succeeded",
@@ -209,7 +156,22 @@ export function toOutcome(payment: Payment): PaymentOutcome {
     };
   }
 
-  if (outcome === "pending") {
+  if (verdict === "indeterminate") {
+    // Rendered as `pending` so `wait()` keeps polling and lets the webhook settle it, rather than
+    // reporting a false success (goods shipped for nothing) or a false retryable failure (the
+    // customer charged twice). Never paid, never retryable — those are the only two rules that
+    // matter here, and both are unconditional.
+    return {
+      ...base,
+      status: "pending",
+      paid: false,
+      retryable: false,
+      receipt: null,
+      message: INDETERMINATE,
+    };
+  }
+
+  if (verdict === "in_flight") {
     return {
       ...base,
       status: "pending",
@@ -219,8 +181,7 @@ export function toOutcome(payment: Payment): PaymentOutcome {
       receipt: null,
       // `detail` is only useful here if it's genuinely a pending code (4999 / 500.001.1001);
       // anything else that classified as pending has no meaningful customer message.
-      message:
-        detail && detail.category === "pending" ? detail.customerMessage : WAITING,
+      message: detail && detail.category === "pending" ? detail.customerMessage : WAITING,
     };
   }
 

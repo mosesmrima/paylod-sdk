@@ -14,13 +14,18 @@ function client(steps: Parameters<typeof mockFetch>[0], opts = {}) {
   const m = mockFetch(steps);
   return {
     m,
-    paylod: new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0, ...opts }),
+    paylod: new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, ...opts }),
   };
 }
 
 /** Runs `fn` with fake timers so the poll backoff doesn't make the suite take 2 minutes. */
 async function withFakeClock<T>(fn: () => Promise<T>): Promise<T> {
-  vi.useFakeTimers();
+  // `performance` must be faked alongside `Date`: operation deadlines are measured on the
+  // MONOTONIC clock (performance.now()), so a fake clock that only advances Date would leave
+  // every deadline permanently in the future and this helper would spin forever.
+  vi.useFakeTimers({
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+  });
   const promise = fn();
   const settled = promise.then(
     (v) => ({ v }),
@@ -46,7 +51,7 @@ describe("construction", () => {
     vi.stubEnv("PAYLOD_API_KEY", "");
     const m = mockFetch([{ status: 202, json: ACK }]);
     // The documented form. Everything else is defaulted.
-    const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod(KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     await paylod.collect({ amount: 1, phone: "0712345678" });
     // The base URL is baked in: the caller never supplied one.
     expect(m.calls[0]!.url).toBe("https://paylod.dev/functions/v1/collect");
@@ -163,7 +168,7 @@ describe("idempotency", () => {
       { status: 503, json: { error: "upstream" } },
       { status: 202, json: ACK },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 2 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 2 });
     const ack = await withFakeClock(() => paylod.collect({ amount: 100, phone: "0712345678" }));
 
     expect(m.calls).toHaveLength(2);
@@ -175,7 +180,7 @@ describe("idempotency", () => {
     const m = mockFetch([
       { status: 409, json: { error: "Idempotency-Key was reused with a different request body" } },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 3 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 3 });
     const err = await paylod
       .collect({ amount: 100, phone: "0712345678", idempotencyKey: "order-42" })
       .catch((e) => e);
@@ -197,7 +202,7 @@ describe("missing-idempotencyKey warning", () => {
     vi.resetModules();
     const { Paylod: Fresh } = await import("../src/client.js");
     const m = mockFetch(steps);
-    return { m, paylod: new Fresh({ apiKey: KEY, fetch: m.fetch }) };
+    return { m, paylod: new Fresh({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true }) };
   }
 
   it("warns when collect() is called with no idempotencyKey", async () => {
@@ -270,7 +275,7 @@ describe("collectAndWait", () => {
       { json: payment({ status: "pending" }) },
       { json: payment({ status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 }) },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     const onPoll = vi.fn();
     const r = await withFakeClock(() =>
@@ -297,7 +302,7 @@ describe("collectAndWait", () => {
         }),
       },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const r = await withFakeClock(() =>
       paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
     );
@@ -320,7 +325,7 @@ describe("collectAndWait", () => {
       { status: 202, json: ACK },
       { json: payment({ status: "failed", resultCode: 1032, resultDesc: "Request cancelled by user" }) },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const r = await withFakeClock(() =>
       paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
     );
@@ -348,7 +353,7 @@ describe("collectAndWait", () => {
         // …and the customer then pays.
         { json: payment({ status: "success", resultCode: 0, mpesaReceipt: "SFF6XYZ123" }) },
       ]);
-      const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+      const paylod = new Paylod(KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
       const r = await withFakeClock(() =>
         paylod.collectAndWait({ amount: 100, phone: "0712345678" }),
       );
@@ -364,7 +369,7 @@ describe("collectAndWait", () => {
       const m = mockFetch([
         { json: payment({ status: "failed", resultCode: code as never, resultDesc: desc }) },
       ]);
-      const paylod = new Paylod(KEY, { fetch: m.fetch, maxRetries: 0 });
+      const paylod = new Paylod(KEY, { fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
       const r = await paylod.check("pay_123");
 
       expect(r.status).toBe("pending");
@@ -382,7 +387,7 @@ describe("collectAndWait", () => {
       { status: 202, json: ACK },
       { json: payment({ status: "pending" }) },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
 
     const err = await withFakeClock(() =>
       paylod
@@ -403,7 +408,7 @@ describe("collectAndWait", () => {
       { json: payment({ status: "success", mpesaReceipt: "R1", resultCode: 0 }) },
       { json: payment({ status: "success", mpesaReceipt: "R1", resultCode: 0 }) },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     await withFakeClock(() => paylod.collectAndWait({ amount: 1, phone: "0712345678" }));
     expect(m.count).toBe(3); // collect + 2 status reads, no more
   });
@@ -411,7 +416,7 @@ describe("collectAndWait", () => {
 
 describe("decodeError", () => {
   it("decodes offline with no network call", () => {
-    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch });
+    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch, allowCustomFetch: true });
     const e = paylod.decodeError(1032);
     expect(e).toMatchObject({
       code: "1032",
@@ -422,7 +427,7 @@ describe("decodeError", () => {
   });
 
   it("falls back gracefully on an unknown code, preferring the raw description", () => {
-    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch });
+    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch, allowCustomFetch: true });
     const e = paylod.decodeError(4242, "Something odd happened");
     expect(e.code).toBe("4242");
     expect(e.title).toBe("Payment failed");
@@ -434,7 +439,7 @@ describe("decodeError", () => {
   });
 
   it("decodes success (0)", () => {
-    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch });
+    const paylod = new Paylod({ apiKey: KEY, fetch: mockFetch([]).fetch, allowCustomFetch: true });
     expect(paylod.decodeError(0).category).toBe("success");
   });
 });
@@ -476,7 +481,7 @@ describe("retries", () => {
       { throw: new TypeError("fetch failed") },
       { status: 202, json: ACK },
     ]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 2 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 2 });
     const ack = await withFakeClock(() => paylod.collect({ amount: 1, phone: "0712345678" }));
     expect(ack.paymentId).toBe("pay_123");
     expect(m.count).toBe(2);
@@ -484,7 +489,7 @@ describe("retries", () => {
 
   it("does not retry a 422 validation error from the server", async () => {
     const m = mockFetch([{ status: 422, json: { error: "invalid Kenyan phone number" } }]);
-    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 3 });
+    const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 3 });
     await expect(paylod.collect({ amount: 1, phone: "0712345678" })).rejects.toThrow(
       PaylodApiError,
     );

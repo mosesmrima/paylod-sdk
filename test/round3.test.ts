@@ -22,7 +22,7 @@ const KEY = "mp_test_abc123";
 
 function client(steps: Step[], opts = {}) {
   const m = mockFetch(steps);
-  return { m, paylod: new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 0, ...opts }) };
+  return { m, paylod: new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0, ...opts }) };
 }
 
 // ── R3-1: the loopback opt-in must not unlock arbitrary protocols ──────────────────────────
@@ -252,7 +252,7 @@ describe("sibling D — Retry-After is parsed in both forms, case-insensitively"
         { status: 429, headers: { [name]: "1" } },
         { status: 202, json: ACK },
       ]);
-      const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, maxRetries: 2 });
+      const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 2 });
       await expect(
         paylod.collect({ amount: 1, phone: "0712345678", idempotencyKey: `k-${name}` }),
       ).resolves.toBeDefined();
@@ -341,7 +341,7 @@ describe("sibling F — the simulator reuses the production validators, not weak
 
   it("a well-formed simulated ack still works", async () => {
     const { paylod } = client([
-      { status: 200, json: { ...ACK, outcomes: [] } },
+      { status: 202, json: { ...ACK, outcomes: [] } },
     ]);
     await expect(paylod.simulate.collect({})).resolves.toMatchObject({ paymentId: "pay_123" });
   });
@@ -377,7 +377,7 @@ describe("sibling G — secrets never reach an error message, stack or echoed bo
         },
       },
     ]);
-    const paylod = new Paylod({ apiKey: secret, fetch: m.fetch, maxRetries: 0 });
+    const paylod = new Paylod({ apiKey: secret, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     const err = (await paylod
       .collect({ amount: 1, phone: "0712345678", idempotencyKey: "k" })
       .catch((e) => e)) as PaylodApiError;
@@ -395,7 +395,7 @@ describe("sibling G — secrets never reach an error message, stack or echoed bo
     const paylod = new Paylod({
       apiKey: KEY,
       webhookSecret: whsec,
-      fetch: m.fetch,
+      fetch: m.fetch, allowCustomFetch: true,
       maxRetries: 0,
     });
     const err = (await paylod

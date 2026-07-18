@@ -35,7 +35,7 @@ const RAW = JSON.stringify(EVENT);
 const NOW = EVENT.created; // pin the clock to the event's own timestamp
 
 function paylod() {
-  return new Paylod({ apiKey: "mp_test_x", webhookSecret: SECRET, fetch: mockFetch([]).fetch });
+  return new Paylod({ apiKey: "mp_test_x", webhookSecret: SECRET, fetch: mockFetch([]).fetch, allowCustomFetch: true });
 }
 
 describe("signature scheme parity with the backend", () => {

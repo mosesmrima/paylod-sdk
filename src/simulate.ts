@@ -23,7 +23,8 @@
  */
 
 import { PaylodInvalidRequestError, PaylodSandboxOnlyError } from "./errors.js";
-import { assertCollectAckShape, assertValidIdempotencyKey } from "./validate.js";
+import { randomUUID } from "node:crypto";
+import { assertCollectAck, assertPaymentBody, assertValidIdempotencyKey } from "./validate.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";
 import { normalizePhone } from "./phone.js";
@@ -147,14 +148,35 @@ export function assertSandboxKey(apiKey: string, what: string): void {
   );
 }
 
-/** The single HTTP hook the simulator borrows from the client. Keeps this module transport-free. */
+/**
+ * The single HTTP hook the simulator borrows from the client. Keeps this module transport-free.
+ *
+ * `validate` is threaded through deliberately. The simulator used to assert its ack AFTER the
+ * request returned, which meant it could only see the parsed body and never the HTTP STATUS — so
+ * it could not enforce the `202` half of the collect contract, and it passed a hardcoded `200` to
+ * the shared validator, certifying a response production would reject. Running the validator
+ * inside the request, exactly as the client does, is what makes "the simulator runs the same
+ * checks" true rather than aspirational.
+ */
 export type SimTransport = <T>(opts: {
   method: "POST";
   path: string;
   body: unknown;
   idempotencyKey?: string;
   signal?: AbortSignal;
+  validate?: (parsed: unknown, status: number) => void;
 }) => Promise<T>;
+
+/**
+ * The settle ack names the payment `paymentId`; a `Payment` names it `id`. Rename so the SHARED
+ * payment validator can be run against it rather than a near-copy being written here — a
+ * near-copy is how the simulator drifted from production in the first place.
+ */
+function normalizeSettleAck(parsed: unknown): unknown {
+  if (parsed === null || typeof parsed !== "object") return parsed;
+  const { paymentId, ...rest } = parsed as Record<string, unknown>;
+  return { ...rest, id: paymentId };
+}
 
 /**
  * `paylod.simulate` — drive a payment to any of the five outcomes from a test file, with no phone.
@@ -223,6 +245,12 @@ export class Simulator {
     if (params.idempotencyKey !== undefined) {
       assertValidIdempotencyKey(params.idempotencyKey, "simulate.collect(): idempotencyKey");
     }
+    // Production `collect()` generates a key when the caller omits one, so a network retry of a
+    // single call cannot create two payments. This surface did not, so an omitted key meant NO
+    // Idempotency-Key header at all and a retried simulate-collect really could create a second
+    // simulated payment. A simulator whose double-charge behaviour is weaker than production's is
+    // precisely the divergence that makes a green "a double-click cannot charge twice" test a lie.
+    const idempotencyKey = params.idempotencyKey ?? randomUUID();
 
     const body: Record<string, unknown> = {
       phone: params.phone ? normalizePhone(params.phone) : DEFAULT_SIM_PHONE,
@@ -247,14 +275,19 @@ export class Simulator {
       method: "POST",
       path: "/simulate/collect",
       body,
-      ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+      idempotencyKey,
       ...(options.signal ? { signal: options.signal } : {}),
+      // THE SAME validator production runs, with the REAL HTTP status — including the 202
+      // requirement. A simulator that tolerates an acknowledgement production would reject
+      // teaches the wrong thing about the shape of a real response, and silently hands back
+      // `paymentId: undefined` for the rest of the test to trip over.
+      validate: (parsed, status) =>
+        assertCollectAck(parsed, {
+          httpStatus: status,
+          idempotencyKey,
+          what: "simulate.collect()",
+        }),
     });
-
-    // The SAME ack schema production runs. A simulator that tolerates a malformed acknowledgement
-    // production would reject teaches the wrong thing about the shape of a real response — and
-    // silently hands back `paymentId: undefined` for the rest of the test to trip over.
-    assertCollectAckShape(ack, 200, params.idempotencyKey ?? "", "simulate.collect()");
 
     return {
       paymentId: ack.paymentId,
@@ -285,7 +318,24 @@ export class Simulator {
       method: "POST",
       path: "/simulate/outcome",
       body: { paymentId, outcome },
+      // Settling is a MUTATING call and it carried no idempotency key at all, so a network retry
+      // could re-dispatch it. The key is derived deterministically from the operation, which is
+      // exactly the right shape here: retrying "settle THIS payment as THIS outcome" is the same
+      // operation and must replay, while settling it as a different outcome is a different one.
+      idempotencyKey: `sim-outcome-${paymentId}-${outcome}`,
       ...(options.signal ? { signal: options.signal } : {}),
+      // The settle response describes a PAYMENT, so it runs the payment validator — the same one
+      // `status()` runs, ID BINDING included. This surface previously did no validation at all:
+      // it read `ack.paymentId` / `ack.status` straight into a `Payment` and handed it to the
+      // classifier, so a body describing a DIFFERENT payment (or carrying an unknown status) was
+      // classified on its merits and returned as this payment's outcome. Every dispatch surface
+      // runs the same validators, or the guarantee is not a guarantee.
+      validate: (parsed, status) =>
+        assertPaymentBody(normalizeSettleAck(parsed), {
+          httpStatus: status,
+          expectedId: paymentId,
+          what: "simulate.outcome()",
+        }),
     });
 
     // Build the outcome with the SAME classifier every other read uses. This is the point of the
