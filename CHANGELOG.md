@@ -3,6 +3,91 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.8.0
+
+Fifth independent review. The review of THIS repo was cut off by a content filter before it emitted
+its findings list, so unlike the sibling SDKs there was no itemised set to work from. The sibling
+reviews did complete, and since all four SDKs share one design, every defect they found was treated
+as a candidate here and re-derived against this code rather than assumed absent. That posture is not
+paranoia: Node was assumed clean in an earlier round and turned out to fail 8 of 8 equivalent checks.
+
+Six of the sibling defects were present. Three were genuinely absent, with evidence.
+
+Signing is unchanged — the shared golden webhook vector (`whsec_golden_vector_v1` →
+`3afe38e4…2c2eb7`) still passes byte for byte, and its literals are untouched.
+
+### Present, and fixed
+
+- **The (claim x evidence) resolution is now a total mapped table**, not a nested `switch` with a
+  reachable tail. Verdicts are unchanged; the structure is what changed. Python "fixed" this exact
+  shape in a previous round and STILL let `pending` + result code 0 resolve to PAID, because the fix
+  was another branch rather than a structure that cannot have a gap. Omitting a cell is now a compile
+  error, and the full 3 x 5 cross-product is asserted so a wrong cell fails rather than defaulting.
+
+- **Success evidence is recognised by exact form, never by numeric coercion.** `Number(raw) === 0`
+  accepted `"0e999"`, `"+0"`, `"00"`, `"0.0"`, `"-0"` and `"0x0"` as result-code zero — six spellings
+  of "declare yourself paid" available to anyone who controls the response body. PHP shipped exactly
+  this. Fixed in the **canonical monorepo classifier** and re-synced here, since the backend shares
+  it. A non-canonical code is now ambiguous (`pending`), never force-failed.
+
+- **Credential-compromise detections are terminal by type.** New `PaylodSecurityError` extends
+  `PaylodConnectionError`, so existing catches keep working, and the retry loop re-throws it
+  structurally. It previously depended on a **regex over the error message** — a credential-critical
+  control resting on prose, which any rewording would silently disable. The JVM SDK's version was
+  worse: it raised these as ordinary connection errors and its retry loop replayed a credential it
+  had just concluded was leaking.
+
+- **`data.decoded` on a webhook is recomputed from the canonical catalog.** It carries `retryable`,
+  the one boolean meaning SAFE TO CHARGE AGAIN, so passing it through gave whoever produced the
+  payload a direct vote on double-charging — a block claiming `retryable: true` beside code 4999 is
+  an instruction to charge a customer whose prompt is still live. The JVM SDK trusted this block. A
+  signature proves who sent a body, not that its opinions are true.
+
+- **Every throw escaping after an acknowledgement carries the payment id as well as the idempotency
+  key** — including thrown primitives, non-`Error` objects and frozen errors. The key lets a caller
+  replay the attempt; the id lets them read it. The JVM SDK lost both on a non-`Exception` throw.
+
+- **Response bodies are bounded in bytes and in JSON depth**, both converted into a terminal
+  indeterminate error carrying the key. The per-request timeout bounded how LONG a response could
+  take; nothing bounded how BIG. The two are independent — a body that streams fast and never ends
+  stays inside the timeout all the way to an OOM, and dying after `POST /collect` loses the
+  idempotency key for a charge that may be live on a handset.
+
+- **`toleranceSec` gains a documented upper bound** (`MAX_TOLERANCE_SEC`, 24h). A positive-integer
+  check passes `86_400_000`, at which point every captured webhook stays valid for three thousand
+  years while the check still reads as enabled. That is worse than no check, because it looks like
+  one.
+
+### Genuinely absent, with evidence
+
+- **A signed `payment.success` with no evidence was already rejected** (law L2), and the `W-schema`
+  non-vacuity case has proven it since 0.7.0 by reverting the guard and requiring the test to fail.
+  Python accepted this; Node did not.
+- **Deadlines were already monotonic** (`monotonicNowMs`, `performance.now()`), and timeouts and
+  retry counts already had finite whole positive bounds with maxima (`MAX_TIMEOUT_MS`,
+  `MAX_RETRIES`).
+- **The `Retry-After` ceiling was already applied only in the absence of a deadline** — a deadline,
+  being the tighter caller-chosen bound, already won inside `#boundedSleep`.
+
+### SECURITY.md
+
+Adds an explicit threat model, identical in substance across the paylod SDKs. It is deliberately
+specific about what is NOT defended: an adversary who can already execute arbitrary code in the same
+process. In particular it documents, plainly, that **replacing `globalThis.fetch` before the client
+is constructed still results in a live bearer token reaching the replacement** — an accepted limit of
+the model, not a bug with a pending fix, and equally true of `stripe-node`, `twilio` and `aws-sdk`.
+The transport is not a security boundary against same-process code and the document does not claim it
+is. Two tests pin that statement so the docs cannot quietly drift into overstating the guarantee.
+
+### Non-vacuity
+
+Ten new harness cases; **29/29 mutations caught**, every selector proven to match at least one test
+on clean source. The harness caught two tests of my own that were vacuous — the frozen-error case
+threw from `fetch`, where `#request` re-wraps before the normaliser ever sees the value, and the
+byte-cap case used a body that the ack validator rejected either way. Both were rewritten to
+exercise the path they claim to. Two pre-existing 0.7.0 anchors were reported `BROKEN-ANCHOR` after
+`semantics.ts` became a table and are re-pointed at the corresponding cells.
+
 ## 0.7.0 — BREAKING
 
 Fourth-round codex review returned **NOT SAFE TO PUBLISH**. Four earlier rounds of per-finding

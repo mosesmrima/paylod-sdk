@@ -669,3 +669,68 @@ describe("D8 — the webhook tolerance has a documented UPPER bound", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE THREAT MODEL'S ACCEPTED LIMIT (SECURITY.md, "out of scope")
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("documented limitation — same-process code is NOT defended against", () => {
+  /**
+   * This test asserts a LEAK, on purpose.
+   *
+   * SECURITY.md states plainly that replacing `globalThis.fetch` BEFORE the client is constructed
+   * still results in a live bearer token reaching the replacement, and that the transport is
+   * therefore not a security boundary against same-process code. That claim has to stay true: if a
+   * future change made it false we would want to say so, and if a future change made the docs
+   * quietly overstate the guarantee we would want that to fail loudly.
+   *
+   * The protection that DOES exist is against a LATER reassignment — the transport binds the
+   * implementation it captured at construction — and that half is asserted below.
+   */
+  it("a fetch replaced BEFORE construction receives the token (accepted, documented)", async () => {
+    const real = globalThis.fetch;
+    let seen: string | null = null;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seen = (init?.headers as Record<string, string> | undefined)?.authorization ?? null;
+      return new Response(JSON.stringify(ACK), { status: 202 });
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      // No `allowCustomFetch`, and a LIVE key — neither gate is engaged, because this is not the
+      // custom-fetch seam at all. It is simply the `fetch` the SDK found in its own runtime.
+      const paylod = new Paylod("mp_live_threatmodel");
+      await paylod.collect({ amount: 10, phone: "0712345678", idempotencyKey: "tm-1" });
+    } finally {
+      globalThis.fetch = real;
+    }
+
+    expect(seen).toBe("Bearer mp_live_threatmodel");
+  });
+
+  it("but a fetch replaced AFTER construction does NOT — the implementation is bound", async () => {
+    const real = globalThis.fetch;
+    let original = 0;
+    let swapped = 0;
+
+    globalThis.fetch = (async () => {
+      original++;
+      return new Response(JSON.stringify(ACK), { status: 202 });
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      const paylod = new Paylod("mp_test_threatmodel");
+      // Swap AFTER construction. The transport captured and bound the one above.
+      globalThis.fetch = (async () => {
+        swapped++;
+        return new Response(JSON.stringify(ACK), { status: 202 });
+      }) as unknown as typeof globalThis.fetch;
+
+      await paylod.collect({ amount: 10, phone: "0712345678", idempotencyKey: "tm-2" });
+    } finally {
+      globalThis.fetch = real;
+    }
+
+    expect(original).toBe(1);
+    expect(swapped).toBe(0);
+  });
+});
