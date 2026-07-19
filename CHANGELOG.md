@@ -3,6 +3,48 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.13.1
+
+Catalog resync plus two catalog-wide guards. No API change.
+
+### Fixed
+
+- **`500.001.1001` on the `api_error` surface no longer invites a retry.** It previously read
+  "M-Pesa returned an error. Please try again in a moment."; it now reads "M-Pesa returned an
+  error and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages
+  first."
+
+  That code is overloaded. Its `stk_result` twin means the payment is still in flight, and the
+  `api_error` entry is returned when M-Pesa errored *after* dispatch -- the outcome is unconfirmed
+  and the debit may already have happened. Inviting a retry there is how a customer pays twice.
+  The entry stays `retryable: false`; only the customer-facing wording changed.
+
+  The vendored `src/daraja-error-codes.json` was resynced from the canonical catalog via
+  `npm run check-catalog`, and is byte-identical to it.
+
+### Added
+
+- **A duplicate-code guard.** `(code, family)` is the catalog's real key -- `code` alone is
+  ambiguous, because `0`, `2001` and `500.001.1001` each appear in two families with different
+  categories and, for `2001`, different retryability. The guard asserts every `(code, family)`
+  pair is unique, and asserts the bare-code collisions still exist, so it cannot pass by
+  inspecting a deduplicated set.
+
+  It also pins the collision behaviour of `ERROR_CATALOG`, the public export keyed on bare `code`:
+  STK wins, because STK is the payment path. That is unchanged behaviour, now documented by a
+  test rather than only by a comment.
+
+- **A catalog-wide "no non-retryable entry invites another payment attempt" invariant**, matching
+  the JVM SDK. Scoped to non-retryable entries in categories `pending` and `mpesa_system` -- the
+  ones where a debit may already have occurred. `credentials` and `customer` failures are refused
+  before dispatch, so no money moved and "fix it and try again" is correct there.
+
+  The detector is negation-aware: a flat substring match on "again" cannot tell an invitation
+  ("Please try again in a moment.") from a prohibition ("Do not pay again yet."), and the
+  lookbehind is clamped to the current sentence so a prohibition cannot launder an invitation in
+  the sentence after it. It is proved non-vacuous by a discrimination test that feeds it the
+  pre-fix text and requires a flag, and the post-fix text and requires none.
+
 ## 0.13.0
 
 The tenth independent review, and the first round worked against
