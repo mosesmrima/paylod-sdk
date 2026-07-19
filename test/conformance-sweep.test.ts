@@ -27,7 +27,7 @@ import {
   PaylodSignatureVerificationError,
   PaylodTimeoutError,
 } from "../src/errors.js";
-import { decodeDarajaResult } from "../src/daraja-catalog.js";
+import { decodeDarajaResult } from "../src/decode.js";
 import { MAX_JSON_DEPTH } from "../src/json.js";
 import { toOutcome, pendingOutcome } from "../src/outcome.js";
 import { judge } from "../src/semantics.js";
@@ -315,7 +315,7 @@ describe("spec 8.6 — permanent adversarial sweep over every public type", () =
 
   it("sweeps the offline and construction-time surfaces", async () => {
     // Offline decoder (spec 4.9) -- no network, no client, still must not echo a credential.
-    const decoded = decodeDarajaResult(1032, `Cancelled. auth=${KEY} sig=${SECRET}`);
+    const decoded = decodeDarajaResult(77777, `Failed. auth=${KEY} sig=${SECRET}`);
     assertClean("decodeDarajaResult", decoded);
     record("DecodedError", decoded);
 

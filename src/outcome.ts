@@ -28,7 +28,8 @@
  *    rather than folding a timeout into `status: "failed"`, because a customer staring at a
  *    live prompt may still pay, and a merchant who cancels that order loses real money.
  */
-import { type DecodedError, decodeDarajaResult } from "./daraja-catalog.js";
+import { type DecodedError } from "./daraja-catalog.js";
+import { decodeDarajaResult } from "./decode.js";
 import { judge } from "./semantics.js";
 import type { Payment } from "./types.js";
 

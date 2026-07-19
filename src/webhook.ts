@@ -19,7 +19,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodResponseTooLargeError, PaylodSignatureVerificationError } from "./errors.js";
 import { isValidIdentifier, isValidReceipt } from "./grammar.js";
 import { decodeUtf8Strict, parseBounded } from "./json.js";
-import { decodeDarajaResult } from "./daraja-catalog.js";
+import { decodeDarajaResult } from "./decode.js";
 import { judge } from "./semantics.js";
 import { asPaymentStatus, asWireResultCode, containsSecret, PAYMENT_STATUSES } from "./validate.js";
 import type { WebhookEvent } from "./types.js";

@@ -48,6 +48,8 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
     "failure",
     "in_flight",
     "conflict",
+    // spec 1.5: a canonically-shaped code the catalog has never heard of.
+    "unknown",
   ];
 
   /**
@@ -69,6 +71,10 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
         // A receipt (money moved) beside a cancellation code (it did not). The two witnesses
         // contradict each other, so the claim never gets a vote.
         return payment({ status: claim, mpesaReceipt: "SFF6XYZ123", resultCode: 1032 });
+      case "unknown":
+        // Well-formed, non-zero, and absent from the catalog. The classifier calls this shape
+        // `failed`; the catalog has never described it, so it proves nothing.
+        return payment({ status: claim, resultCode: 77777 });
     }
   }
 
@@ -80,6 +86,7 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
       failure: "indeterminate",
       in_flight: "indeterminate",
       conflict: "indeterminate",
+      unknown: "indeterminate",
     },
     pending: {
       success: "indeterminate",
@@ -87,6 +94,7 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
       failure: "indeterminate",
       in_flight: "in_flight",
       conflict: "indeterminate",
+      unknown: "indeterminate",
     },
     failed: {
       success: "indeterminate",
@@ -96,10 +104,13 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
       failure: "failed",
       in_flight: "in_flight",
       conflict: "indeterminate",
+      // spec 3.5 row 7. `failed` + an uncatalogued code is INDETERMINATE, not a terminal
+      // failure: nobody has established what the code means, so it is not evidence.
+      unknown: "indeterminate",
     },
   };
 
-  it("covers the FULL cross-product — 3 claims x 5 evidence kinds, 15 cells, none missing", () => {
+  it("covers the FULL cross-product — 3 claims x 6 evidence kinds, 18 cells, none missing", () => {
     const seen: string[] = [];
     for (const claim of CLAIMS) {
       for (const evidence of EVIDENCE) {
@@ -114,7 +125,7 @@ describe("D1 — the claim x evidence table is TOTAL, with no default anywhere o
       }
     }
     // A cell silently dropped from the loop is a cell nothing asserted.
-    expect(seen).toHaveLength(15);
+    expect(seen).toHaveLength(18);
   });
 
   it("NEVER reports a pending record as paid, whatever evidence rides along", () => {

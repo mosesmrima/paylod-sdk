@@ -37,7 +37,7 @@
       "fix": "This is transient, but it is NOT proven that no charge was raised. Confirm the payment's final state with GET /status/:id (or the webhook) before charging again; only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa had a hiccup. Please try again in a moment.",
+      "customerMessage": "M-Pesa had a problem and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
@@ -52,7 +52,7 @@
       "fix": "Back off, then confirm the payment's final state with GET /status/:id (or the webhook) before charging again — a busy-system rejection is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa is busy right now. Please try again shortly.",
+      "customerMessage": "M-Pesa is busy and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
         "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
@@ -66,7 +66,7 @@
       "fix": "Ask the customer to finish or dismiss any open M-Pesa/USSD prompt, then wait 1-3 minutes. Do NOT blind-retry: the in-flight transaction may be your own earlier push, and charging again could double-charge. Confirm the outcome of the existing payment first.",
       "category": "customer",
       "retryable": false,
-      "customerMessage": "You have another M-Pesa request open. Please finish it, wait a minute, then try again.",
+      "customerMessage": "You have another M-Pesa request open. Finish or dismiss it first. Do not start a new payment until the open one clears.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://calculator.co.ke/common-m-pesa-api-errors/"
@@ -94,7 +94,7 @@
       "fix": "Keep TransactionDesc within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a send failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "We couldn't reach M-Pesa. Please try again in a moment.",
+      "customerMessage": "We could not reach M-Pesa and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://woodev.co.ke/common-m-pesa-api-errors/",
@@ -109,7 +109,7 @@
       "fix": "Shorten the request fields (especially TransactionDesc) to stay within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a delivery failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "We couldn't reach M-Pesa. Please try again in a moment.",
+      "customerMessage": "We could not reach M-Pesa and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://woodev.co.ke/common-m-pesa-api-errors/",
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",

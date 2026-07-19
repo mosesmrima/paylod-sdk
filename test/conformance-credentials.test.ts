@@ -5,7 +5,8 @@
 import { describe, expect, it } from "vitest";
 
 import { Paylod } from "../src/client.js";
-import { decodeDarajaResult } from "../src/daraja-catalog.js";
+import { decodeDarajaResult as decodeRaw } from "../src/daraja-catalog.js";
+import { decodeDarajaResult } from "../src/decode.js";
 import { redactCredentialShapes } from "../src/grammar.js";
 import { MAX_JSON_DEPTH, parseBounded } from "../src/json.js";
 import { containsSecret } from "../src/validate.js";
@@ -111,21 +112,51 @@ describe("spec 4.9 — public offline surfaces redact for themselves", () => {
    * for logs and dashboards. It has no client to redact for it, so it had none at all — while
    * interpolating `resultDesc`, the field most likely to carry an echoed Authorization header.
    */
+  /**
+   * THE CODE MUST BE ONE THAT ACTUALLY INTERPOLATES THE DESCRIPTION (spec 8.5).
+   *
+   * A catalogued code such as 1032 renders its cause and customerMessage FROM THE CATALOG and
+   * never reproduces `resultDesc` at all, so a leak test using 1032 passes with the redaction
+   * removed — it discriminates nothing. The first draft of this file made exactly that mistake.
+   * The description is reproduced only on the FALLBACK paths: an uncatalogued code, a blank code,
+   * or a null one. `UNCATALOGUED` below is verified to be a genuine leak vector by the
+   * discrimination test at the end of this block.
+   */
+  const UNCATALOGUED = 77777;
+
   it.each(["mp_live_LEAKED_VIA_DESC", "Bearer leaked.jwt.here", "whsec_LEAKED"])(
     "keeps %s out of the bare decodeDarajaResult output",
     (credential) => {
-      const decoded = decodeDarajaResult(1032, `Cancelled. auth=${credential}`);
-      const serialized = JSON.stringify(decoded);
-      expect(serialized).not.toContain(credential);
+      const decoded = decodeDarajaResult(UNCATALOGUED, `Failed. auth=${credential}`);
+      expect(JSON.stringify(decoded)).not.toContain(credential);
     },
   );
 
+  it.each([null, ""])("keeps a credential out of the %j-code fallback too", (code) => {
+    const credential = "mp_live_LEAKED_VIA_DESC";
+    const decoded = decodeDarajaResult(code, `Something. auth=${credential}`);
+    expect(JSON.stringify(decoded)).not.toContain(credential);
+  });
+
   it("keeps a CONFIGURED credential out of the client's decodeError", () => {
     const paylod = new Paylod({ apiKey: KEY, webhookSecret: SECRET });
-    const decoded = paylod.decodeError(1032, `Cancelled by user. echoed=${KEY} and ${SECRET}`);
+    const decoded = paylod.decodeError(UNCATALOGUED, `Failed. echoed=${KEY} and ${SECRET}`);
     const serialized = JSON.stringify(decoded);
     expect(serialized).not.toContain(KEY);
     expect(serialized).not.toContain(SECRET);
+  });
+
+  /**
+   * THE FIXTURE'S OWN DISCRIMINATOR. Proves the chosen code really does reproduce the
+   * description, so the assertions above are testing the redaction rather than the catalog's
+   * indifference to `resultDesc`.
+   */
+  it("the fixture discriminates: the UNWRAPPED decoder genuinely leaks this shape", () => {
+    const credential = "mp_live_LEAKED_VIA_DESC";
+    const leaked = JSON.stringify(decodeRaw(UNCATALOGUED, `Failed. auth=${credential}`));
+    expect(leaked).toContain(credential);
+    // And a catalogued code does NOT, which is why 1032 would have been a vacuous fixture.
+    expect(JSON.stringify(decodeRaw(1032, `Failed. auth=${credential}`))).not.toContain(credential);
   });
 
   it("still decodes the code correctly with the description scrubbed — the control", () => {

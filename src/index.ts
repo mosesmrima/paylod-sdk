@@ -52,9 +52,11 @@ export { toOutcome, pendingOutcome, type OutcomeStatus, type PaymentOutcome } fr
  * (`scripts/sync-daraja-catalog.mjs`) — never hand-edited here. You do not need any of this to
  * render a payment; it is exposed for logs, dashboards and support tooling.
  */
+// The decoder is exported from the REDACTING WRAPPER (`decode.ts`), not from the generated
+// catalog — see that module for why the redaction cannot live in the generated file (spec 4.9).
+export { decodeDarajaResult, decodeDarajaResult as decodeError } from "./decode.js";
+
 export {
-  decodeDarajaResult,
-  decodeDarajaResult as decodeError,
   classifyStkResult,
   ERROR_CATALOG,
   ALL_ENTRIES,

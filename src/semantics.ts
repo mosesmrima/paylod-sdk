@@ -52,7 +52,7 @@
  * false retryable failure (merchant charges the customer twice).
  */
 
-import { classifyStkResult } from "./daraja-catalog.js";
+import { canonicalCodeForm, classifyStkResult, ERROR_CATALOG } from "./daraja-catalog.js";
 import { isValidReceipt } from "./grammar.js";
 import type { Payment } from "./types.js";
 
@@ -65,8 +65,19 @@ export type PaymentEvidence =
   | "none"
   /** A receipt, or result code 0. Money moved. */
   | "success"
-  /** A terminal failure code (1032 cancelled, 2001 wrong PIN, 1 low balance, …). */
+  /** A terminal failure code the CATALOG KNOWS (1032 cancelled, 2001 wrong PIN, 1 low balance, …). */
   | "failure"
+  /**
+   * A canonically-SHAPED code the catalog has never heard of (spec 1.5).
+   *
+   * Distinct from `failure` on purpose. The vendored classifier answers `failed` for any canonical
+   * non-zero code, catalogued or not — it mirrors the payment engine and is right to be
+   * conservative about SHAPE — but "I do not recognise this code" is not the same claim as "this
+   * payment failed", and collapsing the two made an unknown code into settlement-grade evidence
+   * of failure. It is not evidence at all: nobody has established what it means, so it cannot
+   * prove a terminal outcome in either direction.
+   */
+  | "unknown"
   /** A pending code (4999, 500.001.1001), or a code we cannot place. Still on the handset. */
   | "in_flight"
   /** The evidence disagrees with ITSELF — e.g. a receipt alongside a cancellation code. */
@@ -114,6 +125,19 @@ export function hasReceipt(payment: Pick<Payment, "mpesaReceipt">): boolean {
   return isValidReceipt(payment.mpesaReceipt);
 }
 
+/**
+ * Does the catalog actually describe this code?
+ *
+ * Compared on the CANONICAL FORM only — never on a trimmed or coerced spelling — so this cannot
+ * become a second, laxer way of matching a code (spec 1.1: a guard at one layer is not a guard
+ * at the layer below). A code whose form is not canonical is not catalogued by definition, and
+ * `canonicalCodeForm` has already refused it upstream.
+ */
+function isCataloguedCode(resultCode: unknown): boolean {
+  const form = canonicalCodeForm(resultCode);
+  return form.kind === "canonical" && Object.prototype.hasOwnProperty.call(ERROR_CATALOG, form.code);
+}
+
 /** A result code is "present" if it is neither null nor undefined. `0` is present and meaningful. */
 export function hasResultCode(payment: Pick<Payment, "resultCode">): boolean {
   return payment.resultCode !== null && payment.resultCode !== undefined;
@@ -133,13 +157,32 @@ export function evidenceFor(payment: Payment): PaymentEvidence {
   // `classifyStkResult` is the canonical classifier the payment engine itself uses, so the SDK
   // cannot drift from the backend about what 4999 means. It maps blank/unknown codes to
   // "pending" on purpose — we refuse to force-fail on ambiguity.
-  const codeEvidence: PaymentEvidence = hasResultCode(payment)
+  const rawCodeEvidence: PaymentEvidence = hasResultCode(payment)
     ? ({ success: "success", failed: "failure", pending: "in_flight" } as const)[
         classifyStkResult(payment.resultCode, payment.resultDesc)
       ]
     : "none";
 
+  // AN UNCATALOGUED CODE IS NOT EVIDENCE OF FAILURE (spec 1.5).
+  //
+  // The classifier says `failed` for every canonical non-zero code, because it is judging SHAPE
+  // and a well-formed non-zero code is not a success. That is the correct answer to the question
+  // it is asked. It is the wrong answer to the question the verdict table asks, which is what the
+  // record PROVES — and a code no catalog entry describes proves nothing. `{status:"failed",
+  // resultCode:77777}` used to resolve to a confident terminal `failed`, ending the wait on a
+  // payment whose actual state nobody had established.
+  //
+  // The catalog is the authority on which codes have a known meaning, and it is the same table
+  // the retryability decision already comes from — so this cannot drift from what the SDK claims
+  // to know.
+  const codeEvidence: PaymentEvidence =
+    rawCodeEvidence === "failure" && !isCataloguedCode(payment.resultCode)
+      ? "unknown"
+      : rawCodeEvidence;
+
   if (!receiptSaysSuccess) return codeEvidence;
+  // A receipt beside a code nobody can place is not a settlement we may act on.
+  if (codeEvidence === "unknown") return "conflict";
 
   // A receipt is present. It agrees with success evidence and with silence; it CONTRADICTS a
   // terminal failure code and an in-flight code alike — a receipt means M-Pesa has settled,
@@ -226,6 +269,13 @@ const VERDICTS: {
       "indeterminate",
       "status claims success but the result code says the payment is still in flight",
     ],
+    // spec 1.5 / 3.5 row 7. Nobody has established what this code means, so it is not evidence
+    // in either direction and the claim beside it gets no vote.
+    unknown: [
+      "indeterminate",
+      "the result code is well-formed but is not in the Daraja catalog, so its meaning has " +
+        "never been established — an unrecognised code is not evidence that the payment failed",
+    ],
     conflict: ["indeterminate", CONFLICT_REASON],
   },
 
@@ -241,6 +291,13 @@ const VERDICTS: {
     none: ["in_flight", "the payment is still on the handset"],
     failure: ["indeterminate", "status says pending while the result code is a terminal failure"],
     in_flight: ["in_flight", "the payment is still on the handset"],
+    // spec 1.5 / 3.5 row 7. Nobody has established what this code means, so it is not evidence
+    // in either direction and the claim beside it gets no vote.
+    unknown: [
+      "indeterminate",
+      "the result code is well-formed but is not in the Daraja catalog, so its meaning has " +
+        "never been established — an unrecognised code is not evidence that the payment failed",
+    ],
     conflict: ["indeterminate", CONFLICT_REASON],
   },
 
@@ -285,6 +342,13 @@ const VERDICTS: {
       "in_flight",
       "status says failed but the result code means the prompt is still live and the " +
         "customer has not entered their PIN yet",
+    ],
+    // spec 1.5 / 3.5 row 7. Nobody has established what this code means, so it is not evidence
+    // in either direction and the claim beside it gets no vote.
+    unknown: [
+      "indeterminate",
+      "the result code is well-formed but is not in the Daraja catalog, so its meaning has " +
+        "never been established — an unrecognised code is not evidence that the payment failed",
     ],
     conflict: ["indeterminate", CONFLICT_REASON],
   },

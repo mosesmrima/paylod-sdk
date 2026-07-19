@@ -9,7 +9,7 @@ import {
   PaylodTimeoutError,
 } from "./errors.js";
 import { redactCredentialShapes } from "./grammar.js";
-import { decodeDarajaResult } from "./daraja-catalog.js";
+import { decodeDarajaResult } from "./decode.js";
 import type { DecodedError } from "./daraja-catalog.js";
 import { toOutcome } from "./outcome.js";
 import type { PaymentOutcome } from "./outcome.js";

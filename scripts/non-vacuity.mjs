@@ -1026,7 +1026,7 @@ const CASES = [
     file: "src/grammar.ts",
     find: "const IDENTIFIER_RE = /^[A-Za-z0-9_.:-]{1,128}$/;",
     replace: "const IDENTIFIER_RE = /^.*\\S.*$/;",
-    test: "refuses [redacted] as a collect-ack paymentId",
+    test: "refuses \"[redacted]\" as a collect-ack paymentId",
   },
   {
     id: "S34-idem-sentinel",
@@ -1034,7 +1034,7 @@ const CASES = [
     file: "src/validate.ts",
     find: "  if (looksSanitized(key)) {",
     replace: "  if (false) {",
-    test: "refuses [redacted] as a caller-supplied idempotency key",
+    test: "refuses \"[redacted]\" as a caller-supplied idempotency key",
   },
   {
     id: "S23-duplicate",
@@ -1105,9 +1105,12 @@ const CASES = [
   {
     id: "S49-offline",
     what: "the public offline decoder stops redacting, as it did before",
-    file: "src/daraja-catalog.ts",
-    find: "  return typeof resultDesc === \"string\" ? redactCredentialShapes(resultDesc.trim()) : \"\";",
-    replace: "  return typeof resultDesc === \"string\" ? resultDesc.trim() : \"\";",
+    // The redaction lives in `decode.ts`, a wrapper this SDK owns -- `daraja-catalog.ts` is a
+    // GENERATED file and an edit there would be undone by the next sync while breaking the drift
+    // check in the meantime.
+    file: "src/decode.ts",
+    find: "  const safeDesc = typeof rawDesc === \"string\" ? redactCredentialShapes(rawDesc) : rawDesc;",
+    replace: "  const safeDesc = rawDesc;",
     test: "keeps mp_live_LEAKED_VIA_DESC out of the bare decodeDarajaResult output",
   },
   {
