@@ -3,6 +3,77 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.12.0
+
+The ninth independent review. One Critical, one High, five Mediums and one Low.
+
+The theme of this round is that **two bounds which disagree are a bypass with a number for a
+lock**, and that the shallower one deciding "clean" is how the lock opens.
+
+### Breaking changes
+
+- **Every structural traversal now derives its depth budget from one constant, and every one of
+  them fails CLOSED.** `containsSecret` — the scan that refuses a body carrying your own API key
+  or webhook secret — stopped at depth 8 and returned "no secret here", while the bounded parser
+  admits documents 64 levels deep. The gap between those two numbers was a credential-smuggling
+  channel: a correctly-signed webhook body with the credential at depth 9 walked straight past the
+  refusal, `verifyWebhookSignature` returned it raw, and the typed path silently stripped it
+  during allowlist reconstruction and delivered the event as valid — so the two public entry
+  points to one channel disagreed about whether to refuse.
+
+  The fix is structural, not a larger number. The traversal budget IS `MAX_JSON_DEPTH`, imported
+  from the parser that produced the value, so anything the parser accepted the scan can reach the
+  bottom of by construction and the two limits cannot drift apart. Past the budget the answer is
+  REFUSE, because "I did not look" and "I looked and it is clean" must never be the same answer
+  when every caller reads the second one as permission to hand the value to your application.
+  `PaylodApiError.body` redaction now uses the same constant.
+
+- **A dotted result code must have at least two dots.** `CANONICAL_DOTTED_RE` accepted one-dot
+  lexemes, so `"500.0"` validated as a CANONICAL code — the only classification that can be
+  confident terminal failure evidence. Paired with terminal-500 prose ("wrong credentials") it
+  became genuine failure evidence, which is exactly what a `payment.failed` webhook must carry to
+  be accepted, so an otherwise-valid forged failure event was admitted on a spelling rather than a
+  code. Every real Daraja dotted code has three components, and all nine in the shipped catalog
+  still validate. This was the third sighting of one root across the paylod SDKs.
+
+  `"500.0"` and friends now classify as `pending`, decode as `unknown`, never resolve to a
+  terminal failure, and are refused by webhook verification.
+
+- **Request bodies are serialised under the same depth budget the reader uses**, with cycle
+  detection and a 256 KiB cap, all enforced before `JSON.stringify` is allowed to recurse. Refused
+  as `PaylodInvalidRequestError`, whose defining property is that NOTHING was dispatched.
+
+- **`bodyReadTimeoutMs` must be a whole number between 1 and 60000.** It was accepted as any
+  finite positive number and then floored, so `0.5` became a zero deadline that refuses every
+  legitimate delivery. Validated now, not repaired.
+
+- **The simulator defaults only on `undefined`.** `phone: null`, `phone: ""` and other falsy
+  runtime values were silently replaced with the default handset and dispatched, certifying that
+  production accepts values production rejects. They are now refused before any request goes out.
+
+### Fixed
+
+- The no-stream Web `Request` body fallback awaited an unbounded `arrayBuffer()` with no byte
+  bound and outside the body-read deadline. It now fails closed without a usable `Content-Length`
+  and races the read against the same deadline the streaming path uses.
+- Configured credentials no longer survive into base-URL configuration refusals. `safeUrl`
+  stripped userinfo but reproduced everything else verbatim, so an API key or webhook secret that
+  reached `baseUrl` by any other route landed in an ordinary `PaylodConfigError` message.
+- The non-canonical-lexeme refusal reproduced an unbounded, server-chosen lexeme in its message.
+  Bounded to 32 characters.
+- `simulate.outcome()` no longer coerces a malformed `webhookQueued` to `true`, which told callers
+  to wait for a reconciliation event that would never arrive.
+
+### Testing
+
+- A permanent adversarial sweep constructs every public object and every public error from a
+  hostile server response echoing both configured credentials in every string field at five
+  depths, and asserts neither appears in any serialization, message, `cause`, or nested field —
+  covering the class rather than its instances. It found the base-URL webhook-secret leak above.
+- 99 reverted-protection cases in `scripts/non-vacuity.mjs`, all caught. The Critical is certified
+  by seven independent mutations, including the cutoff itself, the fail-closed direction, and both
+  webhook entry points.
+
 ## 0.11.0
 
 The eighth independent review. Ten findings, four of them High, plus four cross-SDK roots checked

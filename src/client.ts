@@ -324,8 +324,16 @@ export class Paylod {
     );
     // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
     // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
-    assertSecureBaseUrl(this.#baseUrl, this.#apiKey, options.allowInsecureBaseUrl === true);
+    // RESOLVED BEFORE the base-URL check, so the signing secret is available to be scrubbed out
+    // of any refusal that check produces. It used to be resolved after, which meant a baseUrl
+    // carrying the webhook secret was refused with the secret quoted verbatim in the message.
     this.#webhookSecret = options.webhookSecret ?? env.PAYLOD_WEBHOOK_SECRET;
+    assertSecureBaseUrl(
+      this.#baseUrl,
+      this.#apiKey,
+      options.allowInsecureBaseUrl === true,
+      this.#webhookSecret ? [this.#webhookSecret] : [],
+    );
     // A broken timeout is worse than a long one. `setTimeout` clamps BOTH NaN and Infinity to fire
     // immediately, so `timeoutMs: Number(process.env.TIMEOUT)` with an unset env var would abort
     // every request the instant it started — and a charge that is genuinely in flight would come

@@ -114,12 +114,23 @@ export function assertSecureBaseUrl(
   baseUrl: string,
   apiKey: string,
   allowInsecure: boolean,
+  /**
+   * Every OTHER configured credential, so none of them can ride out in a refusal message either.
+   *
+   * The API key alone was not the whole set — found by the adversarial sweep, not by reasoning:
+   * `baseUrl: "https://paylod.dev/?t=<webhookSecret>"` is refused for its query string, and the
+   * refusal quoted the URL. Scrubbing only the key closed the larger half of the hole and left
+   * the signing secret — the credential that lets anyone forge events — in an ordinary
+   * `PaylodConfigError` message.
+   */
+  otherSecrets: readonly string[] = [],
 ): void {
+  const secrets = [apiKey, ...otherSecrets];
   let parsed: URL;
   try {
     parsed = new URL(baseUrl);
   } catch {
-    throw new PaylodConfigError(`baseUrl is not a valid URL: "${safeUrl(baseUrl, [apiKey])}".`);
+    throw new PaylodConfigError(`baseUrl is not a valid URL: "${safeUrl(baseUrl, secrets)}".`);
   }
 
   const isLive = apiKey.startsWith("mp_live_");
@@ -127,16 +138,16 @@ export function assertSecureBaseUrl(
 
   if (parsed.username !== "" || parsed.password !== "") {
     throw new PaylodConfigError(
-      `baseUrl must not embed credentials (got "${safeUrl(baseUrl, [apiKey])}"). A "user:pass@host" URL leaks those ` +
+      `baseUrl must not embed credentials (got "${safeUrl(baseUrl, secrets)}"). A "user:pass@host" URL leaks those ` +
         `credentials into logs and is a standard host-confusion trick.`,
     );
   }
   if (host === "") {
-    throw new PaylodConfigError(`baseUrl has no host: "${safeUrl(baseUrl, [apiKey])}".`);
+    throw new PaylodConfigError(`baseUrl has no host: "${safeUrl(baseUrl, secrets)}".`);
   }
   if (parsed.search !== "" || parsed.hash !== "") {
     throw new PaylodConfigError(
-      `baseUrl must not carry a query string or fragment (got "${safeUrl(baseUrl, [apiKey])}"). It is a path prefix; ` +
+      `baseUrl must not carry a query string or fragment (got "${safeUrl(baseUrl, secrets)}"). It is a path prefix; ` +
         `a trailing "?..." would corrupt every request path built from it.`,
     );
   }
@@ -151,7 +162,7 @@ export function assertSecureBaseUrl(
   // bearer key to whatever `fetch` made of them.
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopbackOptIn)) {
     throw new PaylodConfigError(
-      `baseUrl must use https:// (got protocol "${parsed.protocol}" in "${safeUrl(baseUrl, [apiKey])}"). ` +
+      `baseUrl must use https:// (got protocol "${parsed.protocol}" in "${safeUrl(baseUrl, secrets)}"). ` +
         `Plaintext HTTP would transmit your API key in the clear, and any other scheme ` +
         `(ftp, ws, gopher, file, data…) is not something this SDK will ever speak. Loopback HTTP ` +
         `(localhost, 127.0.0.1, ::1) is allowed ONLY with { allowInsecureBaseUrl: true } and ` +
@@ -162,7 +173,7 @@ export function assertSecureBaseUrl(
   if (isLoopback) {
     if (loopbackOptIn) return;
     throw new PaylodConfigError(
-      `baseUrl points at loopback ("${safeUrl(baseUrl, [apiKey])}"). That is allowed ONLY with ` +
+      `baseUrl points at loopback ("${safeUrl(baseUrl, secrets)}"). That is allowed ONLY with ` +
         `{ allowInsecureBaseUrl: true }, and NEVER with an mp_live_ key — a production ` +
         `credential must never be addressed to a local listener.`,
     );
@@ -170,19 +181,19 @@ export function assertSecureBaseUrl(
 
   if (!ALLOWED_HOSTS.has(host)) {
     throw new PaylodConfigError(
-      `baseUrl host "${host}" is not a paylod origin (got "${safeUrl(baseUrl, [apiKey])}"). Your API key is a bearer ` +
+      `baseUrl host "${host}" is not a paylod origin (got "${safeUrl(baseUrl, secrets)}"). Your API key is a bearer ` +
         `credential: it is sent on every request, so it may only ever be addressed to ` +
         `${[...ALLOWED_HOSTS].join(" or ")}. HTTPS alone does not make an arbitrary host safe.`,
     );
   }
   if (!ALLOWED_PORTS.has(parsed.port)) {
     throw new PaylodConfigError(
-      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${safeUrl(baseUrl, [apiKey])}").`,
+      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${safeUrl(baseUrl, secrets)}").`,
     );
   }
   if (isPrivateOrLoopbackHost(host)) {
     throw new PaylodConfigError(
-      `baseUrl must not point at a private, loopback or link-local address (got "${safeUrl(baseUrl, [apiKey])}").`,
+      `baseUrl must not point at a private, loopback or link-local address (got "${safeUrl(baseUrl, secrets)}").`,
     );
   }
 }
