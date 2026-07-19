@@ -486,7 +486,7 @@ export function parseCollectAck(
       redactBody(parsed),
       opts.idempotencyKey,
       true,
-      undefined,
+      salvagedPaymentId(),
     );
   };
 

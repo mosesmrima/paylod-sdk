@@ -3,6 +3,112 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.13.0
+
+The tenth independent review, and the first round worked against
+[`docs/SDK-CONFORMANCE.md`](https://github.com/mosesmrima/paylod-sdk) rather than against a
+findings list.
+
+That change of unit is the point of this release. Ten rounds produced 95 findings across the
+four paylod SDKs, and the dominant failure was never that a bug was hard to fix -- it was that a
+fix landing in one SDK never reached the other three. PHP closed the
+redaction-placeholder-as-receipt defect in round 9; round 10 found the identical defect still
+open in Node, Python and JVM. So the unit of work is now a shared specification, every
+requirement of which must hold and must have a non-vacuous test.
+
+### Breaking changes
+
+- **A receipt is now validated against a positive grammar: ten uppercase alphanumerics.**
+  Previously ANY nonblank string was settlement evidence, so `{"status":"success",
+  "mpesaReceipt":"[redacted]"}` with no result code was reported PAID. A credential echoed into
+  the receipt field, redacted by something upstream, left a placeholder that `hasReceipt` read as
+  proof of payment -- the sanitizer manufactured settlement out of a leak, which is strictly worse
+  than the leak. The grammar is derived from every real receipt in the paylod fixtures and is
+  shared with the sibling SDKs. It is a grammar and not a blocklist on purpose: `***`, `<hidden>`
+  and whatever the next sanitizer emits all fail it for free.
+
+  A `mpesaReceipt` that is present but not a valid receipt is now a refused body rather than a
+  silently nulled field.
+
+- **Server-issued identifiers get a positive grammar too.** `paymentId`, `checkoutRequestId` and
+  `applicationId` were non-emptiness checks on both the status and the signed-webhook path, so a
+  placeholder was returned to callers as an identifier -- one that correlates nothing, and that
+  every other redacted payment in the system also carries.
+
+- **A caller-supplied idempotency key that looks like sanitizer output is refused.** The hazard is
+  a key read back out of your own redacted logs: every redacted attempt shares one key, so two
+  payments collapse into one (a charge silently never made) or a retry replays against the wrong
+  attempt.
+
+- **An uncatalogued result code no longer resolves to a terminal failure.** A canonically-shaped
+  code the catalog has never heard of -- `77777` -- produced verdict `failed`, ending the wait on
+  a payment whose state nobody had established. The classifier is right to call that shape
+  `failed`, because it judges SHAPE; but what a record PROVES is a different question, and an
+  unrecognised code proves nothing. There is now a distinct `unknown` evidence kind resolving to
+  indeterminate under every claim. The verdict table is 3 x 6 = 18 cells.
+
+- **Duplicate money-critical members are refused.** `{"resultCode":1032,"resultCode":-0}` was
+  accepted; each spelling is individually canonical, so only a duplicate rule catches it. Which
+  copy a parser keeps is a parser detail, and no money verdict should depend on this SDK and the
+  sender answering that question the same way. Scoped per object, so the same name in two
+  different objects is still legal.
+
+- **Invalid UTF-8 is refused, never normalised.** Both the transport and the webhook path decoded
+  with replacement semantics, so two different wire payment ids differing only in invalid bytes
+  collapsed into one identical string and a correlation that should have failed succeeded against
+  the wrong payment. On the webhook path the strict decode runs AFTER the raw-byte HMAC, so
+  verification is unweakened.
+
+### Fixed
+
+- **The numeric-lexeme refusal no longer reproduces server bytes.** It interpolated up to 32 raw
+  characters, and the scan that produces them runs to a terminator the other side chooses -- so a
+  credential shorter than the bound appeared verbatim in the message, its stack, and the webhook
+  adapter's 400 response. It now names the SHAPE ("a fractional form"), computed locally.
+
+- **Credential SHAPES are redacted, not only configured values.** The redactor matched
+  `apiKey`/`webhookSecret` by exact string, so it could only ever protect against leaking your own
+  key: a rotated-out credential, a sibling service's key returned by a shared proxy, or an echoed
+  `Bearer` header passed through untouched. `mp_live_`, `mp_test_`, `whsec_`, `sk_` and `Bearer`
+  are now scrubbed whether or not they are configured.
+
+- **The public offline decoder redacts for itself.** `decodeDarajaResult` never touches the
+  network and is documented for logs and dashboards, so it had no redaction at all -- while
+  interpolating `resultDesc`, the field most likely to carry an echoed `Authorization` header. It
+  is now exported from a wrapper this SDK owns; the generated catalog file stays byte-identical to
+  the payment engine's copy.
+
+- **A refused collect acknowledgement keeps the payment id.** A malformed 202 discarded a
+  perfectly well-formed `paymentId`, leaving the caller told to "read the payment" with no handle
+  to read it by. It is salvaged under the same rules that would let it be returned: grammar first,
+  credential scan second.
+
+- **The signature header is length-bounded before it is split.** The body has been capped since
+  0.9.0; the header was the same unauthenticated input through the same anonymous request, and a
+  multi-megabyte value was tokenised into millions of segments before a byte was known to be
+  genuine.
+
+- **`t=01700000000` is refused.** The documented format is non-padded, and `t` is HMAC input, so a
+  padded spelling is one extra signed spelling of the same instant.
+
+- **Customer messages for codes 17, 26, 1025 and 9999 no longer invite a retry.** These carry
+  `retryable: false` -- they do not prove no debit occurred -- while their copy said "Please try
+  again". The canonical catalog had already been corrected; this SDK's vendored copy was stale and
+  nothing had propagated it, which is exactly the failure the specification exists to prevent.
+
+### Verification
+
+- The adversarial sweep now DEMANDS a declared outcome class per case (it previously accepted "a
+  result or any clean exception", so cases passed even if the successful path were removed) and
+  SELF-CHECKS that every public type was constructed.
+- The every-call idempotency warning is now proven against the BUILT artifact, in a separate
+  process, with the build run as part of the test -- it previously read a stale `dist/`.
+- Source files are checked for raw control bytes, after a NUL in a test file made the whole file
+  invisible to `grep`.
+- 16 new non-vacuity cases, four of them CONTROL-DIRECTION mutations that catch over-correction
+  rather than removal. Ten pre-existing cases were found to have stopped measuring anything and
+  were repaired.
+
 ## 0.12.0
 
 The ninth independent review. One Critical, one High, five Mediums and one Low.
