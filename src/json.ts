@@ -87,38 +87,88 @@ function decodeMemberName(rawBody: string): string {
 }
 
 /**
- * The most server-controlled text this refusal will reproduce.
+ * DESCRIBE THE OFFENDING LEXEME. DO NOT REPRODUCE IT. (spec 4.2)
  *
- * The lexeme is bytes the OTHER side chose, and the scan that produces it runs to the next
- * `,}] ` or whitespace — which an attacker controls, so the "number" can be arbitrarily long and
- * can contain anything but those terminators. Interpolating it whole put an unbounded,
- * attacker-chosen string into an exception message, which is the first thing a crash reporter
- * serialises. This is the Node instance of the Python sibling's round-9 Critical, where a NEW
- * refusal interpolated a raw server header and thereby printed a bearer token.
+ * The previous version interpolated up to 32 raw server-chosen characters into the refusal, and
+ * that was the round-10 High. The scan that produces a lexeme runs to the next `,}] ` or
+ * whitespace — terminators the OTHER side controls — so the "number" can contain anything else,
+ * including a credential. A short API key or webhook secret placed immediately after a numeric
+ * prefix appeared verbatim in the exception message, in its stack, and in the webhook adapter's
+ * 400 response. Truncating to 32 characters bounded the leak; it did not remove it, because a
+ * credential shorter than 32 characters fits inside the bound. This is the same shape as the
+ * Python sibling's round-9 Critical, where a NEW refusal interpolated a raw server header.
  *
- * 32 characters is far more than any real numeric spelling needs and short enough that no
- * credential survives the cut. This module is deliberately dependency-free and holds no
- * credentials of its own, so bounding is the control available here; the API path additionally
- * runs every message it emits through the client's redactor.
+ * This module is deliberately dependency-free — it holds no credentials, so it cannot redact
+ * against them, and a diagnostic here can never be routed through the client's redactor because
+ * it is thrown before the client sees the body. The only sound answer at this layer is to emit
+ * NO SERVER BYTES AT ALL.
+ *
+ * So the refusal names the SHAPE, computed by this SDK from the lexeme, never quoting it. The
+ * shape is what a developer actually needs — "it arrived with a fraction" localises the problem
+ * exactly as well as echoing `1032.0` does, and carries no attacker-chosen text.
  */
-const MAX_QUOTED_LEXEME = 32;
-
-function quoteServerText(s: string): string {
-  return s.length > MAX_QUOTED_LEXEME ? `${s.slice(0, MAX_QUOTED_LEXEME)}…` : s;
+function describeLexemeShape(lexeme: string): string {
+  if (lexeme === "") return "an empty token";
+  if (/^[+-]/.test(lexeme)) return "a signed form (a leading + or -)";
+  if (/^0[0-9]/.test(lexeme)) return "a zero-padded form";
+  if (lexeme.includes(".")) return "a fractional form (it contains a decimal point)";
+  if (/e/i.test(lexeme)) return "an exponent form";
+  if (/^0[xX]/.test(lexeme)) return "a hexadecimal form";
+  if (/^[0-9]+$/.test(lexeme)) return "an out-of-range integer form";
+  return "a non-numeric or otherwise non-canonical form";
 }
 
-function refuseLexeme(rawKey: string, rawLexeme: string): never {
-  const key = quoteServerText(rawKey);
-  const lexeme = quoteServerText(rawLexeme);
+/**
+ * The member name is NOT server text by the time it reaches here.
+ *
+ * `refuseLexeme` is only ever called after the decoded, lower-cased member name matched
+ * {@link MONEY_CRITICAL_KEYS}, so the name is one of this SDK's own two constants. Rendering the
+ * matched CONSTANT rather than the bytes that matched it means an escaped or oddly-cased
+ * spelling cannot smuggle anything into the message either.
+ */
+function refuseLexeme(matchedKey: string, rawLexeme: string): never {
+  const shape = describeLexemeShape(rawLexeme);
   throw new PaylodResponseTooLargeError(
-    `paylod's response spells \`${key}\` as the JSON number \`${lexeme}\`, which is not the ` +
-      `canonical integer form paylod emits. Different spellings of the same number — \`0.0\`, ` +
-      `\`0e999\`, \`1.032e3\` — all collapse onto one value once parsed, so accepting them would ` +
-      `let whoever produced this body choose the payment verdict (\`0\` is PAID; \`1032\` is a ` +
+    `paylod's response spells the \`${matchedKey}\` member as ${shape}, which is not the ` +
+      `canonical integer form paylod emits. The offending value is deliberately NOT reproduced ` +
+      `here: it is bytes the other side chose, and this refusal runs before any credential ` +
+      `redactor could see them. Different spellings of the same number — \`0.0\`, \`0e999\`, ` +
+      `\`1.032e3\` — all collapse onto one value once parsed, so accepting them would let ` +
+      `whoever produced this body choose the payment verdict (\`0\` is PAID; \`1032\` is a ` +
       `cancellation that reports RETRYABLE) through arithmetic rather than through the value. ` +
       `The body is refused before it is parsed. The request DID reach paylod, so the state of ` +
       `anything it may have changed is INDETERMINATE — read the payment rather than retrying, ` +
       `and never mint a fresh idempotency key on the strength of this error.`,
+  );
+}
+
+/**
+ * Members whose DUPLICATION decides money, in the sense of spec 2.3.
+ *
+ * Wider than {@link MONEY_CRITICAL_KEYS} because duplication is a different attack from
+ * spelling. `{"status":"failed","status":"success"}` needs no numeric trick at all: it needs
+ * only that the SDK and the sender disagree about which copy wins.
+ */
+const DUPLICATE_SENSITIVE_KEYS: ReadonlySet<string> = new Set([
+  "resultcode",
+  "errorcode",
+  "status",
+  "mpesareceipt",
+  "id",
+  "paymentid",
+  "checkoutrequestid",
+]);
+
+function refuseDuplicate(matchedKey: string): never {
+  throw new PaylodResponseTooLargeError(
+    `paylod's response declares the \`${matchedKey}\` member more than once in the same object. ` +
+      `Which duplicate a parser keeps is a PARSER DETAIL — last-wins for JSON.parse, first-wins ` +
+      `for others — and this SDK will not make a money decision that depends on agreeing with ` +
+      `the sender about it. \`{"resultCode":1032,"resultCode":0}\` would otherwise be a ` +
+      `cancellation or a settlement according to which end you ask. The body is refused before ` +
+      `it is parsed. The request DID reach paylod, so the state of anything it may have changed ` +
+      `is INDETERMINATE — read the payment rather than retrying, and never mint a fresh ` +
+      `idempotency key on the strength of this error.`,
   );
 }
 
@@ -141,6 +191,17 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
   let depth = 0;
   let i = 0;
   const n = text.length;
+
+  /**
+   * One set of already-seen member names PER OPEN OBJECT (spec 2.3).
+   *
+   * Duplication is only meaningful within a single object, so the sets are scoped rather than
+   * global: `{"a":{"status":"x"},"b":{"status":"y"}}` is two different members that happen to
+   * share a name, and refusing that would refuse ordinary bodies. A frame is pushed for arrays
+   * too, purely to keep the stack aligned with the bracket nesting — an array has no members, so
+   * its frame simply never gets written to.
+   */
+  const scopes: Array<Set<string>> = [new Set()];
 
   while (i < n) {
     const c = text[i];
@@ -171,7 +232,19 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
       if (text[k] !== ":") continue;
       i = k + 1;
 
-      if (!MONEY_CRITICAL_KEYS.has(decodeMemberName(rawBody).toLowerCase())) continue;
+      // ONE decode, used for BOTH rules. The name is compared after escape decoding (spec 2.2),
+      // so `status` is `status` to the duplicate rule exactly as it is to the parser.
+      const memberName = decodeMemberName(rawBody).toLowerCase();
+
+      // DUPLICATE DETECTION (spec 2.3), before the spelling rule — a second declaration is
+      // refused whatever it is spelt like, so a hostile value cannot hide behind a canonical one.
+      if (DUPLICATE_SENSITIVE_KEYS.has(memberName)) {
+        const scope = scopes[scopes.length - 1] as Set<string>;
+        if (scope.has(memberName)) refuseDuplicate(memberName);
+        scope.add(memberName);
+      }
+
+      if (!MONEY_CRITICAL_KEYS.has(memberName)) continue;
 
       // Find the value token. Only NUMBERS are our business here — a string-valued `resultCode`
       // keeps its spelling all the way to `canonicalCodeForm`, which already refuses `"0.0"`.
@@ -186,7 +259,8 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
       while (e < n && !NUMBER_TERMINATORS.includes(text[e] as string)) e++;
       const lexeme = text.slice(v, e);
       if (!CANONICAL_JSON_INTEGER_RE.test(lexeme)) {
-        refuseLexeme(decodeMemberName(rawBody), lexeme);
+        // The MATCHED CONSTANT, never the raw bytes that matched it (spec 4.2).
+        refuseLexeme(memberName, lexeme);
       }
       i = e;
       continue;
@@ -194,6 +268,7 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
 
     if (c === "{" || c === "[") {
       depth++;
+      scopes.push(new Set());
       if (depth > maxDepth) {
         throw new PaylodResponseTooLargeError(
           `paylod's response nests more than ${maxDepth} levels deep and was refused before it ` +
@@ -204,11 +279,44 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
       }
     } else if (c === "}" || c === "]") {
       depth--;
+      // Never pop the root frame: a body with unbalanced brackets is `JSON.parse`'s to reject,
+      // and this scan must not underflow on its way there.
+      if (scopes.length > 1) scopes.pop();
     }
     i++;
   }
 
   return JSON.parse(text);
+}
+
+/**
+ * DECODE BYTES TO TEXT, FATALLY. (spec 2.6)
+ *
+ * `new TextDecoder()` defaults to REPLACEMENT semantics: every byte it cannot make sense of
+ * becomes U+FFFD, silently. On a money path that is not a display concern, it is an identity
+ * collapse. Two DIFFERENT wire payment ids — differing only in bytes that are invalid UTF-8 —
+ * decode to the SAME string, so a correlation that should have failed succeeds against the wrong
+ * payment. The same applies to receipts and to anything downstream of an HMAC.
+ *
+ * `fatal: true` makes an undecodable body an error instead of a quiet normalisation. That is the
+ * honest answer: paylod emits UTF-8, so a body that is not UTF-8 did not come from paylod intact,
+ * and a body we cannot read exactly is a body we must not act on.
+ *
+ * The refusal names no bytes, for the same reason `refuseLexeme` names none.
+ */
+export function decodeUtf8Strict(bytes: Uint8Array, what: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new PaylodResponseTooLargeError(
+      `${what} is not valid UTF-8 and was refused rather than decoded with replacement ` +
+        `characters. Substituting U+FFFD would let two DIFFERENT wire values — payment ids, ` +
+        `receipts — collapse into one identical string, so a correlation that should fail would ` +
+        `instead succeed against the wrong payment. The request DID reach paylod, so the state ` +
+        `of anything it may have changed is INDETERMINATE — read the payment rather than ` +
+        `retrying, and never mint a fresh idempotency key on the strength of this error.`,
+    );
+  }
 }
 
 /**

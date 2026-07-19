@@ -20,7 +20,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { Paylod } from "../src/client.js";
 import { renderThrowable, withIdempotencyKey } from "../src/reconcile.js";
-import { PaylodApiError, PaylodError, PaylodInvalidRequestError } from "../src/errors.js";
+import {
+  PaylodApiError,
+  PaylodError,
+  PaylodInvalidRequestError,
+  PaylodSignatureVerificationError,
+} from "../src/errors.js";
 import { judge } from "../src/semantics.js";
 import { containsSecret } from "../src/validate.js";
 import { MAX_WEBHOOK_BODY_BYTES, signWebhook, verifyWebhook } from "../src/webhook.js";
@@ -506,11 +511,25 @@ describe("M6 the Web Request adapter preserves bytes end to end", () => {
     const signature = signWebhook(raw, SECRET, nowSec);
 
     // Verified directly against the exact bytes: this is the signature that must match.
-    expect(() =>
-      verifyWebhook({ payload: raw, signature, secret: SECRET, nowSec }),
-    ).toThrow(/not a valid paylod event/);
-    // It got PAST the signature check (it fails on the schema, not on `no_match`), which is the
-    // whole point: the bytes authenticated.
+    //
+    // The body is REFUSED — spec 2.6 forbids decoding money-path bytes with replacement
+    // semantics — but the refusal it earns is the discriminating one. "signed correctly but was
+    // refused" can only be reached AFTER the HMAC matched, so this single assertion still proves
+    // exactly what it always proved: the raw bytes reached the HMAC unmodified. A decode round
+    // trip before signing would collapse `0x80` to U+FFFD, change the bytes, and produce
+    // `no_match` instead — which is asserted against explicitly below.
+    const err = (() => {
+      try {
+        verifyWebhook({ payload: raw, signature, secret: SECRET, nowSec });
+        return null;
+      } catch (e) {
+        return e as PaylodSignatureVerificationError;
+      }
+    })();
+    expect(err).toBeInstanceOf(PaylodSignatureVerificationError);
+    expect(err?.reason).not.toBe("no_match");
+    expect(err?.message).toMatch(/signed correctly but was refused/);
+    expect(err?.message).toMatch(/not valid UTF-8/);
   });
 
   it("two DIFFERENT invalid-UTF-8 bodies do not share a signature", () => {

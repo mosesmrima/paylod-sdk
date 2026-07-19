@@ -18,7 +18,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodResponseTooLargeError, PaylodSignatureVerificationError } from "./errors.js";
 import { isValidIdentifier, isValidReceipt } from "./grammar.js";
-import { parseBounded } from "./json.js";
+import { decodeUtf8Strict, parseBounded } from "./json.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
 import { judge } from "./semantics.js";
 import { asPaymentStatus, asWireResultCode, containsSecret, PAYMENT_STATUSES } from "./validate.js";
@@ -144,8 +144,15 @@ const V1_RE = /^[0-9a-f]{64}$/;
  * A well-formed `t` is bare decimal digits — unix seconds, never signed, never in exponent or hex
  * notation, never padded. 15 digits is the ceiling: it keeps every accepted value below
  * Number.MAX_SAFE_INTEGER (and 15 digits of seconds is already ~31 million years out).
+ *
+ * The NON-PADDED half of that sentence used to be a comment rather than a rule: `^\d{1,15}$`
+ * accepted `t=01700000000`, and the doc claimed it did not. Padding is not cosmetic on a signed
+ * header — `t` is an input to the HMAC, so a padded spelling is a DIFFERENT signed string that
+ * denotes the same instant, which is one more spelling of a replayed timestamp than the
+ * canonical form allows. The alternation admits bare `0` and any unpadded positive integer, and
+ * nothing else.
  */
-const TIMESTAMP_RE = /^\d{1,15}$/;
+const TIMESTAMP_RE = /^(?:0|[1-9]\d{0,14})$/;
 
 /**
  * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and nothing else that
@@ -318,7 +325,10 @@ export function verifyWebhookSignature(params: VerifyParams): unknown {
   // fulfilled for a payment that never settled. The API path refused exactly that spelling.
   let decodedBody: unknown;
   try {
-    decodedBody = parseBounded(raw.toString("utf8"));
+    // FATAL decode (spec 2.6), then the shared parser. The HMAC has already run over the RAW
+    // BYTES above, so refusing here cannot weaken verification — it only stops an undecodable
+    // body from being normalised into a valid-looking one after the signature has passed.
+    decodedBody = parseBounded(decodeUtf8Strict(raw, "the webhook body"));
   } catch (e) {
     throw new PaylodSignatureVerificationError(
       "invalid_payload",

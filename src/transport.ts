@@ -34,7 +34,7 @@ import {
   PaylodSecurityError,
   PaylodTerminalTransportError,
 } from "./errors.js";
-import { stringifyBounded } from "./json.js";
+import { decodeUtf8Strict, stringifyBounded } from "./json.js";
 
 /** The one origin family a paylod key may ever be addressed to. */
 export const ALLOWED_HOSTS = new Set(["paylod.dev", "api.paylod.dev"]);
@@ -446,7 +446,8 @@ export class Transport {
       joined.set(c, at);
       at += c.byteLength;
     }
-    return new TextDecoder().decode(joined);
+    // FATAL, not replacement (spec 2.6). See `decodeUtf8Strict`.
+    return decodeUtf8Strict(joined, "paylod's response body");
   }
 
   #tooLarge(): PaylodResponseTooLargeError {
