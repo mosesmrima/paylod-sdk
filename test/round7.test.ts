@@ -362,7 +362,7 @@ describe("H4 onPoll promises are awaited under the deadline", () => {
       { status: 200, json: { id: "pay_123", status: "pending" } },
       {
         status: 200,
-        json: { id: "pay_123", status: "success", mpesaReceipt: "SFF6", resultCode: 0 },
+        json: { id: "pay_123", status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 },
       },
     ]);
 
@@ -431,7 +431,7 @@ describe("H4 onPoll promises are awaited under the deadline", () => {
       { status: 200, json: { id: "pay_123", status: "pending" } },
       {
         status: 200,
-        json: { id: "pay_123", status: "success", mpesaReceipt: "SFF6", resultCode: 0 },
+        json: { id: "pay_123", status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 },
       },
     ]);
     await client(m.fetch).wait("pay_123", {

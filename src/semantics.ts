@@ -53,6 +53,7 @@
  */
 
 import { classifyStkResult } from "./daraja-catalog.js";
+import { isValidReceipt } from "./grammar.js";
 import type { Payment } from "./types.js";
 
 /**
@@ -96,9 +97,21 @@ export interface PaymentJudgement {
   readonly reason: string;
 }
 
-/** A receipt counts only if it is a non-blank string. `""` and `"   "` prove nothing. */
+/**
+ * A receipt counts only if it MATCHES THE RECEIPT GRAMMAR — ten uppercase alphanumerics.
+ *
+ * This was a non-emptiness test (`trim() !== ""`), and that is the round-10 High. `""` and
+ * `"   "` proved nothing, correctly — but so did `"[redacted]"`, and that one came back TRUE.
+ * A credential echoed into `mpesaReceipt`, redacted by something upstream, left a nonblank
+ * placeholder that this function read as settlement evidence: `{status:"success",
+ * mpesaReceipt:"[redacted]"}` with no result code was reported PAID. The sanitizer manufactured
+ * proof of payment out of a leak.
+ *
+ * A positive grammar refuses every placeholder, including the ones nobody has invented yet.
+ * See `grammar.ts` for why this is not a blocklist.
+ */
 export function hasReceipt(payment: Pick<Payment, "mpesaReceipt">): boolean {
-  return typeof payment.mpesaReceipt === "string" && payment.mpesaReceipt.trim() !== "";
+  return isValidReceipt(payment.mpesaReceipt);
 }
 
 /** A result code is "present" if it is neither null nor undefined. `0` is present and meaningful. */

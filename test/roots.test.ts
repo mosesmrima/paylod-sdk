@@ -173,7 +173,7 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
 
   it.each([
     // claim      evidence                                          expected verdict
-    ["success with a receipt", { status: "success", mpesaReceipt: "SFF6" }, "paid"],
+    ["success with a receipt", { status: "success", mpesaReceipt: "SFF6XYZ123" }, "paid"],
     ["success with code zero", { status: "success", resultCode: 0 }, "paid"],
     ["success with no evidence", { status: "success" }, "indeterminate"],
     ["success with a failure code", { status: "success", resultCode: 1032 }, "indeterminate"],
@@ -181,7 +181,7 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
     ["pending with no evidence", { status: "pending" }, "in_flight"],
     ["pending with a pending code", { status: "pending", resultCode: 4999 }, "in_flight"],
     ["a pending row carrying code zero", { status: "pending", resultCode: 0 }, "indeterminate"],
-    ["pending with a receipt", { status: "pending", mpesaReceipt: "SFF6" }, "indeterminate"],
+    ["pending with a receipt", { status: "pending", mpesaReceipt: "SFF6XYZ123" }, "indeterminate"],
     ["pending with a failure code", { status: "pending", resultCode: 1032 }, "indeterminate"],
     // ROUND 7: an unbacked `failed` claim is INDETERMINATE, not a terminal failure. `failed`
     // stops `wait()` polling and is what `verifyWebhook` requires before delivering a
@@ -190,11 +190,11 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
     ["failed with no evidence", { status: "failed" }, "indeterminate"],
     ["failed with a failure code", { status: "failed", resultCode: 2001 }, "failed"],
     ["failed with a pending code", { status: "failed", resultCode: 4999 }, "in_flight"],
-    ["failed with a receipt", { status: "failed", mpesaReceipt: "SFF6" }, "indeterminate"],
+    ["failed with a receipt", { status: "failed", mpesaReceipt: "SFF6XYZ123" }, "indeterminate"],
     ["failed with code zero", { status: "failed", resultCode: 0 }, "indeterminate"],
     [
       "failed with a receipt and a cancel code",
-      { status: "failed", mpesaReceipt: "SFF6", resultCode: 1032 },
+      { status: "failed", mpesaReceipt: "SFF6XYZ123", resultCode: 1032 },
       "indeterminate",
     ],
   ])("verdict for %s is %s", (_label, over, expected) => {
@@ -205,9 +205,9 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
 
   it("L2: paid ALWAYS has success evidence (a receipt or code 0)", () => {
     const paidCases: Partial<Payment>[] = [
-      { status: "success", mpesaReceipt: "SFF6" },
+      { status: "success", mpesaReceipt: "SFF6XYZ123" },
       { status: "success", resultCode: 0 },
-      { status: "success", mpesaReceipt: "SFF6", resultCode: 0 },
+      { status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 },
     ];
     for (const c of paidCases) expect(judge(p(c)).verdict).toBe("paid");
     // and a success claim with nothing behind it is never paid
@@ -223,7 +223,7 @@ describe("ROOT 2 — the claim/evidence verdict table", () => {
   it("L4: a receipt forces success or indeterminate, never failed and never in flight", () => {
     for (const status of ["pending", "success", "failed"] as const) {
       for (const resultCode of [null, 0, 1032, 4999, 2001]) {
-        const v = judge(p({ status, mpesaReceipt: "SFF6", resultCode })).verdict;
+        const v = judge(p({ status, mpesaReceipt: "SFF6XYZ123", resultCode })).verdict;
         expect(["paid", "indeterminate"]).toContain(v);
       }
     }
@@ -235,7 +235,7 @@ describe("ROOT 2 — indeterminate is never a retryable failure (L3)", () => {
     // The worst pre-0.7.0 defect: this returned status "cancelled" with retryable:true, telling
     // a merchant it was safe to charge again for a payment carrying an M-Pesa receipt.
     const { paylod } = client([
-      { status: 200, json: payment({ status: "failed", mpesaReceipt: "SFF6", resultCode: 1032 }) },
+      { status: 200, json: payment({ status: "failed", mpesaReceipt: "SFF6XYZ123", resultCode: 1032 }) },
     ]);
     const out = await paylod.check("pay_123");
     expect(out.paid).toBe(false);
@@ -254,11 +254,11 @@ describe("ROOT 2 — indeterminate is never a retryable failure (L3)", () => {
 
   it("a genuine success is still paid, and still renders a receipt", async () => {
     const { paylod } = client([
-      { status: 200, json: payment({ status: "success", resultCode: 0, mpesaReceipt: "SFF6" }) },
+      { status: 200, json: payment({ status: "success", resultCode: 0, mpesaReceipt: "SFF6XYZ123" }) },
     ]);
     const out = await paylod.check("pay_123");
     expect(out.paid).toBe(true);
-    expect(out.receipt).toBe("SFF6");
+    expect(out.receipt).toBe("SFF6XYZ123");
   });
 });
 
@@ -275,7 +275,7 @@ describe("ROOT 2 — ID binding", () => {
 
   it("a wrong-payment body can never be reported as paid", async () => {
     const { paylod } = client([
-      { status: 200, json: payment({ id: "pay_other", status: "success", resultCode: 0, mpesaReceipt: "SFF6" }) },
+      { status: 200, json: payment({ id: "pay_other", status: "success", resultCode: 0, mpesaReceipt: "SFF6XYZ123" }) },
     ]);
     await expect(paylod.check("pay_123")).rejects.toThrow(PaylodApiError);
   });
@@ -503,7 +503,7 @@ describe("webhook — the full event schema is validated, not cast", () => {
   it("rejects a payment.failed that carries a receipt", () => {
     expect(() =>
       verify(
-        { ...goodSuccess, status: "failed", mpesaReceipt: "SFF6", resultCode: 1032 },
+        { ...goodSuccess, status: "failed", mpesaReceipt: "SFF6XYZ123", resultCode: 1032 },
         "payment.failed",
       ),
     ).toThrow(PaylodSignatureVerificationError);
@@ -535,7 +535,7 @@ describe("webhook adapters — no handler detail on the wire, and a bounded body
         amount: 100,
         phone: "254712345678",
         accountRef: null,
-        mpesaReceipt: "SFF6",
+        mpesaReceipt: "SFF6XYZ123",
         checkoutRequestId: "ws_1",
         resultCode: 0,
         resultDesc: "ok",

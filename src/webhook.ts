@@ -17,6 +17,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PaylodResponseTooLargeError, PaylodSignatureVerificationError } from "./errors.js";
+import { isValidIdentifier, isValidReceipt } from "./grammar.js";
 import { parseBounded } from "./json.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
 import { judge } from "./semantics.js";
@@ -490,8 +491,12 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
   }
   const d = e.data as Record<string, unknown>;
 
-  if (typeof d.paymentId !== "string" || d.paymentId.trim() === "") {
-    invalid("data.paymentId is missing or empty");
+  // POSITIVE GRAMMAR (spec 3.4), not a non-emptiness test. A signed event is authenticated, not
+  // trusted: the signature proves who sent the bytes, never that a sanitizer did not rewrite a
+  // field on the way. `[redacted]` used to arrive as `event.data.paymentId` and be handed to a
+  // handler that routes on it.
+  if (!isValidIdentifier(d.paymentId)) {
+    invalid("data.paymentId is missing, empty or not a usable identifier");
   }
   if (typeof d.status !== "string" || !PAYMENT_STATUSES.includes(d.status)) {
     invalid(
@@ -503,10 +508,30 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
     invalid(`data.env was ${JSON.stringify(d.env)}, expected sandbox or production`);
   }
   requiredString(d.applicationId, "data.applicationId");
+  if (!isValidIdentifier(d.applicationId)) {
+    invalid("data.applicationId is not a usable identifier");
+  }
   requiredString(d.phone, "data.phone");
   optionalString(d.accountRef, "data.accountRef");
   optionalString(d.mpesaReceipt, "data.mpesaReceipt");
+  // A receipt on a signed event obeys the SAME grammar as one from the status endpoint (spec
+  // 3.3). Absent is fine; present-but-not-a-receipt is a body we do not understand, and on this
+  // path it is also the exact shape that forged a `payment.success`.
+  if (
+    typeof d.mpesaReceipt === "string" &&
+    d.mpesaReceipt.trim() !== "" &&
+    !isValidReceipt(d.mpesaReceipt)
+  ) {
+    invalid("data.mpesaReceipt is present but is not a valid M-Pesa receipt");
+  }
   optionalString(d.checkoutRequestId, "data.checkoutRequestId");
+  if (
+    d.checkoutRequestId !== undefined &&
+    d.checkoutRequestId !== null &&
+    !isValidIdentifier(d.checkoutRequestId)
+  ) {
+    invalid("data.checkoutRequestId is not a usable identifier");
+  }
   optionalString(d.resultDesc, "data.resultDesc");
   if (
     d.resultCode !== undefined &&
@@ -612,8 +637,10 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
       amount: d.amount as number,
       phone: d.phone as string,
       accountRef: typeof d.accountRef === "string" ? d.accountRef : null,
-      mpesaReceipt: typeof d.mpesaReceipt === "string" ? d.mpesaReceipt : null,
-      checkoutRequestId: typeof d.checkoutRequestId === "string" ? d.checkoutRequestId : null,
+      // Grammar-gated, matching the status path exactly: the two surfaces must not disagree
+      // about what a receipt or an identifier is.
+      mpesaReceipt: isValidReceipt(d.mpesaReceipt) ? d.mpesaReceipt : null,
+      checkoutRequestId: isValidIdentifier(d.checkoutRequestId) ? d.checkoutRequestId : null,
       resultCode: asWireResultCode(d.resultCode),
       resultDesc: typeof d.resultDesc === "string" ? d.resultDesc : null,
       decoded,

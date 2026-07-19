@@ -53,21 +53,21 @@ describe("fix 1 — raw status never overrides the classifier", () => {
   const p = (over: Partial<Payment>): Payment => payment(over);
 
   it("code 4999 (pending) with status:success is NOT reported as paid", () => {
-    const o = toOutcome(p({ status: "success", resultCode: 4999 as never, mpesaReceipt: "X" }));
+    const o = toOutcome(p({ status: "success", resultCode: 4999 as never, mpesaReceipt: "SFF6XYZ123" }));
     expect(o.paid).toBe(false);
     expect(o.status).toBe("pending");
     expect(o.retryable).toBe(false);
   });
 
   it("code 1032 (cancel/fail) with status:success is contradictory → indeterminate, not paid", () => {
-    const o = toOutcome(p({ status: "success", resultCode: 1032, mpesaReceipt: "X" }));
+    const o = toOutcome(p({ status: "success", resultCode: 1032, mpesaReceipt: "SFF6XYZ123" }));
     expect(o.paid).toBe(false);
     expect(o.retryable).toBe(false); // an indeterminate charge is never "safe to charge again"
     expect(o.receipt).toBeNull();
   });
 
   it("code 0 (success) with status:failed is contradictory → NOT paid", () => {
-    const o = toOutcome(p({ status: "failed", resultCode: 0, mpesaReceipt: "X" }));
+    const o = toOutcome(p({ status: "failed", resultCode: 0, mpesaReceipt: "SFF6XYZ123" }));
     expect(o.paid).toBe(false);
   });
 

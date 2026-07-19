@@ -13,6 +13,7 @@
 import { randomUUID } from "node:crypto";
 
 import { PaylodApiError, PaylodInvalidRequestError } from "./errors.js";
+import { isValidIdentifier, isValidReceipt, looksSanitized } from "./grammar.js";
 import { MAX_JSON_DEPTH } from "./json.js";
 import type { CollectAckWire, Payment, PaymentStatus, WireResultCode } from "./types.js";
 
@@ -110,6 +111,24 @@ export function assertValidIdempotencyKey(key: string, what = "idempotencyKey"):
     throw new PaylodInvalidRequestError(
       `${what} must not contain Unicode whitespace or zero-width characters - they are ` +
         "invisible in logs, so two visually identical keys can silently be different keys.",
+    );
+  }
+  // A SANITIZER'S OUTPUT IS NOT AN IDEMPOTENCY KEY (spec 3.4).
+  //
+  // This key is opaque by design — a UUID, an attempt's primary key — so it gets no positive
+  // grammar. The hazard it needs closing against is a caller who reads a key back out of their
+  // own REDACTED logs and replays it. `[redacted]` is printable ASCII with no spaces, so every
+  // other check here waves it through, and then EVERY redacted attempt in the system shares one
+  // key: two distinct payments collapse into one (a charge silently never made), or a retry
+  // replays against a record that is not the original attempt. That is the double-charge guard
+  // failing in the direction that looks like it is working.
+  if (looksSanitized(key)) {
+    throw new PaylodInvalidRequestError(
+      `${what} looks like the output of a redactor or log sanitizer, not a real key. A ` +
+        "placeholder is SHARED by every redacted attempt in your system, so two different " +
+        "payments would collapse onto one key — a charge silently never made — while a retry " +
+        "would replay against an attempt that is not the original. Pass the real key you " +
+        "persisted when the customer pressed Pay, not a value recovered from a redacted log.",
     );
   }
   // Bound the BYTE length, not the UTF-16 code-unit count: the key goes out as bytes in a header,
@@ -435,6 +454,23 @@ export function parseCollectAck(
   const what = opts.what ?? "paylod";
   const redactBody = opts.redactBody ?? identity;
   const safe = (v: unknown) => sanitizeForMessage(v, opts.redactText ?? identityText);
+  /**
+   * THE PAYMENT ID THAT SURVIVES A REFUSAL (spec 5.4).
+   *
+   * The body is being refused, so nothing in it is trusted — but "not trusted" is not the same
+   * as "not useful". A `paymentId` that satisfies the identifier grammar and carries none of
+   * this client's credentials is the handle the caller needs to reconcile a charge that may
+   * already be live, and discarding it left them with an idempotency key and no way to look the
+   * payment up. It is recovered under exactly the same rules that would let it be returned on
+   * the success path: positive grammar first, credential scan second.
+   */
+  const salvagedPaymentId = (): string | undefined => {
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const candidate = (parsed as Record<string, unknown>).paymentId;
+    if (!isValidIdentifier(candidate)) return undefined;
+    if (containsSecret(candidate, opts.secrets ?? [])) return undefined;
+    return candidate;
+  };
   const indeterminate = (detail: string): never => {
     throw new PaylodApiError(
       `${what} returned a response that is not a valid collect acknowledgement (${detail}) — ` +
@@ -450,6 +486,7 @@ export function parseCollectAck(
       redactBody(parsed),
       opts.idempotencyKey,
       true,
+      salvagedPaymentId(),
     );
   };
 
@@ -469,8 +506,14 @@ export function parseCollectAck(
   if (parsed === null || typeof parsed !== "object") return indeterminate("the body is not an object");
   const ack = parsed as Record<string, unknown>;
 
-  if (!nonEmptyString(ack.paymentId)) return indeterminate("no paymentId");
-  if (!nonEmptyString(ack.checkoutRequestId)) return indeterminate("no checkoutRequestId");
+  // POSITIVE GRAMMAR, not a non-emptiness test (spec 3.4). `[redacted]` is a nonblank string and
+  // used to be returned to the caller as a `paymentId` — an identifier that correlates nothing,
+  // and one that every OTHER redacted payment in the system also carries, so a caller keying
+  // their records on it binds them to the wrong payment. See `grammar.ts`.
+  if (!isValidIdentifier(ack.paymentId)) return indeterminate("no usable paymentId");
+  if (!isValidIdentifier(ack.checkoutRequestId)) {
+    return indeterminate("no usable checkoutRequestId");
+  }
   // `status` is a HARDCODED LITERAL "pending" on the backend, present on every 202 — including an
   // idempotent REPLAY, which returns the stored original ack rather than the current settled
   // state. So there is no legitimate ack carrying a settled status, and no legitimate ack missing
@@ -565,7 +608,10 @@ export function parsePaymentBody(
 
   if (parsed === null || typeof parsed !== "object") return bad("the body is not an object");
   const p = parsed as Record<string, unknown>;
-  if (!nonEmptyString(p.id)) return bad("no payment id");
+  // Positive grammar, same rule and same reason as the collect ack (spec 3.4). This one also
+  // guards the BINDING check below: a placeholder id compared against a placeholder expectation
+  // would "match", so binding on an unvalidated identifier is binding on nothing.
+  if (!isValidIdentifier(p.id)) return bad("no usable payment id");
 
   // ID BINDING. Checked before anything else about the record's CONTENTS, because if this fails
   // then every remaining field describes some other payment and reasoning about them is not just
@@ -583,6 +629,20 @@ export function parsePaymentBody(
   }
   if (p.mpesaReceipt !== undefined && p.mpesaReceipt !== null && typeof p.mpesaReceipt !== "string") {
     return bad("mpesaReceipt is neither a string nor null");
+  }
+  // A receipt is either ABSENT or a REAL RECEIPT — there is no third state (spec 3.3).
+  //
+  // `hasReceipt` already refuses a placeholder as evidence, so this check is not what stops the
+  // false-paid verdict. It stops the quieter half: a nonblank non-receipt is a body this SDK
+  // does not understand, and silently normalising it to `null` would hand the caller a public
+  // `Payment` asserting no receipt exists when the server said something we could not read.
+  // Refusing is the honest answer, and it keeps a placeholder out of the public object entirely.
+  if (
+    typeof p.mpesaReceipt === "string" &&
+    p.mpesaReceipt.trim() !== "" &&
+    !isValidReceipt(p.mpesaReceipt)
+  ) {
+    return bad("mpesaReceipt is present but is not a valid M-Pesa receipt");
   }
   if (
     p.resultCode !== undefined &&
@@ -628,7 +688,7 @@ export function parsePaymentBody(
   return {
     id: p.id,
     status: p.status as PaymentStatus,
-    mpesaReceipt: typeof p.mpesaReceipt === "string" ? p.mpesaReceipt : null,
+    mpesaReceipt: isValidReceipt(p.mpesaReceipt) ? p.mpesaReceipt : null,
     resultCode: asWireResultCode(p.resultCode),
     resultDesc: typeof p.resultDesc === "string" ? p.resultDesc : null,
   };

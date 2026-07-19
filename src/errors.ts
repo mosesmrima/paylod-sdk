@@ -79,6 +79,19 @@ export class PaylodApiError extends PaylodError {
    * signal — read the status with {@link idempotencyKey}, do NOT blindly retry with a new key.
    */
   readonly indeterminate: boolean;
+  /**
+   * The payment id, when the offending body carried a USABLE one (spec 5.4).
+   *
+   * A malformed 202 is the worst case this SDK has: the charge was acknowledged, so it may well
+   * be live, and the body is one we refuse to trust. Refusing it used to discard the whole body
+   * INCLUDING a `paymentId` that was perfectly well-formed — so the caller was told "read the
+   * payment" while the handle needed to read it had just been thrown away, leaving only the
+   * idempotency key. Both handles survive every failure path after acknowledgement now.
+   *
+   * It is attached only when it satisfies the identifier grammar AND is credential-clean, so a
+   * placeholder or an echoed key can never arrive here (spec 3.4).
+   */
+  override readonly paymentId?: string | undefined;
 
   constructor(
     message: string,
@@ -86,12 +99,14 @@ export class PaylodApiError extends PaylodError {
     body: unknown,
     idempotencyKey?: string | undefined,
     indeterminate = false,
+    paymentId?: string | undefined,
   ) {
     super(message);
     this.status = status;
     this.body = body;
     this.idempotencyKey = idempotencyKey;
     this.indeterminate = indeterminate;
+    this.paymentId = paymentId;
   }
 
   /** 401 — the API key is missing or invalid. */

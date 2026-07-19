@@ -514,8 +514,8 @@ describe("collectAndWait", () => {
     const m = mockFetch([
       { status: 202, json: ACK },
       { json: payment({ status: "pending" }) },
-      { json: payment({ status: "success", mpesaReceipt: "R1", resultCode: 0 }) },
-      { json: payment({ status: "success", mpesaReceipt: "R1", resultCode: 0 }) },
+      { json: payment({ status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 }) },
+      { json: payment({ status: "success", mpesaReceipt: "SFF6XYZ123", resultCode: 0 }) },
     ]);
     const paylod = new Paylod({ apiKey: KEY, fetch: m.fetch, allowCustomFetch: true, maxRetries: 0 });
     await withFakeClock(() => paylod.collectAndWait({ idempotencyKey: "t-8", amount: 1, phone: "0712345678" }));
