@@ -174,8 +174,24 @@ describe("spec 6.5 — the signature header is length-bounded before it is split
     nowSec: 1_700_000_000,
   };
 
+  /**
+   * THE FIXTURE MUST BE VALID IN EVERY WAY EXCEPT LENGTH (spec 8.5).
+   *
+   * The first draft padded with repeated `v1=` segments, which `parseHeader` rejects as a
+   * DUPLICATE regardless of any length rule — so it passed with the bound removed and proved
+   * nothing. This header carries exactly one `t`, exactly one correct `v1`, and pads with
+   * UNKNOWN keys, which the parser deliberately ignores for forward-compatibility. Without the
+   * bound it therefore parses cleanly and the signature MATCHES; the only thing that can refuse
+   * it is the length rule.
+   */
+  const paddedButOtherwiseValid = (): string => {
+    const real = signWebhook(base.payload as string, SECRET, base.nowSec as number);
+    const padding = ",x=1".repeat(MAX_SIGNATURE_HEADER_CHARS);
+    return `${real}${padding}`;
+  };
+
   it("refuses an oversized signature header instead of tokenising it", () => {
-    const huge = `t=1,${"v1=x,".repeat(MAX_SIGNATURE_HEADER_CHARS)}`;
+    const huge = paddedButOtherwiseValid();
     expect(huge.length).toBeGreaterThan(MAX_SIGNATURE_HEADER_CHARS);
     const err = (() => {
       try {
@@ -186,7 +202,25 @@ describe("spec 6.5 — the signature header is length-bounded before it is split
       }
     })();
     expect(err).toBeInstanceOf(PaylodSignatureVerificationError);
-    // Refused at the header, never at the HMAC.
+    // Refused AT THE HEADER. Without the bound this same header parses and its signature
+    // matches, so it would get all the way to the event schema instead.
+    expect(err?.reason).toBe("malformed_signature");
+  });
+
+  it("the fixture discriminates: the same header UNDER the bound is accepted by the parser", () => {
+    // Identical shape, short enough to pass. It gets past the header and the HMAC, failing later
+    // on the event schema -- which is what the oversized one would do without the length rule.
+    const short = `${signWebhook(base.payload as string, SECRET, base.nowSec as number)},x=1`;
+    expect(short.length).toBeLessThan(MAX_SIGNATURE_HEADER_CHARS);
+    const err = (() => {
+      try {
+        verifyWebhook({ ...base, signature: short });
+        return null;
+      } catch (e) {
+        return e as PaylodSignatureVerificationError;
+      }
+    })();
+    expect(err?.reason).not.toBe("malformed_signature");
     expect(err?.reason).not.toBe("no_match");
   });
 

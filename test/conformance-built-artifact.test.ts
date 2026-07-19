@@ -18,18 +18,28 @@ import { describe, expect, it } from "vitest";
 const DIST = new URL("../dist/index.js", import.meta.url).pathname;
 
 /**
- * Build once, on demand. The test is skipped rather than failed when the artifact is missing and
- * cannot be produced, because a missing `dist/` is a build problem, not a conformance one — but
- * a PRESENT `dist/` that behaves differently from source is exactly what this file exists to
- * catch, and that is never skipped.
+ * ALWAYS REBUILD, never reuse whatever `dist/` happens to be lying around.
+ *
+ * This looked like a pointless couple of seconds and is in fact what makes the test mean
+ * anything. The first version built only when `dist/` was ABSENT — so the artifact under test
+ * was whatever the last build produced, with no relationship to the current `src/`. The
+ * non-vacuity harness proved it: reverting the every-call warning IN SOURCE left the test
+ * passing, because the test was reading a stale `dist/` the mutation never touched. A test
+ * pinned to an artifact nobody rebuilds is a test of a fossil.
+ *
+ * Rebuilding ties the assertion to the current source, which is the whole point: the failure
+ * mode being guarded is a BUILD-TIME one, so the build has to be part of the test.
+ *
+ * The test is skipped rather than failed when the build cannot run at all, because that is a
+ * toolchain problem and not a conformance one — but a `dist/` that behaves differently from
+ * `src/` is never skipped.
  */
 function ensureBuilt(): boolean {
-  if (existsSync(DIST)) return true;
   try {
     execFileSync("npm", ["run", "build"], { stdio: "pipe", timeout: 180_000 });
     return existsSync(DIST);
   } catch {
-    return false;
+    return existsSync(DIST) ? false : false;
   }
 }
 

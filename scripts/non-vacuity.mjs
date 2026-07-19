@@ -368,6 +368,14 @@ const CASES = [
     file: "src/webhook.ts",
     find: '  requiredString(d.applicationId, "data.applicationId");',
     replace: '  optionalString(d.applicationId, "data.applicationId");',
+    // ROUND 11: spec 3.4 added an identifier-grammar check on the same field, which catches a
+    // missing applicationId on its own -- so reverting the required check alone stopped removing
+    // the guarantee. Both layers go.
+    also: {
+      file: "src/webhook.ts",
+      find: "  if (!isValidIdentifier(d.applicationId)) {",
+      replace: "  if (false) {",
+    },
     test: "rejects a missing applicationId",
   },
   {
@@ -520,7 +528,7 @@ const CASES = [
     find: `  return {
     id: p.id,
     status: p.status as PaymentStatus,
-    mpesaReceipt: typeof p.mpesaReceipt === "string" ? p.mpesaReceipt : null,
+    mpesaReceipt: isValidReceipt(p.mpesaReceipt) ? p.mpesaReceipt : null,
     resultCode: asWireResultCode(p.resultCode),
     resultDesc: typeof p.resultDesc === "string" ? p.resultDesc : null,
   };`,
@@ -669,7 +677,7 @@ const CASES = [
     id: "R8-lexeme",
     what: "JSON numbers are parsed without the money-critical lexeme check",
     file: "src/json.ts",
-    find: "      if (!CANONICAL_JSON_INTEGER_RE.test(lexeme)) {\n        refuseLexeme(decodeMemberName(rawBody), lexeme);\n      }",
+    find: "      if (!CANONICAL_JSON_INTEGER_RE.test(lexeme)) {\n        // The MATCHED CONSTANT, never the raw bytes that matched it (spec 4.2).\n        refuseLexeme(memberName, lexeme);\n      }",
     replace: "      void lexeme;",
     test: "refuses a status body whose resultCode is spelt 1032.0",
   },
@@ -685,7 +693,7 @@ const CASES = [
     id: "R8-webhook-parse",
     what: "the signed webhook path goes back to a bare JSON.parse",
     file: "src/webhook.ts",
-    find: "    decodedBody = parseBounded(raw.toString(\"utf8\"));",
+    find: "    decodedBody = parseBounded(decodeUtf8Strict(raw, \"the webhook body\"));",
     replace: "    decodedBody = JSON.parse(raw.toString(\"utf8\"));",
     test: "a laundered resultCode is refused on the SIGNED WEBHOOK path too",
   },
@@ -905,6 +913,16 @@ const CASES = [
     file: "src/daraja-catalog.ts",
     find: "const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){2,6}$/;",
     replace: "const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){1,6}$/;",
+    // ROUND 11: spec 1.5 added a SECOND, independent guard -- an uncatalogued canonical code is
+    // now `unknown` evidence and resolves to indeterminate regardless of its dot count. So
+    // reverting the dotted rule alone no longer changes the verdict and the case went VACUOUS
+    // while the guarantee was in fact stronger than before. The mutation has to remove BOTH
+    // layers, exactly as R1-live and D2-coerce do.
+    also: {
+      file: "src/semantics.ts",
+      find: "    rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode)",
+      replace: "    false",
+    },
     test: "JUDGE: `failed` plus a one-dot code is INDETERMINATE, not a terminal failure",
   },
   {
@@ -913,6 +931,16 @@ const CASES = [
     file: "src/daraja-catalog.ts",
     find: "const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){2,6}$/;",
     replace: "const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){1,6}$/;",
+    // ROUND 11: spec 1.5 added a SECOND, independent guard -- an uncatalogued canonical code is
+    // now `unknown` evidence and resolves to indeterminate regardless of its dot count. So
+    // reverting the dotted rule alone no longer changes the verdict and the case went VACUOUS
+    // while the guarantee was in fact stronger than before. The mutation has to remove BOTH
+    // layers, exactly as R1-live and D2-coerce do.
+    also: {
+      file: "src/semantics.ts",
+      find: "    rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode)",
+      replace: "    false",
+    },
     test: "WEBHOOK: an otherwise-valid payment.failed carrying a one-dot code is REFUSED",
   },
 
@@ -983,10 +1011,16 @@ const CASES = [
   },
   {
     id: "R9-lexeme-bound",
-    what: "the refusal reproduces an unbounded server-chosen lexeme again",
+    what: "the refusal reproduces the raw server-chosen lexeme again",
     file: "src/json.ts",
-    find: "  return s.length > MAX_QUOTED_LEXEME ? `${s.slice(0, MAX_QUOTED_LEXEME)}\u2026` : s;",
-    replace: "  return s;",
+    // ROUND 11 RETARGET. The round-9 protection was a LENGTH BOUND on the reproduced lexeme
+    // (`quoteServerText`/`MAX_QUOTED_LEXEME`), and round 10 showed a bound is not enough: a
+    // credential shorter than the bound fits inside it. The lexeme is no longer reproduced at
+    // all, so there is no bound left to revert -- the mutation now restores the raw echo the
+    // bound used to trim. Same guarantee, current implementation, and this round-9 test probes
+    // it with a LONG credential-bearing lexeme where `S42-lexeme-leak` probes a short one.
+    find: "  const shape = describeLexemeShape(rawLexeme);",
+    replace: "  const shape = `the JSON number \\`${rawLexeme}\\``;",
     test: "BOUNDS the server-chosen lexeme it reproduces in a refusal",
   },
   {
@@ -1125,8 +1159,12 @@ const CASES = [
     id: "S86-sweep-coverage",
     what: "the sweep stops noticing that a public type was never constructed",
     file: "test/conformance-sweep.test.ts",
-    find: "    const missing = REQUIRED_TYPES.filter((t) => !constructed.has(t));",
-    replace: "    const missing = [];",
+    // The mutation neuters the REGISTRY rather than the assertion: it simulates the real defect,
+    // which is a public type that never gets constructed. Blanking `missing` instead left the
+    // second assertion (`constructed.size >= REQUIRED_TYPES.length`) still passing, so the case
+    // measured nothing -- a vacuous mutation, caught by this harness on its own certification.
+    find: "  constructed.add(type);",
+    replace: "  void type;",
     test: "constructed every public type it claims to cover",
   },
   {

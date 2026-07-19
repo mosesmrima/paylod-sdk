@@ -16,7 +16,7 @@
  *      constructed. Adding a public type without sweeping it is now a test failure rather than
  *      an omission nobody notices.
  */
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { Paylod } from "../src/client.js";
 import {
@@ -173,7 +173,129 @@ const mk = (fetchImpl: ReturnType<typeof rawFetch>) =>
  */
 const DEPTHS = [1, 9, MAX_JSON_DEPTH - 6];
 
+/**
+ * Construct every public type once, so the coverage self-check is independent of which tests the
+ * runner selected. The per-case `it`s below still perform their own construction and assertions —
+ * this exists so `constructed` is complete even when a filter selects a single test.
+ */
+async function constructEverything(): Promise<void> {
+  const okAck = {
+    paymentId: "pay_seed",
+    status: "pending",
+    checkoutRequestId: "ws_CO_seed",
+  };
+  record(
+    "CollectAck",
+    await mk(rawFetch(202, JSON.stringify(okAck))).collect({
+      phone: "254712345678",
+      amount: 100,
+      idempotencyKey: "idem-seed",
+    }),
+  );
+
+  const okPayment = {
+    id: "pay_seed",
+    status: "success",
+    mpesaReceipt: "QGR1ABCDEF",
+    resultCode: "0",
+    resultDesc: "Processed successfully.",
+  };
+  const payment = await mk(rawFetch(200, JSON.stringify(okPayment))).status("pay_seed");
+  record("Payment", payment);
+  record("PaymentOutcome", toOutcome(payment as never));
+  record("PaymentJudgement", judge(payment as never));
+  record("PendingOutcome", pendingOutcome("pay_seed"));
+  record("NormalizedPhone", normalizePhone("0712345678"));
+  record("DecodedError", decodeDarajaResult(77777, "Failed."));
+
+  const capture = async (type: string, fn: () => unknown): Promise<void> => {
+    try {
+      record(type, await fn());
+    } catch (e) {
+      record(type, e);
+    }
+  };
+
+  await capture("PaylodApiError", () =>
+    mk(rawFetch(400, JSON.stringify({ error: "bad" }))).status("pay_seed"),
+  );
+  await capture("PaylodApiErrorIndeterminate", () =>
+    mk(rawFetch(202, JSON.stringify({ status: "settled" }))).collect({
+      phone: "254712345678",
+      amount: 100,
+      idempotencyKey: "idem-seed-2",
+    }),
+  );
+  await capture(
+    "PaylodConfigError",
+    () => new Paylod({ apiKey: KEY, webhookSecret: SECRET, baseUrl: `https://evil.example/${KEY}` }),
+  );
+  await capture("PaylodInvalidRequestError", () =>
+    new Paylod({ apiKey: KEY, webhookSecret: SECRET }).collect({
+      phone: "254712345678",
+      amount: -1,
+      idempotencyKey: "k",
+    }),
+  );
+  await capture("PaylodSignatureVerificationError", () =>
+    verifyWebhook({ payload: "{}", signature: `t=1,v1=${KEY}`, secret: SECRET }),
+  );
+  record(
+    "PaylodTimeoutError",
+    new PaylodTimeoutError(
+      "pay_seed",
+      { id: "pay_seed", status: "pending", mpesaReceipt: null, resultCode: null, resultDesc: null },
+      1000,
+    ),
+  );
+
+  const sim = new Paylod({ apiKey: KEY, webhookSecret: SECRET }).simulate;
+  record("SimOutcomeChoice", sim.outcomes);
+  await capture("SimulatedPayment", () => sim.collect({ amount: 1 } as never));
+  await capture("SimulatedOutcome", () => sim.outcome("", "approve" as never));
+
+  const evt = {
+    type: "payment.failed",
+    created: 1_700_000_000,
+    data: {
+      paymentId: "pay_seed",
+      applicationId: "app_1",
+      env: "sandbox",
+      status: "failed",
+      amount: 100,
+      phone: "254712345678",
+      resultCode: 1032,
+      resultDesc: "Cancelled by user",
+    },
+  };
+  const payload = JSON.stringify(evt);
+  const nowSec = 1_700_000_000;
+  record("WebhookSignaturePayload", signWebhook(payload, SECRET, nowSec));
+  await capture("WebhookEvent", () =>
+    verifyWebhook({
+      payload,
+      signature: signWebhook(payload, SECRET, nowSec),
+      secret: SECRET,
+      apiKey: KEY,
+      nowSec,
+    }),
+  );
+}
+
 describe("spec 8.6 — permanent adversarial sweep over every public type", () => {
+  /**
+   * THE COVERAGE TEST MUST NOT DEPEND ON ITS SIBLINGS HAVING RUN.
+   *
+   * `constructed` is populated by the sweep cases below, so selecting the coverage test alone
+   * (`vitest -t`, which is exactly what the non-vacuity harness does) previously found an empty
+   * registry and failed on clean source — a BROKEN-SELECTOR, i.e. a certification that certifies
+   * nothing while looking like a result. A `beforeAll` runs regardless of which tests the filter
+   * selected, so every construction happens before any assertion whichever test is chosen.
+   */
+  beforeAll(async () => {
+    await constructEverything();
+  });
+
   for (const depth of DEPTHS) {
     it(`sweeps the network surfaces at depth ${depth}`, async () => {
       // THE SUCCESS PATH, exercised with a genuinely CLEAN body.
