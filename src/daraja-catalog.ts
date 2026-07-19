@@ -157,8 +157,23 @@ const TERMINAL_500_MESSAGE_RE =
 /**
  * A dotted Daraja business code — `500.001.1001`, `400.002.02`. Each segment is bare digits; the
  * FIRST segment carries no leading zero, later segments may (`002` is how Daraja writes them).
+ *
+ * ── AT LEAST TWO DOTS, i.e. AT LEAST THREE SEGMENTS ───────────────────────────────────────
+ * This is the third sighting of one bug across the paylod SDKs: the JVM shipped a one-dot-
+ * tolerant pattern, Python shipped the `float()` variant of it, and Node had it here. Every real
+ * Daraja dotted code has THREE components (`500.001.1001`, `400.002.02`), so a `{1,6}` repeat
+ * admitted a family of two-segment lexemes that Daraja never emits and that a coercing reader
+ * flattens into something else entirely.
+ *
+ * `"500.0"` is the one that costs money. It is not a Daraja code, but with a one-dot pattern it
+ * validated as CANONICAL, and a canonical code is the only kind that can be a CONFIDENT TERMINAL
+ * FAILURE. Paired with terminal-500 prose ("wrong credentials") it became genuine failure
+ * evidence — which is exactly what a `payment.failed` webhook must carry to be accepted — so an
+ * otherwise-valid forged failure event was admitted on evidence that was a spelling rather than
+ * a code. Requiring two dots puts `"500.0"` back where it belongs: `ambiguous`, never success,
+ * never a confident terminal failure.
  */
-const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8}){1,6}$/;
+const CANONICAL_DOTTED_RE = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8}){2,6}$/;
 
 /** An alphanumeric result code — `C2B00011`. Always starts with a letter, never with a digit. */
 const CANONICAL_ALNUM_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;

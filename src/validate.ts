@@ -13,6 +13,7 @@
 import { randomUUID } from "node:crypto";
 
 import { PaylodApiError, PaylodInvalidRequestError } from "./errors.js";
+import { MAX_JSON_DEPTH } from "./json.js";
 import type { CollectAckWire, Payment, PaymentStatus, WireResultCode } from "./types.js";
 
 /**
@@ -367,6 +368,23 @@ export function sanitizeForMessage(value: unknown, redactText: TextRedactor = id
  * intercepting, and the honest verdict is INDETERMINATE.
  *
  * Object KEYS are scanned as well as values — a secret can appear as a key just as easily.
+ *
+ * ── THE DEPTH BOUND IS THE SAME BOUND THE PARSER USES, AND IT FAILS CLOSED ────────────────
+ * This walk used to stop at depth 8 and `return false` — "no secret here" — while `parseBounded`
+ * happily admits documents {@link MAX_JSON_DEPTH} levels deep. Two bounds that disagree, where
+ * the SHALLOWER one reports CLEAN, is a bypass with a number for a lock: a signed body carrying
+ * the configured API key or webhook secret at depth 9 walked straight past the refusal, and
+ * `verifyWebhookSignature` handed it back raw.
+ *
+ * Two rules close it, and both are structural rather than a bigger number:
+ *
+ *   1. ONE CONSTANT. The traversal budget IS {@link MAX_JSON_DEPTH}, imported from the parser
+ *      that produced the value. Anything the parser accepted, this walk can reach the bottom of,
+ *      by construction — the two limits cannot drift apart because there is only one of them.
+ *   2. FAIL CLOSED. If the walk cannot reach the bottom anyway (a caller-supplied object that
+ *      never came through the parser, a cyclic structure), the answer is `true` — REFUSE. "I did
+ *      not look" and "I looked and it is clean" must never produce the same answer, because every
+ *      caller of this function treats `false` as permission to hand the value to the application.
  */
 export function containsSecret(
   value: unknown,
@@ -376,8 +394,9 @@ export function containsSecret(
   const live = secrets.filter((s) => typeof s === "string" && s.length > 0);
   if (live.length === 0) return false;
   // Bounded like every other structural walk in this SDK: a hostile body must not be able to
-  // turn a safety scan into a stack overflow, which would be a crash on the money path.
-  if (depth > 8) return false;
+  // turn a safety scan into a stack overflow, which would be a crash on the money path. Past the
+  // budget the honest answer is "unknown", and unknown is REFUSED — see the note above.
+  if (depth > MAX_JSON_DEPTH) return true;
 
   if (typeof value === "string") return live.some((s) => value.includes(s));
   if (Array.isArray(value)) return value.some((v) => containsSecret(v, live, depth + 1));
