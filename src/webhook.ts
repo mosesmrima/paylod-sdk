@@ -137,6 +137,15 @@ function toBoundedBuffer(payload: string | Buffer | Uint8Array): Buffer {
   return toBuffer(payload);
 }
 
+/**
+ * The widest `x-webhook-signature` header this SDK will even tokenise (spec 6.5).
+ *
+ * A genuine header is `t=<unix>,v1=<64 hex>` — roughly 85 characters. This bound is checked
+ * before `split(",")` runs, so an unauthenticated caller cannot choose how much work the parser
+ * does. See `parseHeader`.
+ */
+export const MAX_SIGNATURE_HEADER_CHARS = 1024;
+
 /** A well-formed `v1` is 64 lowercase hex chars (HMAC-SHA256 digest). */
 const V1_RE = /^[0-9a-f]{64}$/;
 
@@ -163,6 +172,17 @@ const TIMESTAMP_RE = /^(?:0|[1-9]\d{0,14})$/;
  * taking the last pair. Duplicates of either key are fatal, as is a malformed `v1`.
  */
 function parseHeader(header: string): { t: string; v1: string } | null {
+  // LENGTH-BOUNDED BEFORE THE SPLIT (spec 6.5).
+  //
+  // The body has been capped since round 6; this header had no bound at all, and it is the same
+  // unauthenticated attacker-controlled input arriving through the same anonymous request. A
+  // multi-megabyte `x-webhook-signature` was split into millions of segments, each trimmed and
+  // scanned, before a single byte of it was known to be genuine — work an anonymous caller
+  // chooses the size of, which is the shape of the OOM the body cap exists to prevent.
+  //
+  // A real header is `t=<=15 digits>,v1=<64 hex>` — about 85 characters. 1 KiB is an order of
+  // magnitude of headroom for forward-compatible extra keys and still trivially bounded.
+  if (header.length > MAX_SIGNATURE_HEADER_CHARS) return null;
   let t: string | undefined;
   let v1: string | undefined;
   let tCount = 0;

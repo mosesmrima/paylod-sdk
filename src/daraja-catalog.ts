@@ -52,6 +52,7 @@
  * payment we cannot classify.
  */
 
+import { redactCredentialShapes } from "./grammar.js";
 import catalogData from "./daraja-error-codes.json" with { type: "json" };
 
 // ─── Types ────────────────────────────────────────────────────────────────────────────────
@@ -258,7 +259,20 @@ export function canonicalCodeForm(resultCode: unknown): CodeForm {
  * `resultDesc`, which surfaced to callers as a crash instead of an indeterminate payment.
  */
 function descText(resultDesc: unknown): string {
-  return typeof resultDesc === "string" ? resultDesc.trim() : "";
+  // CREDENTIAL SHAPES ARE STRIPPED HERE, at the one place every consumer of a `ResultDesc`
+  // funnels through (spec 4.9).
+  //
+  // `decodeDarajaResult` is exported as public API and never touches the network, so it has no
+  // client to redact for it — and it is documented for logs, dashboards and support tooling,
+  // which are exactly the sinks a credential must not reach. `ResultDesc` is server-controlled
+  // free text and is the field most likely to carry an echoed `Authorization` header, and it was
+  // interpolated verbatim into `cause` and `customerMessage`.
+  //
+  // Only the SHAPE scan is available at this layer: this module holds no configured credentials,
+  // by design. `Paylod#decodeError` additionally applies the exact-match scrub for the two values
+  // this client does hold, so the public method is covered by both rules and the bare function by
+  // the one that needs no configuration.
+  return typeof resultDesc === "string" ? redactCredentialShapes(resultDesc.trim()) : "";
 }
 
 /**

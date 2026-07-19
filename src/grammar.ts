@@ -99,6 +99,36 @@ export function isValidIdentifier(value: unknown): value is string {
  * decoders in `transport.ts` and `webhook.ts` (spec 2.6). Distinct wire values that collapse
  * into the same string are not identifiers, whatever else they are.
  */
+/**
+ * CREDENTIAL SHAPES, redacted whether or not this client was configured with the value.
+ *
+ * Spec 4.1 forbids two distinct things from reaching output: a CONFIGURED credential, and any
+ * value MATCHING A CREDENTIAL SHAPE. The client only ever matched the first — it scrubbed
+ * `this.#apiKey` and `this.#webhookSecret` by exact string — so a credential that was not this
+ * client's own sailed through untouched. That is not a corner case: a rotated-out key still
+ * present in an upstream config, a sibling service's key echoed back by a shared proxy, another
+ * tenant's token in a mirrored debug envelope, or a `Bearer` header quoted verbatim in a 4xx are
+ * all real, and all of them are still somebody's live credential.
+ *
+ * An exact-match redactor cannot know about any of them. A shape scan does not need to.
+ *
+ * The `Bearer` arm is deliberately broad — the token after it is opaque by definition, so the
+ * only safe reading is "everything up to whitespace".
+ */
+const CREDENTIAL_SHAPE_RE =
+  /\b(?:mp_live_|mp_test_|whsec_|sk_)[A-Za-z0-9_-]+|\bBearer\s+[A-Za-z0-9._~+/=-]+/g;
+
+/**
+ * Replace every credential-SHAPED substring, independent of configuration.
+ *
+ * Runs alongside the exact-match scrub, never instead of it: a configured secret that does not
+ * happen to match one of these prefixes still has to be removed, and a shaped value that is not
+ * configured still has to be removed. Neither is a superset of the other.
+ */
+export function redactCredentialShapes(text: string): string {
+  return text.replace(CREDENTIAL_SHAPE_RE, "[redacted]");
+}
+
 export function looksSanitized(value: string): boolean {
   if (value.includes("�")) return true;
   // Bracketed / angled placeholders: `[redacted]`, `<hidden>`, `[REDACTED: too deep]`.

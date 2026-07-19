@@ -8,6 +8,7 @@ import {
   PaylodTerminalTransportError,
   PaylodTimeoutError,
 } from "./errors.js";
+import { redactCredentialShapes } from "./grammar.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
 import type { DecodedError } from "./daraja-catalog.js";
 import { toOutcome } from "./outcome.js";
@@ -430,12 +431,26 @@ export class Paylod {
 
   // ── HTTP ──────────────────────────────────────────────────────────────────────
 
-  /** Scrub the API key and webhook secret out of anything that could be logged or thrown. */
+  /**
+   * Scrub credentials out of anything that could be logged or thrown.
+   *
+   * TWO RULES, and neither subsumes the other (spec 4.1):
+   *
+   *   1. THE CONFIGURED VALUES, by exact match. These are the credentials this client actually
+   *      holds, and they must go regardless of what shape they happen to have.
+   *   2. ANYTHING CREDENTIAL-SHAPED, by pattern. This half was missing, and its absence meant the
+   *      redactor could only ever protect against leaking OUR OWN key. A rotated-out credential
+   *      still live upstream, a sibling service's key returned by a shared proxy, or a `Bearer`
+   *      header quoted back in a 4xx envelope is somebody's working credential and was passed
+   *      through verbatim, because it did not string-equal `this.#apiKey`.
+   *
+   * The exact scrub runs FIRST so a configured secret is removed even if it matches no shape.
+   */
   #redact(s: string): string {
     let out = s;
     if (this.#apiKey) out = out.split(this.#apiKey).join("[redacted]");
     if (this.#webhookSecret) out = out.split(this.#webhookSecret).join("[redacted]");
-    return out;
+    return redactCredentialShapes(out);
   }
 
   /**
@@ -1017,7 +1032,15 @@ export class Paylod {
    * tooling — not for deciding what to show a customer.
    */
   decodeError(resultCode: number | string | null | undefined, rawDesc?: string): DecodedError {
-    return decodeDarajaResult(resultCode, rawDesc ?? null);
+    // REDACTED, even though nothing here touches the network (spec 4.9).
+    //
+    // `rawDesc` is a Daraja `ResultDesc`: server-controlled free text, and the field most likely
+    // to carry an echoed `Authorization` header. This method's own docstring points callers at
+    // "logs, dashboards and support tooling" — precisely the sinks a credential must not reach —
+    // and it had no redaction at all, because it has no response to redact and therefore looked
+    // like it had nothing to protect. An offline surface has no client to redact for it; it has
+    // to do its own.
+    return decodeDarajaResult(resultCode, rawDesc === undefined ? null : this.#redact(rawDesc));
   }
 
   /**
