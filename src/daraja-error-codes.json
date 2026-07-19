@@ -319,7 +319,7 @@
       "fix": "Verify the shortcode/merchant configuration and business account balance, then retry or contact Safaricom support.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa returned an error. Please try again in a moment.",
+      "customerMessage": "M-Pesa returned an error and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
