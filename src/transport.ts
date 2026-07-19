@@ -34,6 +34,7 @@ import {
   PaylodSecurityError,
   PaylodTerminalTransportError,
 } from "./errors.js";
+import { stringifyBounded } from "./json.js";
 
 /** The one origin family a paylod key may ever be addressed to. */
 export const ALLOWED_HOSTS = new Set(["paylod.dev", "api.paylod.dev"]);
@@ -118,7 +119,7 @@ export function assertSecureBaseUrl(
   try {
     parsed = new URL(baseUrl);
   } catch {
-    throw new PaylodConfigError(`baseUrl is not a valid URL: "${safeUrl(baseUrl)}".`);
+    throw new PaylodConfigError(`baseUrl is not a valid URL: "${safeUrl(baseUrl, [apiKey])}".`);
   }
 
   const isLive = apiKey.startsWith("mp_live_");
@@ -126,16 +127,16 @@ export function assertSecureBaseUrl(
 
   if (parsed.username !== "" || parsed.password !== "") {
     throw new PaylodConfigError(
-      `baseUrl must not embed credentials (got "${safeUrl(baseUrl)}"). A "user:pass@host" URL leaks those ` +
+      `baseUrl must not embed credentials (got "${safeUrl(baseUrl, [apiKey])}"). A "user:pass@host" URL leaks those ` +
         `credentials into logs and is a standard host-confusion trick.`,
     );
   }
   if (host === "") {
-    throw new PaylodConfigError(`baseUrl has no host: "${safeUrl(baseUrl)}".`);
+    throw new PaylodConfigError(`baseUrl has no host: "${safeUrl(baseUrl, [apiKey])}".`);
   }
   if (parsed.search !== "" || parsed.hash !== "") {
     throw new PaylodConfigError(
-      `baseUrl must not carry a query string or fragment (got "${safeUrl(baseUrl)}"). It is a path prefix; ` +
+      `baseUrl must not carry a query string or fragment (got "${safeUrl(baseUrl, [apiKey])}"). It is a path prefix; ` +
         `a trailing "?..." would corrupt every request path built from it.`,
     );
   }
@@ -150,7 +151,7 @@ export function assertSecureBaseUrl(
   // bearer key to whatever `fetch` made of them.
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopbackOptIn)) {
     throw new PaylodConfigError(
-      `baseUrl must use https:// (got protocol "${parsed.protocol}" in "${safeUrl(baseUrl)}"). ` +
+      `baseUrl must use https:// (got protocol "${parsed.protocol}" in "${safeUrl(baseUrl, [apiKey])}"). ` +
         `Plaintext HTTP would transmit your API key in the clear, and any other scheme ` +
         `(ftp, ws, gopher, file, data…) is not something this SDK will ever speak. Loopback HTTP ` +
         `(localhost, 127.0.0.1, ::1) is allowed ONLY with { allowInsecureBaseUrl: true } and ` +
@@ -161,7 +162,7 @@ export function assertSecureBaseUrl(
   if (isLoopback) {
     if (loopbackOptIn) return;
     throw new PaylodConfigError(
-      `baseUrl points at loopback ("${safeUrl(baseUrl)}"). That is allowed ONLY with ` +
+      `baseUrl points at loopback ("${safeUrl(baseUrl, [apiKey])}"). That is allowed ONLY with ` +
         `{ allowInsecureBaseUrl: true }, and NEVER with an mp_live_ key — a production ` +
         `credential must never be addressed to a local listener.`,
     );
@@ -169,19 +170,19 @@ export function assertSecureBaseUrl(
 
   if (!ALLOWED_HOSTS.has(host)) {
     throw new PaylodConfigError(
-      `baseUrl host "${host}" is not a paylod origin (got "${safeUrl(baseUrl)}"). Your API key is a bearer ` +
+      `baseUrl host "${host}" is not a paylod origin (got "${safeUrl(baseUrl, [apiKey])}"). Your API key is a bearer ` +
         `credential: it is sent on every request, so it may only ever be addressed to ` +
         `${[...ALLOWED_HOSTS].join(" or ")}. HTTPS alone does not make an arbitrary host safe.`,
     );
   }
   if (!ALLOWED_PORTS.has(parsed.port)) {
     throw new PaylodConfigError(
-      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${safeUrl(baseUrl)}").`,
+      `baseUrl must use the default HTTPS port (got port "${parsed.port}" in "${safeUrl(baseUrl, [apiKey])}").`,
     );
   }
   if (isPrivateOrLoopbackHost(host)) {
     throw new PaylodConfigError(
-      `baseUrl must not point at a private, loopback or link-local address (got "${safeUrl(baseUrl)}").`,
+      `baseUrl must not point at a private, loopback or link-local address (got "${safeUrl(baseUrl, [apiKey])}").`,
     );
   }
 }
@@ -204,19 +205,40 @@ function isPrivateOrLoopbackHost(host: string): boolean {
 }
 
 /**
- * Render a URL for an ERROR MESSAGE with any userinfo stripped. The check that exists to stop a
- * credential leaking must not itself be the thing that leaks it.
+ * Render a URL for an ERROR MESSAGE with any userinfo stripped, KNOWN CREDENTIALS REDACTED, and
+ * the result bounded in length. The check that exists to stop a credential leaking must not
+ * itself be the thing that leaks it.
+ *
+ * ── Why `secrets` is not optional in practice ─────────────────────────────────────────────
+ * Stripping `user:pass@` closes only the credential that arrived in the URL's userinfo slot. The
+ * configured API key reaches these diagnostics by other routes entirely — pasted into the path or
+ * query of a copied "debug" URL, templated into a base URL by a misconfigured deployment, or
+ * simply passed as the wrong argument. Every one of those lands the live bearer key in an
+ * ordinary `PaylodConfigError` message, which is the first thing a crash reporter serialises.
+ * This is the same shape as the Python sibling's round-9 Critical, where a NEW refusal path
+ * interpolated a raw server header and put a token into `str(error)`: the refusal is written to
+ * be safe, and the refusal is where the value gets printed.
  */
-export function safeUrl(raw: string): string {
+export function safeUrl(raw: string, secrets: readonly string[] = []): string {
+  let rendered: string;
   try {
     const u = new URL(raw);
-    if (u.username === "" && u.password === "") return raw;
-    u.username = "";
-    u.password = "";
-    return u.toString().replace("://", "://[redacted]@");
+    if (u.username === "" && u.password === "") {
+      rendered = raw;
+    } else {
+      u.username = "";
+      u.password = "";
+      rendered = u.toString().replace("://", "://[redacted]@");
+    }
   } catch {
-    return "[unparseable url]";
+    rendered = "[unparseable url]";
   }
+  for (const s of secrets) {
+    if (typeof s === "string" && s.length > 0) rendered = rendered.split(s).join("[redacted]");
+  }
+  // Bounded AFTER redaction — truncating first could cut a credential in half and leave the
+  // surviving prefix in the message.
+  return rendered.length > 200 ? `${rendered.slice(0, 200)}…` : rendered;
 }
 
 export interface TransportInit {
@@ -318,7 +340,7 @@ export class Transport {
       const res = await this.#fetch(url, {
         method: req.method,
         headers,
-        body: req.body === undefined ? undefined : JSON.stringify(req.body),
+        body: req.body === undefined ? undefined : stringifyBounded(req.body),
         signal: timer.signal,
         // Never auto-follow: a cross-origin 3xx would replay the Authorization header to
         // another host. This is the FIRST line of defence, not the only one — see below.

@@ -35,7 +35,7 @@
  * `1032.0` cannot invite the retry that charges the customer twice. The error is terminal and
  * says INDETERMINATE, so the caller reads the payment rather than minting a fresh key.
  */
-import { PaylodResponseTooLargeError } from "./errors.js";
+import { PaylodInvalidRequestError, PaylodResponseTooLargeError } from "./errors.js";
 
 /**
  * Deepest JSON nesting accepted from any untrusted document.
@@ -86,7 +86,30 @@ function decodeMemberName(rawBody: string): string {
   }
 }
 
-function refuseLexeme(key: string, lexeme: string): never {
+/**
+ * The most server-controlled text this refusal will reproduce.
+ *
+ * The lexeme is bytes the OTHER side chose, and the scan that produces it runs to the next
+ * `,}] ` or whitespace — which an attacker controls, so the "number" can be arbitrarily long and
+ * can contain anything but those terminators. Interpolating it whole put an unbounded,
+ * attacker-chosen string into an exception message, which is the first thing a crash reporter
+ * serialises. This is the Node instance of the Python sibling's round-9 Critical, where a NEW
+ * refusal interpolated a raw server header and thereby printed a bearer token.
+ *
+ * 32 characters is far more than any real numeric spelling needs and short enough that no
+ * credential survives the cut. This module is deliberately dependency-free and holds no
+ * credentials of its own, so bounding is the control available here; the API path additionally
+ * runs every message it emits through the client's redactor.
+ */
+const MAX_QUOTED_LEXEME = 32;
+
+function quoteServerText(s: string): string {
+  return s.length > MAX_QUOTED_LEXEME ? `${s.slice(0, MAX_QUOTED_LEXEME)}…` : s;
+}
+
+function refuseLexeme(rawKey: string, rawLexeme: string): never {
+  const key = quoteServerText(rawKey);
+  const lexeme = quoteServerText(rawLexeme);
   throw new PaylodResponseTooLargeError(
     `paylod's response spells \`${key}\` as the JSON number \`${lexeme}\`, which is not the ` +
       `canonical integer form paylod emits. Different spellings of the same number — \`0.0\`, ` +
@@ -186,4 +209,86 @@ export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
   }
 
   return JSON.parse(text);
+}
+
+/**
+ * Hard ceiling on a request body this SDK will serialise, in bytes.
+ *
+ * A paylod request is a few hundred bytes. 256 KiB is three orders of magnitude of headroom, and
+ * bounding it is not about the network — it is about `JSON.stringify` running in THIS process,
+ * before anything is dispatched, on a value the caller assembled from data they may not control
+ * (a webhook payload echoed into `metadata`, a user-supplied order object, a database row).
+ */
+export const MAX_REQUEST_BODY_BYTES = 262_144;
+
+/**
+ * `JSON.stringify` with the SAME depth budget the reader uses, plus cycle detection and a byte cap.
+ *
+ * ── Why the write side needs bounds at all ────────────────────────────────────────────────
+ * Every bound in this SDK used to face outward: response bytes capped, response depth capped,
+ * numeric lexemes validated. The write side had none, so `JSON.stringify(req.body)` on the
+ * `collect` path ran unbounded on a caller-assembled value:
+ *
+ *   • DEEPLY NESTED → `JSON.stringify` recurses, so a body a few thousand levels deep is a
+ *     `RangeError` thrown from inside the serialiser. Thrown at THIS point it is survivable; the
+ *     danger is that the same shape reaches a retry or a reconciliation path where a stack
+ *     overflow costs the idempotency key for a charge that may already be live.
+ *   • CYCLIC → `JSON.stringify` throws a `TypeError` whose message quotes the property path it
+ *     walked, which is caller data in an exception nobody sanitised.
+ *   • ENORMOUS → the serialised copy is committed to memory in full before a single byte is sent.
+ *
+ * All three are refused BEFORE the serialiser is allowed to recurse, and refused as an
+ * INVALID REQUEST — the defining property being that NOTHING WAS DISPATCHED. There is no charge
+ * to reconcile and no idempotency key to preserve, which is exactly why this check belongs here,
+ * ahead of the dispatch, rather than in a `catch` around it.
+ *
+ * The depth budget is {@link MAX_JSON_DEPTH}, the same constant `parseBounded` enforces. One
+ * constant for every structural bound in this SDK: two limits that can drift apart will.
+ */
+export function stringifyBounded(value: unknown, what = "the request body"): string {
+  const seen = new Set<object>();
+
+  const walk = (v: unknown, depth: number): void => {
+    if (v === null || typeof v !== "object") return;
+    if (depth > MAX_JSON_DEPTH) {
+      throw new PaylodInvalidRequestError(
+        `${what} nests more than ${MAX_JSON_DEPTH} levels deep. It was refused before it was ` +
+          `serialised, so NOTHING was dispatched — no charge was raised and there is no payment ` +
+          `to reconcile. Flatten the value and call again with the SAME idempotency key.`,
+      );
+    }
+    // Ancestor set, not a global visited set: a DAG that repeats the same object on two sibling
+    // branches is legal JSON and must not be mistaken for a cycle.
+    const obj = v as object;
+    if (seen.has(obj)) {
+      throw new PaylodInvalidRequestError(
+        `${what} contains a circular reference. It was refused before it was serialised, so ` +
+          `NOTHING was dispatched — no charge was raised and there is no payment to reconcile. ` +
+          `The offending property is not named here because its path is caller data that would ` +
+          `then travel in this message. Call again with the SAME idempotency key once the cycle ` +
+          `is removed.`,
+      );
+    }
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      for (const item of obj) walk(item, depth + 1);
+    } else {
+      for (const item of Object.values(obj as Record<string, unknown>)) walk(item, depth + 1);
+    }
+    seen.delete(obj);
+  };
+
+  walk(value, 1);
+
+  const text = JSON.stringify(value) ?? "null";
+  const bytes = new TextEncoder().encode(text).byteLength;
+  if (bytes > MAX_REQUEST_BODY_BYTES) {
+    throw new PaylodInvalidRequestError(
+      `${what} serialises to ${bytes} bytes, over the ${MAX_REQUEST_BODY_BYTES}-byte limit. It ` +
+        `was refused before it was dispatched, so NOTHING was sent — no charge was raised and ` +
+        `there is no payment to reconcile. Shrink the value (\`metadata\` is the usual culprit) ` +
+        `and call again with the SAME idempotency key.`,
+    );
+  }
+  return text;
 }

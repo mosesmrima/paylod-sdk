@@ -452,7 +452,12 @@ export class Paylod {
     //
     // The safe answer at the limit is to drop the subtree, not to emit it. Anything past the
     // limit is diagnostic detail of vanishing value; the key is not.
-    if (depth > 8) return "[redacted: structure too deeply nested to scan]";
+    //
+    // THE BUDGET IS THE PARSER'S BUDGET. It was a local `8` while `parseBounded` admits
+    // MAX_JSON_DEPTH levels — the same two-bounds-that-disagree shape that made `containsSecret`
+    // fail OPEN. Here the limit already failed closed, so the mismatch cost fidelity rather than
+    // the credential; deriving both from one constant means neither can drift.
+    if (depth > MAX_JSON_DEPTH) return "[redacted: structure too deeply nested to scan]";
     if (typeof value === "string") return this.#redact(value);
     if (Array.isArray(value)) return value.map((v) => this.#redactDeep(v, depth + 1));
     if (value !== null && typeof value === "object") {
@@ -1217,14 +1222,22 @@ export const MAX_WEBHOOK_BODY_READ_MS = 60_000;
 
 function resolveBodyReadMs(configured: number | undefined): number {
   if (configured === undefined) return DEFAULT_WEBHOOK_BODY_READ_MS;
-  if (!Number.isFinite(configured) || configured <= 0) {
+  // WHOLE, POSITIVE, AND IN RANGE — CHECKED, NOT REPAIRED.
+  //
+  // The check was `Number.isFinite && > 0` followed by `Math.floor`, so `0.5` passed the bound
+  // and floored to `0`: a deadline of zero milliseconds, which expires before the first chunk can
+  // arrive and refuses every legitimate webhook. A value that is silently rewritten into a
+  // different value is not a validated value, and the rewrite here turned a typo into an outage
+  // on the delivery channel. `Number.isInteger` also excludes `NaN` and both infinities.
+  if (!Number.isInteger(configured) || configured < 1 || configured > MAX_WEBHOOK_BODY_READ_MS) {
     throw new PaylodConfigError(
-      "`bodyReadTimeoutMs` must be a finite positive number of milliseconds. The read deadline " +
-        "is what stops an anonymous slow-drip request from pinning the handler, so it cannot be " +
-        "disabled.",
+      "`bodyReadTimeoutMs` must be a whole number of milliseconds between 1 and " +
+        `${MAX_WEBHOOK_BODY_READ_MS}. The read deadline is what stops an anonymous slow-drip ` +
+        "request from pinning the handler, so it cannot be disabled — and a fractional value " +
+        "below 1 would floor to a zero deadline that refuses every legitimate delivery.",
     );
   }
-  return Math.min(Math.floor(configured), MAX_WEBHOOK_BODY_READ_MS);
+  return configured;
 }
 
 /** The refusal, so both adapters say the same thing for the same reason. */
@@ -1286,8 +1299,13 @@ function assertDeclaredLengthOk(declared: string | null | undefined): void {
  * that the bytes are never allocated, not that they are counted afterwards.
  *
  * The `arrayBuffer()` fallback covers a synthesised `Request` with no readable stream (some
- * runtimes, some test doubles). It is strictly weaker and is applied after the fact, which is all
- * that is available in that shape — but the declared-length check above still runs first.
+ * runtimes, some test doubles). Without a stream there is no way to stop reading part-way, so the
+ * fallback CANNOT bound memory by counting — it can only refuse to start. It therefore demands a
+ * usable `Content-Length` and races the read against the same deadline the streaming path uses.
+ * Previously it did neither: `await request.arrayBuffer()` ran to completion with no byte bound
+ * and outside the body-read deadline, so on any runtime taking this branch an anonymous caller
+ * could commit unbounded memory, or hold the handler forever by dripping, on the one route a
+ * payments integration exposes to the internet by design.
  *
  * ── THE BYTES ARE NEVER DECODED ───────────────────────────────────────────────────────────
  * This returned a `string`, which meant the raw body was decoded to UTF-8 here and re-encoded
@@ -1310,11 +1328,29 @@ async function readWebRequestBody(request: Request, bodyReadMs: number): Promise
 
   const body = request.body as ReadableStream<Uint8Array> | null | undefined;
   if (!body || typeof body.getReader !== "function") {
+    // FAIL CLOSED WITHOUT A DECLARED LENGTH. `arrayBuffer()` is all-or-nothing: it resolves once
+    // the whole body is resident, so a byte check after it has already lost. The only bound
+    // available before the allocation is the sender's own `Content-Length`, already validated
+    // against the cap by `assertDeclaredLengthOk` above. No stream AND no usable declared length
+    // means nothing bounds the read, and an unbounded read on an unauthenticated route is
+    // refused rather than attempted.
+    const declared = request.headers?.get?.("content-length");
+    if (typeof declared !== "string" || !/^\d{1,15}$/.test(declared.trim())) {
+      throw tooLargeBody(
+        "no readable stream was exposed and no usable Content-Length was declared, so the body " +
+          "could not be bounded before it was allocated",
+      );
+    }
     // `arrayBuffer()`, NOT `text()`. `text()` is the decode this function exists to avoid, and
     // using it only "in the fallback" would mean the byte-collapsing bug survived on precisely
     // the runtimes that do not expose a stream — a silent, per-runtime difference in what
     // verifies, which is worse than a uniform bug.
-    const buf = Buffer.from(await request.arrayBuffer());
+    //
+    // Raced against the SAME deadline the streaming path uses: a declared length bounds the
+    // memory, it does not bound how slowly those bytes arrive.
+    const buf = Buffer.from(
+      await readWithin(request.arrayBuffer(), deadlineAt, () => {}, 0, bodyReadMs),
+    );
     if (buf.byteLength > MAX_WEBHOOK_BODY_BYTES) {
       throw tooLargeBody("no readable stream was exposed, so the body was measured after reading");
     }

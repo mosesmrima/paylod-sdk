@@ -329,12 +329,24 @@ export class Simulator {
     // proved a request production rejects at the boundary. That is the same class of divergence
     // the idempotency-key rule was consolidated to fix: a simulator that is LAXER than production
     // certifies guarantees that are not in force, which is worse than having no simulator.
-    const amount = assertChargeAmount(params.amount ?? 1, "simulate.collect()");
+    // DEFAULT ONLY ON `undefined` — NEVER ON A FALSY OR INVALID VALUE.
+    //
+    // These were `params.amount ?? 1` and `params.phone ? normalizePhone(...) : DEFAULT_SIM_PHONE`.
+    // `??` already handled `amount`, but the phone ternary silently REPLACED every falsy runtime
+    // value — `null`, `""`, `0`, `false` — with the default instead of validating it, and a
+    // TypeScript-free caller (plain JS, JSON config, a deserialised fixture) is exactly who
+    // supplies those. So `simulate.collect({ phone: null })` quietly charged the default handset
+    // and returned success, certifying that production accepts a null phone. Production does not.
+    // A simulator that is LAXER than production certifies guarantees that are not in force.
+    //
+    // `undefined` means "not supplied", which is the one case a documented default belongs to.
+    // Everything else the caller actually wrote goes through the production validator.
+    const amount = assertChargeAmount(params.amount === undefined ? 1 : params.amount, "simulate.collect()");
     assertAccountReference(params.accountReference, "simulate.collect()");
     assertDescription(params.description, "simulate.collect()");
 
     const body: Record<string, unknown> = {
-      phone: params.phone ? normalizePhone(params.phone) : DEFAULT_SIM_PHONE,
+      phone: params.phone === undefined ? DEFAULT_SIM_PHONE : normalizePhone(params.phone),
       amount,
     };
     // The backend calls this field `accountRef`; the rest of the SDK calls it `accountReference`.
@@ -474,10 +486,19 @@ export class Simulator {
           secrets: this.#guards.secrets(),
         });
         const raw = parsed as { webhookQueued?: unknown };
-        // Build the outcome with the SAME classifier every other read uses. This is the point of
-        // the whole feature: there is no "simulated" outcome type and no special branch —
-        // `paylod.check()` on this id returns an identical object.
-        return { ...toOutcome(payment), webhookQueued: raw.webhookQueued !== false };
+        // A BOOLEAN, OR NOTHING. This was `raw.webhookQueued !== false`, which is true for every
+        // value in the language except the literal `false` — so `null`, `0`, `"no"`, `{}` and a
+        // missing-but-misspelled field all reported "your reconciliation webhook was queued".
+        // That is the one field a caller uses to decide whether to expect delivery at all, so
+        // coercing a malformed value to `true` tells them to wait for an event that will never
+        // arrive. Absence is the documented default (`true`); anything present and non-boolean is
+        // a response we do not understand, and the honest answer there is `false` — do not rely
+        // on delivery — rather than an invented reassurance.
+        const queued = raw.webhookQueued;
+        return {
+          ...toOutcome(payment),
+          webhookQueued: queued === undefined ? true : queued === true,
+        };
       },
     });
 
