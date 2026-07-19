@@ -138,6 +138,23 @@ interface RequestOptions<T> {
 const IN_PROGRESS_409_RE = /already in progress/i;
 
 /**
+ * A `409` **indeterminate** — a previous request under this key died mid-dispatch, so it may or
+ * may not have moved money. This is the STOP signal, and it takes precedence over every other
+ * reading of a 409.
+ *
+ * The two patterns are not disjoint, and nothing guarantees they ever will be: the server writes
+ * prose, and a message can contain both phrases (a conflict raised while a previous attempt was
+ * both queued and interrupted, or simply a reworded message that mentions both states). Testing
+ * only for "in progress" therefore RETRIED an indeterminate 409 — the SDK dispatched the charge a
+ * second time against a key whose first attempt may already have taken the customer's money. The
+ * probe counted two dispatches where the documented behaviour is zero retries.
+ *
+ * When the two disagree, the conservative reading wins. `in progress` costs a caller one extra
+ * poll if we get it wrong; `indeterminate` costs a customer a second charge.
+ */
+const INDETERMINATE_409_RE = /interrupted while the provider call was/i;
+
+/**
  * The WALL clock. Used only where a wall-clock reading is the correct one: comparing against an
  * HTTP-date `Retry-After`, which is an absolute civil time the server named. Operation deadlines
  * use {@link monotonicNowMs} instead — see `#remaining`.
@@ -375,7 +392,9 @@ export class Paylod {
       assertSandboxKey(this.#apiKey, "new Paylod({ simulate: true })");
     }
 
-    this.simulate = new Simulator(this.#apiKey, (opts) =>
+    this.simulate = new Simulator(
+      this.#apiKey,
+      (opts) =>
       this.#request({
         method: opts.method,
         path: opts.path,
@@ -390,6 +409,14 @@ export class Paylod {
         // run on exactly the same path production's do.
         ...(opts.project ? { project: opts.project } : {}),
       }),
+      // THE PRODUCTION GUARDS, not a weaker copy. The simulator's error envelopes redacted
+      // nothing and its projectors scanned for nothing, so the surface every integrator's test
+      // suite runs against was the one surface a leaked credential survived.
+      {
+        redactText: (s) => this.#redact(s),
+        redactBody: (b) => this.#redactDeep(b),
+        secrets: () => this.#secrets(),
+      },
     );
   }
 
@@ -577,7 +604,13 @@ export class Paylod {
       // 429 / 5xx are transient. A 409 is retried ONLY when it is explicitly "same key still in
       // progress" — every other 409 (body conflict, indeterminate) is a real, terminal answer.
       const transient = res.status === 429 || res.status >= 500;
-      const inProgress = res.status === 409 && IN_PROGRESS_409_RE.test(message);
+      // INDETERMINATE WINS. A message carrying both phrases is not retried — see
+      // INDETERMINATE_409_RE. The two substring tests overlap, so precedence is the only thing
+      // that makes the pair total.
+      const inProgress =
+        res.status === 409 &&
+        IN_PROGRESS_409_RE.test(message) &&
+        !INDETERMINATE_409_RE.test(message);
       if ((!transient && !inProgress) || attempt === this.#maxRetries) throw apiError;
 
       lastError = apiError;
@@ -885,6 +918,16 @@ export class Paylod {
     const remaining = this.#remaining(deadlineMs) ?? MAX_UNBOUNDED_SLEEP_MS;
 
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // THE ABORT HANDLER IS RETAINED SO IT CAN BE REMOVED.
+    //
+    // `{ once: true }` only removes a listener that FIRED. The common case is the opposite: the
+    // onPoll resolves, the race settles, and the listener stays installed on the caller's signal
+    // — which is a long-lived object they reuse across the whole operation. `wait()` polls dozens
+    // of times, so dozens of listeners accumulate on one signal, every one of them holding a
+    // closure over a `Payment` and a rejection function for a race that is long over. Node warns
+    // at 11 and the memory is held for as long as the caller holds the signal. A cleanup that
+    // runs only when the thing goes wrong is not cleanup.
+    let onAbort: (() => void) | undefined;
     try {
       await Promise.race([
         result,
@@ -895,14 +938,15 @@ export class Paylod {
           if (remaining <= 0) return fail();
           timer = setTimeout(fail, remaining);
           if (signal) {
-            signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), {
-              once: true,
-            });
+            onAbort = () => reject(signal.reason ?? new Error("aborted"));
+            signal.addEventListener("abort", onAbort, { once: true });
           }
         }),
       ]);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      // Same `finally`, same guarantee: whatever happened, nothing of this race outlives it.
+      if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -1004,8 +1048,9 @@ export class Paylod {
    */
   webhookHandler(
     handler: (event: WebhookEvent) => void | Promise<void>,
-    options: { secret?: string; toleranceSec?: number } = {},
+    options: { secret?: string; toleranceSec?: number; bodyReadTimeoutMs?: number } = {},
   ): (request: Request) => Promise<Response> {
+    const bodyReadMs = resolveBodyReadMs(options.bodyReadTimeoutMs);
     return async (request: Request): Promise<Response> => {
       // THE BYTES ARE CAPPED BEFORE THEY ARE AUTHENTICATED, because there is no order in which
       // they could be authenticated first: verification needs the whole raw body. `request.text()`
@@ -1016,7 +1061,7 @@ export class Paylod {
       // the HMAC collapses distinct invalid-UTF-8 bodies onto one canonical byte string.
       let raw: Buffer;
       try {
-        raw = await readWebRequestBody(request);
+        raw = await readWebRequestBody(request, bodyReadMs);
       } catch (e) {
         return new Response(
           JSON.stringify({ error: e instanceof Error ? e.message : "cannot read body" }),
@@ -1078,12 +1123,13 @@ export class Paylod {
    */
   webhook(
     handler: (event: WebhookEvent) => void | Promise<void>,
-    options: { secret?: string; toleranceSec?: number } = {},
+    options: { secret?: string; toleranceSec?: number; bodyReadTimeoutMs?: number } = {},
   ): (req: ExpressLikeRequest, res: ExpressLikeResponse) => Promise<void> {
+    const bodyReadMs = resolveBodyReadMs(options.bodyReadTimeoutMs);
     return async (req: ExpressLikeRequest, res: ExpressLikeResponse): Promise<void> => {
       let raw: Buffer;
       try {
-        raw = await readRawBody(req);
+        raw = await readRawBody(req, bodyReadMs);
       } catch (e) {
         res.status(400).json({ error: e instanceof Error ? e.message : "cannot read body" });
         return;
@@ -1147,6 +1193,78 @@ function reportHandlerError(e: unknown): void {
   console.error("[paylod] webhook handler threw; responding 500 so paylod retries.", e);
 }
 
+/**
+ * How long an UNAUTHENTICATED webhook body may take to arrive, in milliseconds.
+ *
+ * The byte cap and this are two different controls and neither substitutes for the other. The cap
+ * bounds how much an anonymous caller can make this process ALLOCATE; it says nothing about how
+ * long they can make it WAIT. A request that dribbles one byte a minute stays under 1 MiB
+ * essentially forever, and both adapters awaited the next chunk with nothing bounding them — so a
+ * handful of such requests pins the handler, the connection and the caller's own request budget
+ * indefinitely, at no cost to the attacker. That is a slowloris, reached through the one route on
+ * a payments integration that is open to the internet by design.
+ *
+ * 10 seconds is ~4 orders of magnitude more than a real paylod event needs (a few hundred bytes
+ * on an already-established connection) and short enough that holding a worker is not free.
+ */
+export const DEFAULT_WEBHOOK_BODY_READ_MS = 10_000;
+
+/**
+ * The widest body-read deadline this SDK will accept. A bound a caller can set to `Infinity` is
+ * not a bound — the same reasoning as `MAX_TOLERANCE_SEC` on the replay window.
+ */
+export const MAX_WEBHOOK_BODY_READ_MS = 60_000;
+
+function resolveBodyReadMs(configured: number | undefined): number {
+  if (configured === undefined) return DEFAULT_WEBHOOK_BODY_READ_MS;
+  if (!Number.isFinite(configured) || configured <= 0) {
+    throw new PaylodConfigError(
+      "`bodyReadTimeoutMs` must be a finite positive number of milliseconds. The read deadline " +
+        "is what stops an anonymous slow-drip request from pinning the handler, so it cannot be " +
+        "disabled.",
+    );
+  }
+  return Math.min(Math.floor(configured), MAX_WEBHOOK_BODY_READ_MS);
+}
+
+/** The refusal, so both adapters say the same thing for the same reason. */
+function bodyReadTimedOut(ms: number, got: number): Error {
+  return new Error(
+    `Webhook body did not finish arriving within ${ms}ms (${got} bytes read). The bytes are not ` +
+      "authenticated until the whole body is here, so an unbounded wait is a hold an anonymous " +
+      "caller controls. The source has been cancelled.",
+  );
+}
+
+/**
+ * Race one read against the remaining budget.
+ *
+ * The timer is cleared on BOTH paths. Leaving it pending would keep the event loop alive for the
+ * full deadline after a body that arrived promptly — a per-request leak on the busiest route in
+ * the integration.
+ */
+async function readWithin<T>(next: Promise<T>, deadlineAt: number, onExpiry: () => void, got: number, ms: number): Promise<T> {
+  const remaining = deadlineAt - monotonicNowMs();
+  if (remaining <= 0) {
+    onExpiry();
+    throw bodyReadTimedOut(ms, got);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      next,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          onExpiry();
+          reject(bodyReadTimedOut(ms, got));
+        }, remaining);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** A declared length can be refused before a single byte is pulled. It is a hint, never a bound. */
 function assertDeclaredLengthOk(declared: string | null | undefined): void {
   if (typeof declared !== "string") return;
@@ -1186,8 +1304,9 @@ function assertDeclaredLengthOk(declared: string | null | undefined): void {
  * HMAC — the JSON parse at the far end is the only place a decode is legitimate, and by then the
  * bytes have already been authenticated.
  */
-async function readWebRequestBody(request: Request): Promise<Buffer> {
+async function readWebRequestBody(request: Request, bodyReadMs: number): Promise<Buffer> {
   assertDeclaredLengthOk(request.headers?.get?.("content-length"));
+  const deadlineAt = monotonicNowMs() + bodyReadMs;
 
   const body = request.body as ReadableStream<Uint8Array> | null | undefined;
   if (!body || typeof body.getReader !== "function") {
@@ -1207,7 +1326,16 @@ async function readWebRequestBody(request: Request): Promise<Buffer> {
   let total = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      // THE READ IS BOUNDED IN TIME AS WELL AS IN BYTES. On expiry the producer is CANCELLED,
+      // not merely abandoned: an abandoned stream keeps the connection and its buffers alive,
+      // which is most of what the attacker wanted.
+      const { done, value } = await readWithin(
+        reader.read(),
+        deadlineAt,
+        () => void reader.cancel().catch(() => {}),
+        total,
+        bodyReadMs,
+      );
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
@@ -1235,6 +1363,8 @@ export interface ExpressLikeRequest {
   body?: unknown;
   rawBody?: unknown;
   readableEnded?: boolean;
+  /** Node's `IncomingMessage.destroy`, where the runtime exposes it. Used to abandon a slow drip. */
+  destroy?: (error?: Error) => void;
   [Symbol.asyncIterator]?: () => AsyncIterator<Buffer | Uint8Array | string>;
 }
 
@@ -1263,7 +1393,7 @@ function assertBufferedSizeOk(bytes: number, source: string): void {
   }
 }
 
-async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
+async function readRawBody(req: ExpressLikeRequest, bodyReadMs: number): Promise<Buffer> {
   assertDeclaredLengthOk(
     typeof req.headers?.["content-length"] === "string"
       ? (req.headers["content-length"] as string)
@@ -1295,10 +1425,38 @@ async function readRawBody(req: ExpressLikeRequest): Promise<Buffer> {
   if (req.body === undefined && typeof req[Symbol.asyncIterator] === "function") {
     const chunks: Buffer[] = [];
     let total = 0;
-    for await (const chunk of req as AsyncIterable<Buffer | Uint8Array | string>) {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
+    const deadlineAt = monotonicNowMs() + bodyReadMs;
+    // Driven manually rather than with `for await`, because `for await` gives no way to bound the
+    // wait on the next chunk — which is the entire hold being closed here.
+    const it = (req as AsyncIterable<Buffer | Uint8Array | string>)[Symbol.asyncIterator]();
+    const abandon = (): void => {
+      // Destroy the socket where the runtime exposes it (Node's IncomingMessage does), and close
+      // the iterator otherwise. Either way the producer stops being this process's problem.
+      try {
+        req.destroy?.();
+      } catch {
+        /* nothing further to do — the deadline refusal is thrown regardless */
+      }
+      try {
+        void it.return?.(undefined as never);
+      } catch {
+        /* same */
+      }
+    };
+    for (;;) {
+      const { done, value } = await readWithin(
+        Promise.resolve(it.next()),
+        deadlineAt,
+        abandon,
+        total,
+        bodyReadMs,
+      );
+      if (done) break;
+      if (value === undefined || value === null) continue;
+      const buf = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
       total += buf.length;
       if (total > MAX_WEBHOOK_BODY_BYTES) {
+        abandon();
         throw tooLargeBody(`read ${total} bytes and stopped`);
       }
       chunks.push(buf);

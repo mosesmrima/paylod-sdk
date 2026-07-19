@@ -190,6 +190,58 @@ export type SimTransport = <T>(opts: {
 }) => Promise<T>;
 
 /**
+ * The production redactors and credential list, handed to the simulator rather than reimplemented
+ * inside it.
+ *
+ * The simulator ran `withIdempotencyKey(err, key, (m) => m)` — an IDENTITY redactor — and its two
+ * projectors called the shared validators with no `secrets` and no redactors at all. So the one
+ * surface every integrator's test suite runs against was the surface where a bearer key echoed in
+ * an error message, or carried in a `resultDesc` on a 2xx, sailed through untouched. That is the
+ * simulator's characteristic failure mode in this repo, and it has now appeared three rounds
+ * running under three different names: the simulator is LAXER than production, so a test goes
+ * green on a guarantee that is not actually in force. A simulator that certifies the opposite of
+ * production is worse than no simulator.
+ */
+export interface SimGuards {
+  /** Scrubs credentials out of any single string. */
+  readonly redactText: (s: string) => string;
+  /** The same scrub, through a parsed body. */
+  readonly redactBody: (b: unknown) => unknown;
+  /** Credentials that must not appear ANYWHERE in a successful body. */
+  readonly secrets: () => readonly string[];
+}
+
+/**
+ * Rebuild the outcome menu from an EXACT allowlist, dropping anything that is not one of the
+ * five outcomes this SDK knows how to ask for.
+ *
+ * The menu is server-controlled data on a public object, so it gets the same treatment every
+ * other server-controlled structure in this SDK gets: reconstructed field by field from values
+ * that were checked, never cast. `id` must be one of `SIM_OUTCOMES` — an id the SDK cannot ask
+ * for is not a choice, it is noise — and `label` / `status` are rebuilt rather than carried, so a
+ * sixth field cannot ride along inside an entry.
+ */
+function parseOutcomeMenu(parsed: unknown): readonly SimOutcomeChoice[] {
+  const raw = (parsed as { outcomes?: unknown } | null)?.outcomes;
+  if (!Array.isArray(raw)) return [];
+  const out: SimOutcomeChoice[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const id = e.id;
+    if (typeof id !== "string" || !(SIM_OUTCOMES as readonly string[]).includes(id)) continue;
+    const status = e.status;
+    if (status !== "success" && status !== "failed") continue;
+    out.push({
+      id: id as SimOutcomeId,
+      label: typeof e.label === "string" ? e.label : id,
+      status,
+    });
+  }
+  return out;
+}
+
+/**
  * The settle ack names the payment `paymentId`; a `Payment` names it `id`. Rename so the SHARED
  * payment validator can be run against it rather than a near-copy being written here — a
  * near-copy is how the simulator drifted from production in the first place.
@@ -228,10 +280,12 @@ function normalizeSettleAck(parsed: unknown): unknown {
 export class Simulator {
   readonly #apiKey: string;
   readonly #request: SimTransport;
+  readonly #guards: SimGuards;
 
-  constructor(apiKey: string, request: SimTransport) {
+  constructor(apiKey: string, request: SimTransport, guards: SimGuards) {
     this.#apiKey = apiKey;
     this.#request = request;
+    this.#guards = guards;
   }
 
   /** The five outcomes, typed. `for (const o of paylod.simulate.outcomes) …` */
@@ -317,13 +371,23 @@ export class Simulator {
             httpStatus: status,
             idempotencyKey,
             what: "simulate.collect()",
+            // THE PRODUCTION REDACTORS AND CREDENTIAL LIST. Omitting them here made the
+            // simulator's success boundary weaker than production's on exactly the check that
+            // keeps the bearer key out of a returned object.
+            redactBody: this.#guards.redactBody,
+            redactText: this.#guards.redactText,
+            secrets: this.#guards.secrets(),
           });
-          const raw = parsed as { outcomes?: unknown };
           return {
             paymentId: validated.paymentId,
             status: "pending",
             checkoutRequestId: validated.checkoutRequestId,
-            outcomes: Array.isArray(raw.outcomes) ? (raw.outcomes as SimOutcomeChoice[]) : [],
+            // REBUILT FROM AN ALLOWLIST, exactly like every other server-controlled array in
+            // this SDK. `raw.outcomes as SimOutcomeChoice[]` was a CAST, which is not a check:
+            // the entries reached a public object with whatever fields, and whatever field
+            // VALUES, the server chose. `label` in particular is free text that a test harness
+            // prints, so an echoed bearer key rode out inside it.
+            outcomes: parseOutcomeMenu(parsed),
             idempotencyKey,
           };
         },
@@ -331,7 +395,7 @@ export class Simulator {
 
       return ack;
     } catch (err) {
-      throw withIdempotencyKey(err, idempotencyKey, (m) => m);
+      throw withIdempotencyKey(err, idempotencyKey, (m) => this.#guards.redactText(m));
     }
   }
 
@@ -369,7 +433,7 @@ export class Simulator {
     } catch (err) {
       // Settling is a mutating call, so its failures carry the key AND the payment id — the two
       // handles needed to find out whether the settle landed before deciding anything else.
-      throw withIdempotencyKey(err, idempotencyKey, (m) => m, paymentId);
+      throw withIdempotencyKey(err, idempotencyKey, (m) => this.#guards.redactText(m), paymentId);
     }
   }
 
@@ -405,6 +469,9 @@ export class Simulator {
           httpStatus: status,
           expectedId: paymentId,
           what: "simulate.outcome()",
+          redactBody: this.#guards.redactBody,
+          redactText: this.#guards.redactText,
+          secrets: this.#guards.secrets(),
         });
         const raw = parsed as { webhookQueued?: unknown };
         // Build the outcome with the SAME classifier every other read uses. This is the point of
@@ -446,7 +513,12 @@ export class Simulator {
     try {
       return await this.outcome(created.paymentId, outcome, options);
     } catch (err) {
-      throw withIdempotencyKey(err, created.idempotencyKey, (m) => m, created.paymentId);
+      throw withIdempotencyKey(
+        err,
+        created.idempotencyKey,
+        (m) => this.#guards.redactText(m),
+        created.paymentId,
+      );
     }
   }
 }

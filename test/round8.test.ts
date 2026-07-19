@@ -31,6 +31,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Paylod, parseBounded } from "../src/client.js";
 import { withIdempotencyKey } from "../src/reconcile.js";
 import {
+  PaylodApiError,
   PaylodError,
   PaylodResponseTooLargeError,
   PaylodSignatureVerificationError,
@@ -344,5 +345,335 @@ describe("H4 the reconciliation envelope survives a throwable that fights back",
     const wrapped = withIdempotencyKey(err, "other-key", (m) => m);
     expect(wrapped).toBe(err);
     expect((wrapped as PaylodError).idempotencyKey).toBe("already-set");
+  });
+});
+
+// ── M7 — a contradictory 409 is never retried ────────────────────────────────────────────────
+
+describe("M7 an indeterminate 409 takes precedence over an in-progress one", () => {
+  const BOTH =
+    "This key is already in progress; a previous request was interrupted while the provider " +
+    "call was in flight.";
+
+  it("DOES NOT RE-DISPATCH a 409 whose message carries BOTH phrases", async () => {
+    const calls: string[] = [];
+    const fetch = vi.fn(async () => {
+      calls.push("x");
+      return new Response(JSON.stringify({ error: BOTH }), {
+        status: 409,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    await expect(
+      client(fetch, { maxRetries: 5 }).collect({
+        amount: 100,
+        phone: "0712345678",
+        idempotencyKey: "attempt-1",
+      }),
+    ).rejects.toThrow(PaylodApiError);
+
+    // The documented conservative result: ONE dispatch, no retries, even with five configured.
+    expect(calls.length).toBe(1);
+  });
+
+  it("a plain in-progress 409 is STILL retried — the fix discriminates", async () => {
+    const calls: string[] = [];
+    const fetch = vi.fn(async () => {
+      calls.push("x");
+      return new Response(JSON.stringify({ error: "That key is already in progress." }), {
+        status: 409,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    await expect(
+      client(fetch, { maxRetries: 2 }).collect({
+        amount: 100,
+        phone: "0712345678",
+        idempotencyKey: "attempt-1",
+      }),
+    ).rejects.toThrow(PaylodApiError);
+    expect(calls.length).toBe(3);
+  });
+
+  it("the PUBLIC getters agree with the retry decision", () => {
+    const both = new PaylodApiError(BOTH, 409, null, "attempt-1");
+    expect(both.isIdempotencyIndeterminate).toBe(true);
+    // The caller branching on this getter would replay a key that may already have moved money.
+    expect(both.isIdempotencyInProgress).toBe(false);
+
+    const plain = new PaylodApiError("already in progress", 409, null, "attempt-1");
+    expect(plain.isIdempotencyInProgress).toBe(true);
+    expect(plain.isIdempotencyIndeterminate).toBe(false);
+  });
+});
+
+// ── M6 — the webhook body-read deadline ──────────────────────────────────────────────────────
+
+describe("M6 a slow-drip webhook body cannot pin the handler forever", () => {
+  /** A Web `Request` whose body emits one byte and then never another. */
+  function drippingRequest(): Request {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{"));
+        // …and then nothing, ever.
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const req = new Request("https://example.test/webhooks", {
+      method: "POST",
+      body: stream,
+      headers: { "x-webhook-signature": "t=1,v1=" + "0".repeat(64) },
+      // `duplex` is required by undici for a streaming body; it is not in the DOM lib types.
+      ...({ duplex: "half" } as Record<string, unknown>),
+    });
+    Object.defineProperty(req, "wasCancelled", { get: () => cancelled });
+    return req;
+  }
+
+  it("REFUSES a Web Request body that stops arriving, and cancels the source", async () => {
+    const handler = vi.fn();
+    const route = client(vi.fn() as unknown as typeof globalThis.fetch).webhookHandler(handler, {
+      bodyReadTimeoutMs: 60,
+    });
+    const req = drippingRequest();
+
+    const started = Date.now();
+    const res = await route(req);
+    expect(res.status).toBe(400);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(handler).not.toHaveBeenCalled();
+    expect((req as unknown as { wasCancelled: boolean }).wasCancelled).toBe(true);
+  });
+
+  it("REFUSES an Express body that stops arriving, and destroys the request", async () => {
+    let destroyed = false;
+    const req = {
+      headers: { "x-webhook-signature": "t=1,v1=" + "0".repeat(64) },
+      destroy: () => {
+        destroyed = true;
+      },
+      [Symbol.asyncIterator]: () => ({
+        i: 0,
+        async next(): Promise<IteratorResult<Buffer>> {
+          if (this.i++ === 0) return { done: false, value: Buffer.from("{") };
+          return await new Promise(() => {}); // never settles
+        },
+      }),
+    };
+    const sent: { status?: number; body?: unknown } = {};
+    const res = {
+      status(code: number) {
+        sent.status = code;
+        return res;
+      },
+      json(body: unknown) {
+        sent.body = body;
+        return body;
+      },
+    };
+
+    const handler = vi.fn();
+    const mw = client(vi.fn() as unknown as typeof globalThis.fetch).webhook(handler, {
+      bodyReadTimeoutMs: 60,
+    });
+    await mw(req as never, res as never);
+
+    expect(sent.status).toBe(400);
+    expect(destroyed).toBe(true);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("a body that arrives promptly is unaffected", async () => {
+    const raw = JSON.stringify({
+      type: "payment.failed",
+      created: 1,
+      data: {
+        paymentId: "pay_1",
+        applicationId: "app_1",
+        env: "sandbox",
+        status: "failed",
+        amount: 100,
+        phone: "254712345678",
+        accountRef: null,
+        mpesaReceipt: null,
+        checkoutRequestId: "ws_1",
+        resultCode: 1032,
+        resultDesc: "Request cancelled by user",
+      },
+    });
+    const handler = vi.fn();
+    const route = client(vi.fn() as unknown as typeof globalThis.fetch).webhookHandler(handler, {
+      bodyReadTimeoutMs: 5_000,
+    });
+    const res = await route(
+      new Request("https://example.test/webhooks", {
+        method: "POST",
+        body: raw,
+        headers: { "x-webhook-signature": signWebhook(raw, SECRET, Math.floor(Date.now() / 1000)) },
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("the deadline cannot be disabled", () => {
+    const paylod = client(vi.fn() as unknown as typeof globalThis.fetch);
+    expect(() => paylod.webhookHandler(vi.fn(), { bodyReadTimeoutMs: 0 })).toThrow();
+    expect(() => paylod.webhookHandler(vi.fn(), { bodyReadTimeoutMs: Infinity })).toThrow();
+    expect(() => paylod.webhook(vi.fn(), { bodyReadTimeoutMs: -1 })).toThrow();
+  });
+});
+
+// ── M5 — simulator parity ────────────────────────────────────────────────────────────────────
+
+describe("M5 the simulator runs production's redactors and credential scans", () => {
+  const SIM_ACK = {
+    paymentId: "pay_sim_1",
+    status: "pending",
+    checkoutRequestId: "ws_sim_1",
+  };
+
+  it("REFUSES a simulator ack whose body echoes the API key", async () => {
+    const { fetch } = rawFetch(
+      JSON.stringify({ ...SIM_ACK, checkoutRequestId: `ws_${KEY}` }),
+      202,
+    );
+    await expect(
+      client(fetch).simulate.collect({ amount: 100, idempotencyKey: "sim-1" }),
+    ).rejects.toThrow();
+  });
+
+  it("REDACTS the API key out of a simulator failure's message", async () => {
+    const fetch = vi.fn(async () => {
+      throw new Error(`connect ECONNREFUSED (authorization: Bearer ${KEY})`);
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      await client(fetch).simulate.collect({ amount: 100, idempotencyKey: "sim-1" });
+      throw new Error("expected a failure");
+    } catch (e) {
+      expect(e).toBeInstanceOf(PaylodError);
+      expect((e as Error).message).not.toContain(KEY);
+      // The handle survives the redaction — that is the whole point of the envelope.
+      expect((e as PaylodError).idempotencyKey).toBe("sim-1");
+    }
+  });
+
+  it("REBUILDS the outcome menu from an allowlist instead of casting it", async () => {
+    const { fetch } = rawFetch(
+      JSON.stringify({
+        ...SIM_ACK,
+        outcomes: [
+          { id: "approve", label: "Paid", status: "success", __extra: "rides along" },
+          { id: "not_a_real_outcome", label: "Nope", status: "failed" },
+          { id: "wrong_pin", label: "Wrong PIN", status: "failed" },
+          "not even an object",
+        ],
+      }),
+      202,
+    );
+    const sim = await client(fetch).simulate.collect({ amount: 100, idempotencyKey: "sim-1" });
+
+    expect(sim.outcomes.map((o) => o.id)).toEqual(["approve", "wrong_pin"]);
+    for (const o of sim.outcomes) {
+      expect(Object.keys(o).sort()).toEqual(["id", "label", "status"]);
+    }
+  });
+});
+
+// ── L9 — abort listeners do not accumulate ───────────────────────────────────────────────────
+
+describe("L9 a resolved onPoll leaves nothing attached to the caller's signal", () => {
+  it("removes its abort listener on the SUCCESS path, not just on abort", async () => {
+    const controller = new AbortController();
+    let added = 0;
+    let removed = 0;
+    const realAdd = controller.signal.addEventListener.bind(controller.signal);
+    const realRemove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.addEventListener = ((...args: Parameters<typeof realAdd>) => {
+      if (args[0] === "abort") added++;
+      return realAdd(...args);
+    }) as typeof realAdd;
+    controller.signal.removeEventListener = ((...args: Parameters<typeof realRemove>) => {
+      if (args[0] === "abort") removed++;
+      return realRemove(...args);
+    }) as typeof realRemove;
+
+    const settled = {
+      id: "pay_1",
+      status: "success",
+      mpesaReceipt: "SFF6XYZ123",
+      resultCode: 0,
+      resultDesc: "ok",
+    };
+    const pending = { ...settled, status: "pending", mpesaReceipt: null, resultCode: null };
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      const body = n++ < 3 ? pending : settled;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    await client(fetch).wait("pay_1", {
+      signal: controller.signal,
+      timeoutMs: 20_000,
+      onPoll: async () => {
+        await new Promise((r) => setTimeout(r, 1));
+      },
+    });
+
+    // Every listener the onPoll race installed was taken back off again.
+    expect(added).toBeGreaterThan(0);
+    expect(removed).toBe(added);
+  });
+});
+
+// ── Cross-SDK check: the decompression bomb ──────────────────────────────────────────────────
+
+describe("cross-SDK: a small compressed body that expands hugely is refused", () => {
+  it("caps DECOMPRESSED bytes incrementally, so 16 KB of gzip cannot become 9 MB of heap", async () => {
+    // The Python sibling applied its cap AFTER automatic decompression, so a 9 KB gzip response
+    // produced a 9 MB allocation and defeated both the byte cap and the deadline before the
+    // reconciliation handles could escape.
+    //
+    // This runs against a REAL http server and the REAL global fetch, deliberately. A
+    // hand-constructed `Response` is not decompressed by undici — the decompression lives in the
+    // fetch pipeline — so a stubbed test here would prove nothing about the case in question and
+    // would pass whether the cap were before or after expansion.
+    const { createServer } = await import("node:http");
+    const { gzipSync } = await import("node:zlib");
+
+    const bomb = gzipSync(Buffer.alloc(9 * 1024 * 1024, 0x61));
+    expect(bomb.byteLength).toBeLessThan(64 * 1024); // genuinely small on the wire
+
+    const server = createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "content-length": String(bomb.byteLength),
+      });
+      res.end(bomb);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+
+    try {
+      const paylod = new Paylod(KEY, {
+        baseUrl: `http://127.0.0.1:${port}`,
+        allowInsecureBaseUrl: true,
+      } as never);
+      // Refused mid-expansion. The declared Content-Length is the COMPRESSED size and is well
+      // under the cap, so the only thing that can stop this is counting bytes as they inflate.
+      await expect(paylod.check("pay_1")).rejects.toThrow(PaylodResponseTooLargeError);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

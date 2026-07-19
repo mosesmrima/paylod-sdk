@@ -129,7 +129,17 @@ export class PaylodApiError extends PaylodError {
    * double-click the SDK usually never surfaces this — the duplicate simply waits.)
    */
   get isIdempotencyInProgress(): boolean {
-    return this.status === 409 && /already in progress/i.test(this.message);
+    // INDETERMINATE TAKES PRECEDENCE, exactly as it does in the client's own retry decision.
+    // This getter is a PUBLIC field with the same shape as the nested-`retryable` defect: a
+    // caller branching on it would honour Retry-After and replay a key whose first attempt may
+    // already have moved money. The two substring tests overlap; without precedence a message
+    // carrying both phrases reads as `true` on both getters, and the caller believes the safe
+    // one. When they disagree, the reading that does not re-dispatch a charge wins.
+    return (
+      this.status === 409 &&
+      /already in progress/i.test(this.message) &&
+      !this.isIdempotencyIndeterminate
+    );
   }
 
   /**
