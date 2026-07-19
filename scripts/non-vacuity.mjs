@@ -997,6 +997,152 @@ const CASES = [
     replace: "        if (false) {",
     test: "proves the sweep can actually fail",
   },
+
+  // ── ROUND 11 — the conformance specification ──────────────────────────────────────────────
+  //
+  // Each case reverts one requirement of docs/SDK-CONFORMANCE.md to the behaviour round 10 found.
+
+  {
+    id: "S33-receipt-grammar",
+    what: "every nonblank receipt is settlement evidence again, so a placeholder proves payment",
+    file: "src/grammar.ts",
+    find: "const RECEIPT_RE = /^[A-Z0-9]{10}$/;",
+    replace: "const RECEIPT_RE = /^.*\\S.*$/;",
+    test: "does NOT report paid for status success with a redacted receipt and no result code",
+  },
+  {
+    id: "S33-receipt-control",
+    what: "the receipt grammar over-corrects and refuses REAL receipts too",
+    file: "src/grammar.ts",
+    find: "const RECEIPT_RE = /^[A-Z0-9]{10}$/;",
+    replace: "const RECEIPT_RE = /^(?!)$/;",
+    // THE CONTROL DIRECTION. An SDK that calls every receipt invalid is also non-conformant, and
+    // the mutation above cannot detect that. This one does.
+    test: "still reports paid for status success with a REAL receipt and no result code",
+  },
+  {
+    id: "S34-identifier-grammar",
+    what: "a sanitizer placeholder is accepted as a paymentId again",
+    file: "src/grammar.ts",
+    find: "const IDENTIFIER_RE = /^[A-Za-z0-9_.:-]{1,128}$/;",
+    replace: "const IDENTIFIER_RE = /^.*\\S.*$/;",
+    test: "refuses [redacted] as a collect-ack paymentId",
+  },
+  {
+    id: "S34-idem-sentinel",
+    what: "a redacted log value is accepted as an idempotency key again",
+    file: "src/validate.ts",
+    find: "  if (looksSanitized(key)) {",
+    replace: "  if (false) {",
+    test: "refuses [redacted] as a caller-supplied idempotency key",
+  },
+  {
+    id: "S23-duplicate",
+    what: "duplicate money-critical members are resolved by the parser instead of refused",
+    file: "src/json.ts",
+    find: "        if (scope.has(memberName)) refuseDuplicate(memberName);",
+    replace: "        if (false) refuseDuplicate(memberName);",
+    test: "refuses two resultCode members whose values disagree",
+  },
+  {
+    id: "S23-duplicate-scope",
+    what: "the duplicate rule loses its per-object scope and refuses ordinary bodies",
+    file: "src/json.ts",
+    find: "      scopes.push(new Set());",
+    replace: "      void 0;",
+    // THE CONTROL DIRECTION: over-refusal is also a defect. Without per-object scoping, two
+    // sibling objects each carrying `status` are wrongly refused.
+    test: "accepts the same member name in two DIFFERENT objects",
+  },
+  {
+    id: "S42-lexeme-leak",
+    what: "the numeric-lexeme refusal interpolates raw server bytes again",
+    file: "src/json.ts",
+    find: "  const shape = describeLexemeShape(rawLexeme);",
+    replace: "  const shape = `the JSON number \\`${rawLexeme.slice(0, 32)}\\``;",
+    test: "does NOT echo a credential embedded in a non-canonical numeric lexeme",
+  },
+  {
+    id: "S26-fatal-decode",
+    what: "response bytes are decoded with replacement semantics again",
+    file: "src/json.ts",
+    find: '    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);',
+    replace: "    return new TextDecoder().decode(bytes);",
+    test: "refuses a lone continuation byte rather than yielding U+FFFD",
+  },
+  {
+    id: "S26-collapse",
+    what: "distinct invalid byte sequences collapse into one identical string again",
+    file: "src/json.ts",
+    find: '    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);',
+    replace: "    return new TextDecoder().decode(bytes);",
+    test: "does not let two distinct invalid byte sequences collapse into one string",
+  },
+  {
+    id: "S54-paymentid",
+    what: "a refused acknowledgement discards a usable payment id again",
+    file: "src/validate.ts",
+    find: "      salvagedPaymentId(),",
+    replace: "      undefined,",
+    test: "carries the payment id off a malformed 202 that still has a usable one",
+  },
+  {
+    id: "S54-no-launder",
+    what: "the salvaged payment id skips the grammar, so a placeholder is attached",
+    file: "src/validate.ts",
+    find: "    if (!isValidIdentifier(candidate)) return undefined;",
+    replace: "    if (typeof candidate !== \"string\") return undefined;",
+    test: "does NOT attach a placeholder payment id",
+  },
+  {
+    id: "S41-shapes",
+    what: "only CONFIGURED credentials are redacted, so another party's key rides out",
+    file: "src/grammar.ts",
+    find: "  return text.replace(CREDENTIAL_SHAPE_RE, \"[redacted]\");",
+    replace: "  return text;",
+    test: "redacts mp_live_SOMEONE_ELSES_KEY",
+  },
+  {
+    id: "S49-offline",
+    what: "the public offline decoder stops redacting, as it did before",
+    file: "src/daraja-catalog.ts",
+    find: "  return typeof resultDesc === \"string\" ? redactCredentialShapes(resultDesc.trim()) : \"\";",
+    replace: "  return typeof resultDesc === \"string\" ? resultDesc.trim() : \"\";",
+    test: "keeps mp_live_LEAKED_VIA_DESC out of the bare decodeDarajaResult output",
+  },
+  {
+    id: "S65-sigheader",
+    what: "the signature header is split with no length bound again",
+    file: "src/webhook.ts",
+    find: "  if (header.length > MAX_SIGNATURE_HEADER_CHARS) return null;",
+    replace: "  void MAX_SIGNATURE_HEADER_CHARS;",
+    test: "refuses an oversized signature header instead of tokenising it",
+  },
+  {
+    id: "S86-sweep-coverage",
+    what: "the sweep stops noticing that a public type was never constructed",
+    file: "test/conformance-sweep.test.ts",
+    find: "    const missing = REQUIRED_TYPES.filter((t) => !constructed.has(t));",
+    replace: "    const missing = [];",
+    test: "constructed every public type it claims to cover",
+  },
+  {
+    id: "S86-sweep-expected",
+    what: "the sweep accepts any clean exception again instead of the declared class",
+    file: "test/conformance-sweep.test.ts",
+    find: "    if (!(e instanceof expected)) {",
+    replace: "    if (false) {",
+    test: "proves the expected-outcome requirement can actually fail",
+  },
+  {
+    id: "S53-built-artifact",
+    what: "the unsafe-path warning goes back to once per process, probed against the BUILT dist",
+    file: "src/validate.ts",
+    find: "function warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  console.warn(",
+    replace:
+      "let warnedOnceDist = false;\nfunction warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  if (warnedOnceDist) return;\n  warnedOnceDist = true;\n  console.warn(",
+    test: "warns on EVERY unprotected call in the BUILT artifact, not just in source",
+  },
 ];
 
 const results = [];
