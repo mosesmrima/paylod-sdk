@@ -178,3 +178,47 @@ describe("the grammar helpers themselves discriminate", () => {
     expect(looksSanitized("attempt_99182")).toBe(false);
   });
 });
+
+describe("spec 3.5 / 1.5 — a code that is not evidence resolves to indeterminate", () => {
+  it.each([77777, "77777", 424242])(
+    "a canonically-shaped code the catalog never heard of (%s) is NOT a terminal failure",
+    (code) => {
+      expect(judge(p({ status: "failed", resultCode: code as never })).verdict).toBe(
+        "indeterminate",
+      );
+    },
+  );
+
+  it.each(["500.0", " 1032", "1.032e3", "1032.0", "+0"])(
+    "a NON-canonical code (%j) is not evidence the prompt is live either",
+    (code) => {
+      expect(judge(p({ status: "failed", resultCode: code })).verdict).toBe("indeterminate");
+    },
+  );
+
+  /**
+   * THE CONTROLS. An SDK that answers indeterminate to everything is also non-conformant, and
+   * both of these are revenue-protecting paths that must survive.
+   */
+  it("a GENUINE catalog failure code is still a terminal failure", () => {
+    expect(judge(p({ status: "failed", resultCode: 1032 })).verdict).toBe("failed");
+  });
+
+  it("a catalogued PENDING code on a failed row is still in_flight — the prompt is live", () => {
+    expect(judge(p({ status: "failed", resultCode: 4999 })).verdict).toBe("in_flight");
+  });
+
+  it("the still-processing prose safety net survives for a canonical uncatalogued code", () => {
+    // This net lives on the canonical-numeric branch and guards against a pending code paylod
+    // has not catalogued yet. Reporting that as indeterminate would be safe; reporting it as
+    // in_flight is BETTER, because the wait keeps polling a prompt that is genuinely live.
+    const v = judge(
+      p({
+        status: "failed",
+        resultCode: 88888,
+        resultDesc: "The transaction is still under processing",
+      }),
+    ).verdict;
+    expect(v).toBe("in_flight");
+  });
+});

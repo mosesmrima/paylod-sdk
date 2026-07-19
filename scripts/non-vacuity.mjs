@@ -920,8 +920,8 @@ const CASES = [
     // layers, exactly as R1-live and D2-coerce do.
     also: {
       file: "src/semantics.ts",
-      find: "    rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode)",
-      replace: "    false",
+      find: "    (rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode))",
+      replace: "    (false)",
     },
     test: "JUDGE: `failed` plus a one-dot code is INDETERMINATE, not a terminal failure",
   },
@@ -938,8 +938,8 @@ const CASES = [
     // layers, exactly as R1-live and D2-coerce do.
     also: {
       file: "src/semantics.ts",
-      find: "    rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode)",
-      replace: "    false",
+      find: "    (rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode))",
+      replace: "    (false)",
     },
     test: "WEBHOOK: an otherwise-valid payment.failed carrying a one-dot code is REFUSED",
   },
@@ -1174,6 +1174,31 @@ const CASES = [
     find: "    if (!(e instanceof expected)) {",
     replace: "    if (false) {",
     test: "proves the expected-outcome requirement can actually fail",
+  },
+  {
+    id: "S15-uncatalogued",
+    what: "a canonical code the catalog never heard of is a confident terminal failure again",
+    file: "src/semantics.ts",
+    find: "    (rawCodeEvidence === \"failure\" && !isCataloguedCode(payment.resultCode))",
+    replace: "    (false)",
+    test: "a canonically-shaped code the catalog never heard of",
+  },
+  {
+    id: "S15-noncanonical",
+    what: "a non-canonical code claims the prompt is still live again",
+    file: "src/semantics.ts",
+    find: "    codePresentButNotCanonical ||",
+    replace: "    false ||",
+    test: "is not evidence the prompt is live either",
+  },
+  {
+    id: "S15-control",
+    what: "the unknown rule over-corrects and swallows a GENUINE catalog failure",
+    file: "src/semantics.ts",
+    find: "    codePresentButNotCanonical ||",
+    replace: "    hasResultCode(payment) ||",
+    // CONTROL DIRECTION: calling everything unknown is also non-conformant.
+    test: "a GENUINE catalog failure code is still a terminal failure",
   },
   {
     id: "S53-built-artifact",

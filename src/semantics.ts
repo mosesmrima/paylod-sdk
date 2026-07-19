@@ -175,8 +175,23 @@ export function evidenceFor(payment: Payment): PaymentEvidence {
   // The catalog is the authority on which codes have a known meaning, and it is the same table
   // the retryability decision already comes from — so this cannot drift from what the SDK claims
   // to know.
+  //
+  // A NON-CANONICAL code is `unknown` too (spec 3.5 row 7). `classifyStkResult` answers `pending`
+  // for anything whose FORM it refuses — `"500.0"`, `" 1032"`, `"1.032e3"` — which is the right
+  // conservative answer to "did this fail?" but reads here as `in_flight`, i.e. a positive claim
+  // that the prompt is still live on the handset. A garbled code is not evidence of that either.
+  // It is not evidence of anything, which is what `unknown` means.
+  //
+  // This loses none of the "still processing" safety net: that net (PENDING_DESC_RE) lives on the
+  // CANONICAL-numeric branch of the classifier, and a non-canonical code returns from an earlier
+  // branch without ever consulting the description. A canonical uncatalogued code whose prose
+  // says "still under processing" is still classified pending and still resolves to `in_flight`.
+  const codePresentButNotCanonical =
+    hasResultCode(payment) && canonicalCodeForm(payment.resultCode).kind !== "canonical";
+
   const codeEvidence: PaymentEvidence =
-    rawCodeEvidence === "failure" && !isCataloguedCode(payment.resultCode)
+    codePresentButNotCanonical ||
+    (rawCodeEvidence === "failure" && !isCataloguedCode(payment.resultCode))
       ? "unknown"
       : rawCodeEvidence;
 
