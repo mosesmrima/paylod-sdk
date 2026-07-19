@@ -319,6 +319,16 @@ describe("H4 the reconciliation envelope survives a throwable that fights back",
     expect((wrapped as PaylodError).paymentId).toBe("pay_1");
   });
 
+  it("a hostile throwable is reconciled NORMALLY, not by the last-resort fallback", () => {
+    // There are two ways to end up holding both handles: the guarded `instanceof` lets the
+    // ordinary path complete, or the outer wrapper catches the explosion and synthesises the
+    // fallback. Both satisfy the test above, which is exactly why that test cannot certify the
+    // INNER guard on its own. The two paths write different messages, so this one can.
+    const wrapped = withIdempotencyKey(hostileThrowable(), "attempt-1", (m) => m, "pay_1") as Error;
+    expect(wrapped.message).toMatch(/INDETERMINATE/);
+    expect(wrapped.message).not.toMatch(/could not be inspected/);
+  });
+
   it("a throwing REDACTOR cannot strip the handles either", () => {
     const wrapped = withIdempotencyKey(
       new Error("boom"),
@@ -676,4 +686,47 @@ describe("cross-SDK: a small compressed body that expands hugely is refused", ()
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+});
+
+// ── L-onPoll — a floating callback is observable only when it outlasts the interval ───────────
+
+describe("H4 onPoll callbacks are awaited, not fired and forgotten", () => {
+  it("never runs two onPoll callbacks at once, even when one outlasts the poll interval", async () => {
+    // The existing ordering test uses a 10ms callback against a ~1s poll interval, so start/end
+    // never interleave whether the await is there or not — it passed with the fix reverted. A
+    // floating promise is only OBSERVABLE when the callback is still running when the next poll
+    // comes round, so the callback here is deliberately longer than the interval.
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const pending = { id: "pay_1", status: "pending", mpesaReceipt: null, resultCode: null };
+    const settled = {
+      id: "pay_1",
+      status: "success",
+      mpesaReceipt: "SFF6XYZ123",
+      resultCode: 0,
+      resultDesc: "ok",
+    };
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      const body = n++ < 3 ? pending : settled;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    await client(fetch).wait("pay_1", {
+      timeoutMs: 60_000,
+      onPoll: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 2_500));
+        inFlight--;
+      },
+    });
+
+    expect(maxInFlight).toBeGreaterThan(0);
+    expect(maxInFlight).toBe(1);
+  }, 60_000);
 });

@@ -80,6 +80,9 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Non-vacuity (mutation certification)
+        run: npm run non-vacuity
+
       - name: Build
         run: npm run build
 

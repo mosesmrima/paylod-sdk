@@ -3,6 +3,102 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.11.0
+
+The eighth independent review. Ten findings, four of them High, plus four cross-SDK roots checked
+in Node because each had already turned up in two or more sibling SDKs wearing different clothes.
+
+The theme of this round is that a guarantee can be true of a VALUE and false of its SPELLING, and
+true at the TOP LEVEL and false one field down.
+
+### Breaking changes
+
+- **A `resultCode` spelt as a non-canonical JSON number is refused, not parsed.** `JSON.parse`
+  maps `0.0`, `0e999`, `-0`, `1032.0` and `1.032e3` onto the same doubles as `0` and `1032`, so a
+  response body could declare itself PAID, or declare a cancellation RETRYABLE, in a spelling that
+  no strictness check downstream could still see — by the time `canonicalCodeForm` holds a
+  `number`, the spelling it was written in no longer exists. The check therefore moved to the
+  text, in a new bounded parser both the API path and the signed webhook path share. Member names
+  are escape-decoded before matching (`"\u0072esultCode"` is the same member to every JSON parser,
+  and a raw-bytes key search walks straight past it — that is exactly how the PHP sibling was
+  bypassed), and every duplicate occurrence is checked rather than only the parser's winner.
+
+  paylod does not emit these spellings. If you see this error, something between you and paylod is
+  rewriting bodies. The error says INDETERMINATE and carries the guidance to read the payment.
+
+- **A correctly-signed webhook body containing one of your own credentials is refused, not
+  stripped.** Previously an unknown field carrying the API key was silently dropped during
+  reconstruction. Dropping it is not enough: `verifyWebhookSignature` hands back the raw parsed
+  body, and the schema diagnostics quote field values into messages that land in 400 responses and
+  logs. A signed body containing our credential is evidence that something upstream is echoing it,
+  and the honest response is to stop.
+
+- **`detail.retryable` is `false` on every verdict except a proven terminal failure.** If you were
+  reading the nested flag rather than the top-level one, you were reading a field that could say
+  "another charge is safe" about a payment we could not prove anything about.
+
+### Fixed
+
+- **Nested `retryable` contradicted the top-level one (High).** The decoded block was resolved
+  before the verdict and spread into every branch, so an indeterminate payment came back with
+  `retryable: false` beside `detail.retryable: true`. Both are public, both answer the same
+  question, and they answered it differently. The block is now resolved after the verdict. The
+  same defect shipped in the JVM and Python SDKs.
+
+- **The webhook verifier scanned the signing secret and not the API key (High).** The class
+  wrapper — the path essentially every integration takes — never passed the key in, so the
+  credential that moves money was the one a signed body could echo into a handler's logs. The scan
+  now runs on the parsed body before the first schema diagnostic can quote a field value, covers
+  every credential the client holds, and guards the signature-only helper as well.
+
+- **The reconciliation envelope could be thrown out of (High).** `instanceof` is a call, not an
+  inspection: it invokes a `Proxy`'s `getPrototypeOf` trap, which is attacker-controlled code and
+  can throw. A hostile throwable blew up on the wrapper's first statement and escaped carrying
+  neither the idempotency key nor the payment id — the failure mode most likely to involve a
+  hostile value was the one that stripped the recovery information. The check is guarded, the
+  redactor is guarded, and the wrapper as a whole is now non-throwing with an unconditional
+  fallback that carries both handles.
+
+- **The simulator ran an identity redactor and no credential scan (Medium).** Its two projectors
+  called the shared validators without production's `secrets` and redactors, and its error
+  envelopes redacted nothing — so the surface every integrator's test suite runs against was the
+  one surface a leaked bearer key survived. It now receives production's guards. The outcome menu
+  is rebuilt from an exact allowlist instead of cast.
+
+- **Webhook body reads had a byte cap and no deadline (Medium).** A request dribbling one byte a
+  minute stays under 1 MiB essentially forever. Both adapters now bound the read with a
+  configurable `bodyReadTimeoutMs` (10s default, 60s ceiling, cannot be disabled) and cancel or
+  destroy the source on expiry rather than abandoning it.
+
+- **A contradictory 409 was retried (Medium).** The "already in progress" and "interrupted while
+  the provider call was" patterns are not disjoint, and a message carrying both was retried — the
+  SDK dispatched a charge a second time against a key whose first attempt may already have taken
+  the customer's money. Indeterminate now takes precedence, in the retry decision and in the
+  public `isIdempotencyInProgress` getter, which had the same overlap.
+
+- **Signed webhook JSON bypassed the parse-depth budget (Low).** A valid signature proves who sent
+  the bytes, not that the bytes are safe to parse.
+
+- **Resolved `onPoll` races left abort listeners attached (Low).** `{ once: true }` only removes a
+  listener that fired; the common case is the race resolving, so listeners accumulated on the
+  caller's reusable signal across every poll of a `wait()`.
+
+### Testing
+
+- **The mutation harness certified less than it appeared to (Low).** vitest's `-t` is a REGEX, so
+  a test name containing `()` silently selected ZERO tests while the runner exited 0 — which reads
+  as a live selector. Selectors are now escaped, one case was pointed at a genuinely
+  discriminating test instead of one that passed either way, and one was repointed so it can
+  produce a verdict at all rather than only `HARNESS-ERROR`. Sixteen round-8 cases were added, and
+  the harness now runs in CI, in the release workflow and in `prepublishOnly` — a certification
+  nothing gates is documentation.
+
+- **A decompression bomb is proven refused.** The Python sibling applied its response cap after
+  automatic decompression, turning 9 KB of gzip into 9 MB of heap. Node's cap is enforced chunk by
+  chunk on the decompressed stream, and the test runs against a real HTTP server and the real
+  global `fetch` — a hand-constructed `Response` is not decompressed by undici and would have
+  proven nothing.
+
 ## 0.10.0
 
 **Breaking, and the reason for the version bump.** One finding, rated High by the independent

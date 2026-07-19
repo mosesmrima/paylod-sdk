@@ -431,9 +431,22 @@ const event = paylod.verifyWebhook({
   payload: rawBodyStringOrBuffer,
   signature: req.headers["x-webhook-signature"],
   secret: process.env.PAYLOD_WEBHOOK_SECRET,  // optional if set on the client
-  toleranceSec: 300,                          // optional; 0 disables the freshness check
+  toleranceSec: 300,                          // optional; must be positive, cannot be disabled
 });
 ```
+
+The freshness check cannot be turned off — `0` is refused, and so is a window wide enough to be
+one in name only. To verify a fixed vector, pin `nowSec` instead of widening `toleranceSec`.
+
+Both framework adapters also accept `bodyReadTimeoutMs` (default `10_000`, ceiling `60_000`):
+
+```ts
+app.post("/webhooks/paylod", paylod.webhook(handler, { bodyReadTimeoutMs: 5_000 }));
+```
+
+The body-size cap bounds how much an anonymous caller can make your process ALLOCATE; this bounds
+how long they can make it WAIT. A request that dribbles one byte a minute stays under the size cap
+essentially forever, so both controls are needed and neither substitutes for the other.
 
 Throws `PaylodSignatureVerificationError` (with `.reason`: `missing_signature` | `malformed_signature` | `stale_timestamp` | `no_match` | `invalid_payload`) on any failure. It never returns a half-trusted value.
 

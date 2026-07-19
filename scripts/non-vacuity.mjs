@@ -10,7 +10,7 @@
  * Exit code 0 only if every mutation was caught.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
 /**
@@ -149,9 +149,13 @@ const CASES = [
   {
     id: "B-key",
     what: "escaping failures are not normalised, so a primitive throw loses the key",
-    file: "src/client.ts",
-    find: "  const wrapped = new PaylodConnectionError(",
-    replace: "  if (!(err instanceof PaylodError)) return err;\n  const wrapped = new PaylodConnectionError(",
+    // `withIdempotencyKey` lives in `reconcile.ts` since 0.9.0. The anchor still named
+    // `client.ts`, so this case had been silently BROKEN-ANCHOR ever since — a stale anchor is
+    // the third way (after a zero selector and a vacuous test) for a certification to certify
+    // nothing while looking green.
+    file: "src/reconcile.ts",
+    find: "  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
+    replace: "  if (!isPaylodError(err)) return err;\n  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
     test: "carries it when user code throws a PRIMITIVE",
   },
   {
@@ -284,8 +288,8 @@ const CASES = [
     id: "H1-web",
     what: "the Web Request adapter buffers the unauthenticated body with request.text()",
     file: "src/client.ts",
-    find: "        raw = await readWebRequestBody(request);",
-    replace: "        raw = await request.text();",
+    find: "        raw = await readWebRequestBody(request, bodyReadMs);",
+    replace: "        raw = Buffer.from(await request.text(), \"utf8\");",
     test: "refuses an oversized STREAMED body without buffering it",
   },
   {
@@ -294,6 +298,17 @@ const CASES = [
     file: "src/client.ts",
     find: '    assertBufferedSizeOk(req.body.length, "req.body");',
     replace: "    void 0;",
+    // The pre-buffered cap is enforced in the adapter AND again inside `toBoundedBuffer`, so
+    // reverting one alone proves nothing — the other still holds the line and the test goes on
+    // passing for a different reason. The mutation has to remove the GUARANTEE, not one of its
+    // two implementations. Same shape as `R1-live`.
+    also: {
+      file: "src/webhook.ts",
+      find: `  if (declared > MAX_WEBHOOK_BODY_BYTES) {
+    throw tooLargeBody(\`the payload passed to verify() is \${declared} bytes\`);
+  }`,
+      replace: "  void declared;",
+    },
     test: "refuses an oversized pre-buffered Buffer body",
   },
   {
@@ -394,10 +409,12 @@ const CASES = [
   {
     id: "D6-frozen",
     what: "a frozen error is returned as-is, losing the handle (the JVM defect)",
-    file: "src/client.ts",
-    find: "  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
-    replace:
-      "  if (err instanceof PaylodError) return err;\n  const wrapped = new PaylodConnectionError(\n    `The charge attempt failed and its state is INDETERMINATE",
+    file: "src/reconcile.ts",
+    // The anchor used to sit after the assignment that THROWS for a frozen error, so the mutated
+    // line was unreachable and the case measured nothing. The defect being reverted is the catch:
+    // the JVM sibling returned the frozen error as-is, handles and all missing.
+    find: "    } catch {\n      /* frozen / read-only — wrap below */\n    }",
+    replace: "    } catch {\n      return err;\n    }",
     test: "carries BOTH when a FROZEN PaylodError escapes after the ack",
   },
   {
@@ -411,7 +428,7 @@ const CASES = [
   {
     id: "D7-depth",
     what: "JSON is parsed with no depth budget",
-    file: "src/client.ts",
+    file: "src/json.ts",
     find: "      if (depth > maxDepth) {",
     replace: "      if (false) {",
     test: "refuses a JSON document nested past the depth cap",
@@ -553,14 +570,28 @@ const CASES = [
     file: "src/client.ts",
     find: "        await this.#awaitOnPoll(options.onPoll(payment), payment, deadline, options.signal);",
     replace: "        void options.onPoll(payment);",
-    test: "an async onPoll REJECTION fails the call instead of becoming an unhandled rejection",
+    // NOT the REJECTION test: dropping the await turns its rejection into an UNHANDLED one, which
+    // the harness correctly refuses to score as CAUGHT — so that pairing could only ever produce
+    // HARNESS-ERROR. Nor the ORDERING test: its callback finishes in 10ms and the poll interval
+    // is ~1s, so start/end never interleave whether the await is there or not — it passed both
+    // ways. THIS test uses a callback LONGER than the poll interval, which is the only shape in
+    // which a floating promise is observable at all.
+    test: "never runs two onPoll callbacks at once, even when one outlasts the poll interval",
   },
   {
     id: "R7-render-throwable",
     what: "the reconciliation wrapper calls String(err) unprotected again",
     file: "src/reconcile.ts",
-    find: "  const detail = redact(renderThrowable(err));",
-    replace: "  const detail = redact(err instanceof Error ? err.message : String(err));",
+    find: "  const detail = safeRedact(redact, renderThrowable(err));",
+    replace: "  const detail = safeRedact(redact, err instanceof Error ? err.message : String(err));",
+    // Round 8 added an outer guard around the whole wrapper, which catches the unprotected
+    // `String(err)` and synthesises a fallback that carries both handles — so this edit alone
+    // stopped removing the guarantee. Both layers go, exactly as in `R8-envelope-total`.
+    also: {
+      file: "src/reconcile.ts",
+      find: "  } catch {\n    // NOTHING gets past this.",
+      replace: "  } catch (rethrow) {\n    throw rethrow;\n    // NOTHING gets past this.",
+    },
     test: "wraps a throwing toString into an error that still carries BOTH handles",
   },
   {
@@ -569,7 +600,12 @@ const CASES = [
     file: "src/webhook.ts",
     find: "  const raw = toBoundedBuffer(payload);",
     replace: "  const raw = Buffer.from(toBoundedBuffer(payload).toString('utf8'), 'utf8');",
-    test: "two DIFFERENT invalid-UTF-8 bodies do not share a signature",
+    // NOT "two DIFFERENT invalid-UTF-8 bodies do not share a signature": that test keeps passing
+    // after the decode/re-encode is restored, because it goes on rejecting the mismatched
+    // signature for an unrelated reason. A test that passes either way certifies nothing. THIS
+    // one is the discriminating half of the pair — it asserts that an invalid-UTF-8 body gets
+    // PAST the signature check, which is exactly what a lossy decode destroys.
+    test: "verifies a body containing INVALID UTF-8 — which a decode round trip would destroy",
   },
   {
     id: "R7-manual-cap",
@@ -585,9 +621,10 @@ const CASES = [
     id: "R7-sim-envelope",
     what: "simulator outcome failures escape without the effective idempotency key",
     file: "src/simulate.ts",
-    find: "      throw withIdempotencyKey(err, idempotencyKey, (m) => m, paymentId);",
+    find: "      throw withIdempotencyKey(err, idempotencyKey, (m) => this.#guards.redactText(m), paymentId);",
     replace: "      throw err;",
-    test: "simulate.outcome failures carry the derived key AND the payment id",
+    // The `()` in this name is why the selector must be escaped — see `exact()`.
+    test: "simulate.outcome() failures carry the derived key AND the payment id",
   },
   {
     id: "R7-sim-validators",
@@ -626,14 +663,192 @@ const CASES = [
     },
     test: "ignores a payload that asserts the OPPOSITE",
   },
+
+  // ── ROUND 8 ────────────────────────────────────────────────────────────────────────────────
+  {
+    id: "R8-lexeme",
+    what: "JSON numbers are parsed without the money-critical lexeme check",
+    file: "src/json.ts",
+    find: "      if (!CANONICAL_JSON_INTEGER_RE.test(lexeme)) {\n        refuseLexeme(decodeMemberName(rawBody), lexeme);\n      }",
+    replace: "      void lexeme;",
+    test: "refuses a status body whose resultCode is spelt 1032.0",
+  },
+  {
+    id: "R8-lexeme-escaped",
+    what: "the member-name scan matches raw bytes instead of decoding escapes",
+    file: "src/json.ts",
+    find: "  if (!rawBody.includes(\"\\\\\")) return rawBody;",
+    replace: "  return rawBody;\n  // eslint-disable-next-line no-unreachable\n  if (!rawBody.includes(\"\\\\\")) return rawBody;",
+    test: "an ESCAPED member name is decoded before the key is matched",
+  },
+  {
+    id: "R8-webhook-parse",
+    what: "the signed webhook path goes back to a bare JSON.parse",
+    file: "src/webhook.ts",
+    find: "    decodedBody = parseBounded(raw.toString(\"utf8\"));",
+    replace: "    decodedBody = JSON.parse(raw.toString(\"utf8\"));",
+    test: "a laundered resultCode is refused on the SIGNED WEBHOOK path too",
+  },
+  {
+    id: "R8-nested-retryable",
+    what: "the decoded detail block is resolved BEFORE the verdict again",
+    file: "src/outcome.ts",
+    find: "  const safeDetail = verdict === \"failed\" ? detail : withoutRetryability(detail);",
+    replace: "  const safeDetail = detail;",
+    test: "an INDETERMINATE verdict exposes no true retryable anywhere, top level or nested",
+  },
+  {
+    id: "R8-webhook-secrets",
+    what: "the webhook verifier scans only the signing secret again",
+    file: "src/webhook.ts",
+    find: "  if (typeof params.apiKey === \"string\" && params.apiKey) out.push(params.apiKey);",
+    replace: "  void params;",
+    test: "REFUSES a signed body whose resultDesc echoes the API KEY, not just the signing secret",
+  },
+  {
+    id: "R8-webhook-prescan",
+    what: "the credential scan runs only on the reconstructed event, after the diagnostics",
+    file: "src/webhook.ts",
+    find: "  if (containsSecret(decodedBody, liveSecrets(params))) {",
+    replace: "  if (false) {",
+    test: "a SCHEMA DIAGNOSTIC never quotes a credential back to the caller",
+  },
+  {
+    id: "R8-instanceof",
+    what: "the reconciliation wrapper inspects the throwable with a bare instanceof",
+    file: "src/reconcile.ts",
+    find: "    return err instanceof PaylodError;\n  } catch {\n    return false;\n  }",
+    replace: "    return err instanceof PaylodError;\n  } finally {\n    /* unguarded */\n  }",
+    test: "a hostile throwable is reconciled NORMALLY, not by the last-resort fallback",
+  },
+  {
+    id: "R8-envelope-total",
+    what: "the reconciliation wrapper is throwable again (no outer guard)",
+    file: "src/reconcile.ts",
+    find: "  } catch {\n    // NOTHING gets past this.",
+    replace: "  } catch (rethrow) {\n    throw rethrow;\n    // NOTHING gets past this.",
+    // BOTH guards, because either one alone still produces an error carrying both handles: the
+    // inner `isPaylodError` stops the throw, and the outer wrapper catches it if the inner one
+    // is gone. Reverting a single layer measures the other layer, not the guarantee.
+    also: {
+      file: "src/reconcile.ts",
+      find: "    return err instanceof PaylodError;\n  } catch {\n    return false;\n  }",
+      replace: "    return err instanceof PaylodError;\n  } finally {\n    /* unguarded */\n  }",
+    },
+    test: "a throwable that throws during `instanceof` still yields BOTH handles",
+  },
+  {
+    id: "R8-409-precedence",
+    what: "a contradictory 409 is retried because only the in-progress phrase is tested",
+    file: "src/client.ts",
+    find: "        IN_PROGRESS_409_RE.test(message) &&\n        !INDETERMINATE_409_RE.test(message);",
+    replace: "        IN_PROGRESS_409_RE.test(message);",
+    test: "DOES NOT RE-DISPATCH a 409 whose message carries BOTH phrases",
+  },
+  {
+    id: "R8-409-getter",
+    what: "the public isIdempotencyInProgress getter loses the precedence rule",
+    file: "src/errors.ts",
+    find: "      /already in progress/i.test(this.message) &&\n      !this.isIdempotencyIndeterminate\n    );",
+    replace: "      /already in progress/i.test(this.message)\n    );",
+    test: "the PUBLIC getters agree with the retry decision",
+  },
+  {
+    id: "R8-web-drip",
+    what: "the Web Request adapter reads the body with no finite deadline",
+    file: "src/client.ts",
+    find: "      const { done, value } = await readWithin(\n        reader.read(),",
+    replace: "      const { done, value } = await ((x) => x)(\n        reader.read(),",
+    test: "REFUSES a Web Request body that stops arriving, and cancels the source",
+  },
+  {
+    id: "R8-express-drip",
+    what: "the Express adapter reads the body with no finite deadline",
+    file: "src/client.ts",
+    find: "      const { done, value } = await readWithin(\n        Promise.resolve(it.next()),",
+    replace: "      const { done, value } = await ((x) => x)(\n        Promise.resolve(it.next()),",
+    test: "REFUSES an Express body that stops arriving, and destroys the request",
+  },
+  {
+    id: "R8-sim-redactor",
+    what: "the simulator envelope goes back to an identity redactor",
+    file: "src/simulate.ts",
+    find: "      throw withIdempotencyKey(err, idempotencyKey, (m) => this.#guards.redactText(m));",
+    replace: "      throw withIdempotencyKey(err, idempotencyKey, (m) => m);",
+    // The client's own connection-error redaction runs FIRST on this path, so the simulator's
+    // identity redactor was invisible behind it — the case passed either way. Both are reverted,
+    // which is what actually removes the guarantee "a simulator failure never quotes the key".
+    also: {
+      file: "src/client.ts",
+      find: "        lastError = new PaylodConnectionError(\n          this.#redact(",
+      replace: "        lastError = new PaylodConnectionError(\n          ((x) => x)(",
+    },
+    test: "REDACTS the API key out of a simulator failure's message",
+  },
+  {
+    id: "R8-sim-secrets",
+    what: "the simulator ack is validated without production's credential scan",
+    file: "src/simulate.ts",
+    find: "            secrets: this.#guards.secrets(),\n          });",
+    replace: "          });",
+    test: "REFUSES a simulator ack whose body echoes the API key",
+  },
+  {
+    id: "R8-sim-menu",
+    what: "the simulator casts the server's outcome menu instead of rebuilding it",
+    file: "src/simulate.ts",
+    find: "            outcomes: parseOutcomeMenu(parsed),",
+    replace: "            outcomes: ((parsed as { outcomes?: unknown }).outcomes ?? []) as never,",
+    test: "REBUILDS the outcome menu from an allowlist instead of casting it",
+  },
+  {
+    id: "R8-onpoll-listener",
+    what: "the onPoll abort listener is left attached on the success path",
+    file: "src/client.ts",
+    find: "      if (onAbort !== undefined) signal?.removeEventListener(\"abort\", onAbort);",
+    replace: "      void onAbort;",
+    test: "removes its abort listener on the SUCCESS path, not just on abort",
+  },
+  {
+    id: "R8-decompression",
+    what: "the response byte cap is applied after the whole body is resident",
+    file: "src/transport.ts",
+    find: "        if (total > MAX_RESPONSE_BYTES) throw this.#tooLarge();",
+    replace: "        void total;",
+    test: "caps DECOMPRESSED bytes incrementally, so 16 KB of gzip cannot become 9 MB of heap",
+  },
 ];
 
 const results = [];
 
+/**
+ * Vitest's `-t` IS A REGEX, and that fact silently invalidated a certification.
+ *
+ * `R7-sim-envelope` named the test "simulate.outcome() failures carry…". The literal `()` in that
+ * name is an empty capture group to a regex engine, so the pattern matched a DIFFERENT string
+ * than the one written down — in that case, nothing at all. Vitest then exits 0 for "no tests
+ * matched", which reads exactly like "the mutation was not caught" while in truth no assertion
+ * ever ran. The strongest evidence of a broken case looked like ordinary evidence of a live one.
+ *
+ * Every selector is escaped to a LITERAL and anchored, so `-t` means what the string says.
+ */
+function exact(name) {
+  // Escaped but NOT anchored: vitest matches `-t` against the FULL name (describe titles joined
+  // to the test title), so an anchored pattern matches nothing at all — the same zero-selector
+  // failure this function exists to prevent, arrived at from the other side. Escaping alone is
+  // what makes the string mean itself; `selected()` then proves it covers at least one test.
+  return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Number of tests a `-t` selector actually selects, against the CURRENT (unmutated) tree. */
 function selected(pattern) {
   try {
-    const out = execSync(`npx vitest run --reporter=dot -t ${JSON.stringify(pattern)}`, {
+    // execFileSync, NOT execSync: there is no shell, so a test name is never re-interpreted on
+    // its way to vitest. `a throwable that throws during \`instanceof\`…` contains BACKTICKS, and
+    // inside the double quotes execSync's shell produced, those are COMMAND SUBSTITUTION — the
+    // selector vitest received was not the selector written here, and it matched nothing. Same
+    // class of defect as the unescaped regex, one layer further out.
+    const out = execFileSync("npx", ["vitest", "run", "--reporter=dot", "-t", exact(pattern)], {
       stdio: "pipe",
       timeout: 180_000,
     });
@@ -645,7 +860,16 @@ function selected(pattern) {
   }
 }
 
-for (const c of CASES) {
+// `NV_ONLY=id1,id2 node scripts/non-vacuity.mjs` re-certifies specific cases. The full pass is
+// what gates a release; this is for iterating on one case without paying for all of them.
+const only = (process.env.NV_ONLY ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+const SELECTED = only.length ? CASES.filter((c) => only.includes(c.id)) : CASES;
+if (only.length && SELECTED.length !== only.length) {
+  console.error("NV_ONLY named an unknown case id");
+  process.exit(1);
+}
+
+for (const c of SELECTED) {
   // A selector containing a regex metacharacter (`+`, `(`, `-`) can silently match NOTHING, and
   // vitest then exits 0 — which reads as "the mutation was not caught" when in truth no test
   // ever ran. Every selector is proven live before its verdict is trusted.
@@ -692,10 +916,10 @@ for (const c of CASES) {
   let status = "VACUOUS";
   let detail = "";
   try {
-    execSync(
-      `npx vitest run --reporter=dot -t ${JSON.stringify(c.test)}`,
-      { stdio: "pipe", timeout: 180_000 },
-    );
+    execFileSync("npx", ["vitest", "run", "--reporter=dot", "-t", exact(c.test)], {
+      stdio: "pipe",
+      timeout: 180_000,
+    });
     detail = "test still PASSED";
   } catch (e) {
     // A NONZERO EXIT IS NOT PROOF OF A CAUGHT MUTATION.
