@@ -189,58 +189,17 @@ export function parseRetryAfterMs(raw: string | null | undefined, now: number = 
 }
 
 /**
- * The deepest JSON nesting this SDK will walk in a response body.
+ * The bounded JSON reader. Lives in `json.ts` because the webhook path needs the IDENTICAL
+ * parser — a depth budget and a numeric-lexeme rule that hold on API responses but not on signed
+ * events are two different parsers with one name, and the gap between them is where a laundered
+ * `resultCode` gets in. Re-exported here so the published entry points are unchanged.
  *
- * A paylod body is three levels at most (`{ data: { decoded: { … } } }`). Depth matters
- * independently of size: `[[[[…]]]]` is one byte per level, so a body well inside
- * `MAX_RESPONSE_BYTES` can still nest tens of thousands deep. `JSON.parse` is recursive, and a
- * document like that blows the V8 stack — and every consumer that walks the result afterwards
- * (`#redactDeep`, a logger, an error reporter) blows it again. A RangeError from a stack overflow
- * is not catchable in a way that preserves the process's footing, and losing the process here
- * loses the idempotency key for a charge that may already be live.
- *
- * 64 is ~20x the deepest real body and still shallow enough that no runtime is troubled by it.
+ * See `json.ts` for why `JSON.parse` alone is not safe to point at a money verdict.
  */
-export const MAX_JSON_DEPTH = 64;
+import { MAX_JSON_DEPTH, parseBounded } from "./json.js";
 
-/**
- * `JSON.parse` with a depth budget enforced BEFORE the parser recurses.
- *
- * The check is a scan of the raw text rather than a walk of the parsed value, which is the whole
- * point: by the time there is a value to walk, `JSON.parse` has already recursed to the bottom of
- * the document and the stack has already been consumed. Only structural brackets count — braces
- * inside string literals are skipped, with escape handling, so a body whose *content* is full of
- * JSON text is not mistaken for deep nesting.
- */
-export function parseBounded(text: string, maxDepth = MAX_JSON_DEPTH): unknown {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
+export { MAX_JSON_DEPTH, parseBounded };
 
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inString = false;
-      continue;
-    }
-    if (c === '"') inString = true;
-    else if (c === "{" || c === "[") {
-      depth++;
-      if (depth > maxDepth) {
-        throw new PaylodResponseTooLargeError(
-          `paylod's response nests more than ${maxDepth} levels deep and was refused before it ` +
-            `was parsed. The request DID reach paylod, so the state of anything it may have ` +
-            `changed is INDETERMINATE — read the payment rather than retrying, and never mint a ` +
-            `fresh idempotency key on the strength of this error.`,
-        );
-      }
-    } else if (c === "}" || c === "]") depth--;
-  }
-
-  return JSON.parse(text);
-}
 
 /**
  * Guarantee that whatever escapes a money-moving call CARRIES THE EFFECTIVE IDEMPOTENCY KEY.
@@ -1019,6 +978,13 @@ export class Paylod {
       payload: params.payload,
       signature: params.signature,
       secret,
+      // EVERY CREDENTIAL THIS CLIENT HOLDS, not just the signing one.
+      //
+      // The verifier scanned `secret` alone, and this wrapper — the path essentially every
+      // integration actually takes — never told it about the API key. So the credential that
+      // MOVES MONEY was the one credential a signed body could echo into a handler's logs. The
+      // client knows both; withholding one from the scan was the whole defect.
+      ...(this.#apiKey ? { apiKey: this.#apiKey } : {}),
       ...(params.toleranceSec !== undefined ? { toleranceSec: params.toleranceSec } : {}),
     });
   }

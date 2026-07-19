@@ -133,7 +133,6 @@ export function toOutcome(payment: Payment): PaymentOutcome {
   const hasCode = payment.resultCode !== null && payment.resultCode !== undefined;
   const detail = hasCode ? decodeDarajaResult(payment.resultCode, payment.resultDesc) : null;
   const code = detail?.code ?? null;
-  const base = { paymentId: payment.id, code, detail, payment } as const;
 
   // ── The whole decision, in one call ────────────────────────────────────────────────────
   //
@@ -144,6 +143,32 @@ export function toOutcome(payment: Payment): PaymentOutcome {
   // and the gaps between those three were where `{ status: "pending", resultCode: 0 }` came back
   // paid and a receipt on a failed row came back `retryable: true`.
   const { verdict } = judge(payment);
+
+  // THE DETAIL BLOCK IS RESOLVED AFTER THE VERDICT, NEVER BEFORE IT.
+  //
+  // `detail` is decoded from the result code ALONE — it is the catalog's opinion of that code in
+  // isolation, and the catalog is right about it: 1032 taken by itself means "the customer
+  // cancelled, no money moved, a fresh charge is safe". But `judge()` looks at the whole record,
+  // and `{ status: "pending", resultCode: 1032 }` contradicts itself: the record claims the
+  // payment is in flight and the code claims it is a dead cancellation. We cannot prove money did
+  // or did not move, so the verdict is INDETERMINATE.
+  //
+  // Decoding first and spreading the result into every branch meant the top-level `retryable`
+  // went `false` — correctly — while `detail.retryable` stayed `true` right beside it. Both are
+  // PUBLIC fields on the returned object, both answer the same question, and they answered it
+  // differently. `outcome.detail.retryable` is not an exotic thing to read: it is the field the
+  // types invite you to reach for when you want the reason as well as the flag, and half of the
+  // integrations that log an outcome log it. A nested `true` on a payment that may be live is an
+  // invitation to charge the customer a second time, delivered by the object whose entire job is
+  // to prevent exactly that. The JVM and Python siblings shipped the same defect.
+  //
+  // So there is ONE rule and it is applied at ONE point: `retryable` means SAFE TO CHARGE AGAIN,
+  // and nothing is safe to charge again unless we have proven the charge is dead. Only a `failed`
+  // verdict proves that, so every other verdict gets a detail block with `retryable: false`. The
+  // rest of the decoded block — title, cause, fix, category, customerMessage — is untouched: it
+  // is genuinely useful diagnostic text, and it is not a decision.
+  const safeDetail = verdict === "failed" ? detail : withoutRetryability(detail);
+  const base = { paymentId: payment.id, code, detail: safeDetail, payment } as const;
 
   if (verdict === "paid") {
     return {
@@ -196,4 +221,16 @@ export function toOutcome(payment: Payment): PaymentOutcome {
     receipt: null,
     message: detail?.customerMessage ?? "The payment didn't go through. Please try again.",
   };
+}
+
+/**
+ * A decoded block with its `retryable` forced to `false`, everything else preserved.
+ *
+ * Returns a NEW object — the catalog's entries are shared, frozen-in-spirit singletons, and
+ * mutating one would flip `retryable` for every other caller that ever decodes that code.
+ */
+function withoutRetryability(detail: DecodedError | null): DecodedError | null {
+  if (detail === null) return null;
+  if (detail.retryable === false) return detail;
+  return { ...detail, retryable: false };
 }

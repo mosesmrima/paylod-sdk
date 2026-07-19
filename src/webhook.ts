@@ -16,7 +16,8 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { PaylodSignatureVerificationError } from "./errors.js";
+import { PaylodResponseTooLargeError, PaylodSignatureVerificationError } from "./errors.js";
+import { parseBounded } from "./json.js";
 import { decodeDarajaResult } from "./daraja-catalog.js";
 import { judge } from "./semantics.js";
 import { asPaymentStatus, asWireResultCode, containsSecret, PAYMENT_STATUSES } from "./validate.js";
@@ -59,6 +60,18 @@ export interface VerifyParams {
   readonly toleranceSec?: number;
   /** Injectable clock (unix seconds) — tests only. Must be a finite non-negative integer. */
   readonly nowSec?: number;
+  /**
+   * This client's API key, so a signed body that echoes it is refused rather than handed to a
+   * handler that logs it. `Paylod#verifyWebhook` supplies this automatically; supply it yourself
+   * only when calling the standalone functions.
+   *
+   * A verified event is the single most-logged object in an integration, and the API key is the
+   * credential that moves money. Scanning only the SIGNING secret closed the smaller half of the
+   * hole and left the larger one open.
+   */
+  readonly apiKey?: string;
+  /** Any further values that must never appear inside a verified body. */
+  readonly extraSecrets?: readonly string[];
 }
 
 function toBuffer(payload: string | Buffer | Uint8Array): Buffer {
@@ -293,14 +306,77 @@ export function verifyWebhookSignature(params: VerifyParams): unknown {
     );
   }
 
+  // THE SAME PARSER THE API PATH USES — depth budget and numeric-lexeme rule included.
+  //
+  // This was a bare `JSON.parse`, which made the signed channel the WEAKER of the two. Both
+  // halves of that mattered. The depth budget: an event is three levels deep, and a signed body
+  // nesting tens of thousands deep blew the stack of the process holding a live charge — a valid
+  // signature proves who sent the bytes, not that the bytes are safe to parse. The numeric
+  // lexeme: `{"resultCode": 0.0}` parses to `0` and `judge()` reads that as PAID, so a signing
+  // key (the thing a compromise takes first) plus one non-canonical spelling was an order
+  // fulfilled for a payment that never settled. The API path refused exactly that spelling.
+  let decodedBody: unknown;
   try {
-    return JSON.parse(raw.toString("utf8"));
-  } catch {
+    decodedBody = parseBounded(raw.toString("utf8"));
+  } catch (e) {
     throw new PaylodSignatureVerificationError(
       "invalid_payload",
-      "Webhook body is signed correctly but is not valid JSON.",
+      e instanceof PaylodResponseTooLargeError
+        ? `Webhook body is signed correctly but was refused before it was parsed: ${e.message}`
+        : "Webhook body is signed correctly but is not valid JSON.",
     );
   }
+
+  // THE CREDENTIAL SCAN RUNS HERE — ON THE RAW PARSED BODY, BEFORE ANY DIAGNOSTIC QUOTES IT.
+  //
+  // Three separate leaks closed at one point, all of which lived downstream of this function:
+  //
+  //   1. THIS FUNCTION RETURNED THE RAW OBJECT. `verifyWebhookSignature` is public and documented
+  //      for relays and recorders — the callers most likely to log or forward what they get — and
+  //      it handed back the parsed body with no scan at all. `verifyWebhook`'s scan protected
+  //      only `verifyWebhook`.
+  //   2. THE SCHEMA DIAGNOSTICS INTERPOLATE FIELD VALUES. `invalid()` messages quote
+  //      `JSON.stringify(d.status)`, `e.type` and friends, and those messages travel into the
+  //      caller's 400 response and their logs. A body whose `status` carries the bearer key
+  //      therefore leaked it through the REFUSAL path — the one path nobody thinks to redact,
+  //      because a refusal feels safe. Scanning before the first diagnostic runs is what makes
+  //      it safe.
+  //   3. ONLY THE SIGNING SECRET WAS SCANNED. The API key is the credential that moves money;
+  //      the class wrapper never passed it in. Every credential the caller holds is scanned now.
+  //
+  // Refused, not redacted, and refused AFTER the signature checked out: a correctly-signed event
+  // containing our own credential is not a well-formed event with an unfortunate string in it.
+  // It is evidence something upstream is echoing the credential, and the honest response is to
+  // stop. The refusal message names no field and quotes no value.
+  if (containsSecret(decodedBody, liveSecrets(params))) {
+    throw new PaylodSignatureVerificationError(
+      "invalid_payload",
+      "The webhook body is signed correctly but contains one of this client's own credentials " +
+        "(the signing secret or the API key). A verified body is logged and forwarded wholesale, " +
+        "so delivering it would write a credential into ordinary application logs. No field is " +
+        "named here because naming it would reproduce the value.",
+    );
+  }
+
+  return decodedBody;
+}
+
+/**
+ * Every credential the caller holds that must never appear inside a body we hand back.
+ *
+ * The signing secret alone was never the whole set. `secret` proves WHO sent the event; the API
+ * KEY is what moves money, and a body echoing it is the worse of the two leaks. `extraSecrets`
+ * exists for anything else the integrator considers fatal to log (a shared HMAC key, a tenant
+ * token) without needing a new parameter each time.
+ */
+function liveSecrets(params: VerifyParams): readonly string[] {
+  const out: string[] = [];
+  if (typeof params.secret === "string" && params.secret) out.push(params.secret);
+  if (typeof params.apiKey === "string" && params.apiKey) out.push(params.apiKey);
+  for (const s of params.extraSecrets ?? []) {
+    if (typeof s === "string" && s) out.push(s);
+  }
+  return out;
 }
 
 /** Reject with a consistent, non-leaking message. */
@@ -556,11 +632,15 @@ export function verifyWebhook(params: VerifyParams): WebhookEvent {
   // correctly-signed event that contains the signing secret is not a well-formed event with an
   // unfortunate string in it. It is evidence that something upstream is echoing the secret, and
   // the honest response to that is to stop, not to quietly scrub one copy and continue.
-  if (containsSecret(event, [params.secret])) {
+  // `liveSecrets`, not `[params.secret]`: the API key is scanned too, and the raw body was
+  // already scanned before the diagnostics above could quote a field value. This is the
+  // last of the three gates, on the RECONSTRUCTED event.
+  if (containsSecret(event, liveSecrets(params))) {
     invalid(
-      "the event body contains the webhook signing secret. A verified event is logged wholesale " +
-        "by handlers, so delivering it would write the signing key — the value that lets anyone " +
-        "forge these events — into ordinary application logs",
+      "the event body contains one of this client's own credentials. A verified event is logged " +
+        "wholesale by handlers, so delivering it would write a credential — the signing key that " +
+        "lets anyone forge these events, or the API key that moves money — into ordinary " +
+        "application logs",
     );
   }
 

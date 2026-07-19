@@ -188,8 +188,12 @@ describe("H2 a verified webhook event is reconstructed, never spread", () => {
   }
 
   it("STRIPS unknown top-level and data fields from a correctly-signed event", () => {
+    // NOTE: the `debug` blob carries a plausible-looking bearer token that is NOT one of this
+    // client's credentials. A body carrying a REAL credential — even in a field that would have
+    // been stripped — is refused outright now rather than stripped; see the test below. Stripping
+    // and refusing are two different guarantees and each needs its own body.
     const event = verify(
-      evt({ __extra: "top" }, { debug: { authorization: `Bearer ${SECRET}` }, __raw: "x" }),
+      evt({ __extra: "top" }, { debug: { authorization: "Bearer mp_test_someone_elses" }, __raw: "x" }),
     );
 
     expect(Object.keys(event).sort()).toEqual(["created", "data", "type"]);
