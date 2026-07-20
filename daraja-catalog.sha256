@@ -1,0 +1,18 @@
+# Daraja catalog provenance — PINNED CHECKSUMS. GENERATED FILE, DO NOT HAND-EDIT.
+#
+# Regenerate from the paylod monorepo:  node scripts/sync-daraja-catalog.mjs
+#
+# This repo's drift guard verifies the vendored catalog against these digests, with no access
+# to the canonical file. That is deliberate. The canonical catalog lives in a PRIVATE monorepo
+# which CI cannot check out, and the guard used to compare against a sibling directory that
+# does not exist in CI — so it skipped, silently, and the pipeline stayed green while verifying
+# nothing. A check that cannot distinguish "I did not look" from "I looked and it is fine" is
+# not a check.
+#
+# A cross-repo token was rejected as the fix: it would mint a long-lived credential with read
+# access to the private monorepo and store it in four SDK repos, three of them public. A
+# committed digest needs no credential, no network, and works in any checkout.
+#
+# Fields: <canonical sha256>  <vendored sha256>  <canonical path>  <vendored path>
+2046f95cda940b8e1522c71646c1a76c8d97aefbc820ad671fbe006a87f3700b  2046f95cda940b8e1522c71646c1a76c8d97aefbc820ad671fbe006a87f3700b  supabase/functions/_shared/daraja/daraja-error-codes.json  src/daraja-error-codes.json
+a9535591a02d5bfce5892172f5eb8eb6400a7d72e76e6ce0d70fbbdcd17e45d0  14d8414bb9d875665d514d6227e30d8163df5a9572a51803e6fead2fc3859a00  supabase/functions/_shared/daraja/daraja-catalog.ts  src/daraja-catalog.ts

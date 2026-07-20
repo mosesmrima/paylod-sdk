@@ -36,7 +36,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check vendored Daraja catalog is in sync
+      # Verifies src/daraja-error-codes.json and src/daraja-catalog.ts against the committed
+      # digests in daraja-catalog.sha256. The canonical catalog lives in a PRIVATE monorepo that
+      # this job deliberately cannot check out, so the pinned digests are what makes the check
+      # real here. It FAILS CLOSED: a missing or malformed checksum file is a red build, never a
+      # skip. This step used to exit 0 with a warning whenever the monorepo was absent -- which in
+      # CI is always -- so it passed while verifying nothing.
+      - name: Verify vendored Daraja catalog against pinned checksums
         run: npm run check-catalog
 
       - name: Typecheck

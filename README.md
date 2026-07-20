@@ -681,7 +681,7 @@ if (outcome.retryable) showRetry();
 Version 0.2 also contains two corrections to the behaviour. Both corrections make the SDK safer:
 
 - **`wait()` no longer reports a pending payment as failed.** `wait()` classifies the payment on the result code. A record marked `failed` that carries result code `4999` therefore keeps the poll active. The SDK does not report a failure for a payment that can still succeed.
-- **An unknown result code is no longer `retryable: true`.** Before version 0.2, the SDK held a hand-maintained copy of the Daraja table. The fallback in that copy permitted a second charge on a result code that the SDK could not classify. The SDK now generates the table from the canonical source with `npm run sync-catalog`. A `--check` drift guard runs in `prepublishOnly`. An indeterminate result code is never safe for a second charge.
+- **An unknown result code is no longer `retryable: true`.** Before version 0.2, the SDK held a hand-maintained copy of the Daraja table. The fallback in that copy permitted a second charge on a result code that the SDK could not classify. The SDK now generates the table from the canonical source with `npm run sync-catalog`. A `--check` drift guard runs in CI and in `prepublishOnly`; it verifies the vendored table against the committed digests in `daraja-catalog.sha256`, so it verifies the same thing on a laptop as in CI, and it fails closed if those digests are missing or malformed. An indeterminate result code is never safe for a second charge.
 
 ---
 

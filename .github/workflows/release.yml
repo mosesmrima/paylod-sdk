@@ -71,7 +71,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check vendored Daraja catalog is in sync
+      # Verifies the vendored catalog against the committed digests in daraja-catalog.sha256.
+      # Fails closed -- a missing or malformed checksum file blocks the publish. See ci.yml.
+      - name: Verify vendored Daraja catalog against pinned checksums
         run: npm run check-catalog
 
       - name: Typecheck

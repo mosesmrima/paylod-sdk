@@ -3,6 +3,44 @@
 All notable changes to `@paylod/node` are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+Tooling only. No API change, no change to any shipped byte in `dist/`.
+
+### Fixed
+
+- **The Daraja catalog drift guard no longer passes without checking anything.** `npm run
+  check-catalog` located the canonical catalog as a sibling checkout of the private paylod
+  monorepo, and when that directory was absent it printed `skipping drift check: ...` and exited
+  **0**. In CI that directory is *always* absent, so the guard ran on every push and every release
+  and verified nothing, while the pipeline stayed green. A check that cannot distinguish "I did
+  not look" from "I looked and it is fine" is not a check.
+
+  The guard now stands on `daraja-catalog.sha256`, a committed file pinning the SHA-256 of every
+  vendored copy and of the canonical bytes it was generated from. That verification runs in every
+  checkout — no monorepo, no network, no credential — and it **fails closed**: a checksum file
+  that is missing, empty, malformed, carries a non-hex digest, has no data lines, or has quietly
+  dropped a row is a red build, never a skip. A vendored file listed but absent is also red.
+
+  When the monorepo *is* checked out beside this repo the guard additionally performs the stronger
+  comparison it always did: the canonical file must still hash to the pinned canonical digest, and
+  the vendored bytes must equal the transformed canonical bytes. Its absence now downgrades the
+  guard to the pinned check and says so plainly; it no longer disables it.
+
+  **Why a pinned checksum and not a cross-repo token.** The alternative was an `MPESA_REPO_TOKEN`
+  secret so CI could clone the private monorepo. That means minting a long-lived credential with
+  read access to the whole private monorepo and storing it in four SDK repos, three of them
+  public — widening the blast radius to solve what is only a file-availability problem. A
+  committed digest solves it with no credential at all.
+
+### Added
+
+- **`test/catalog-guard-fail-closed.test.ts`** — 18 tests pinning the two properties above: the
+  guard goes red for every way its pinned evidence can become unusable, and with `MPESA_REPO`
+  pointing nowhere it still passes on an intact tree *and still catches a tampered one*. Each case
+  runs against an isolated copy of the guard's inputs in a temp directory, so no fixture can race
+  another test file or leave residue.
+
 ## 0.13.1
 
 Catalog resync plus two catalog-wide guards. No API change.
