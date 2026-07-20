@@ -648,6 +648,11 @@ describe("L9 a resolved onPoll leaves nothing attached to the caller's signal", 
 // ── Cross-SDK check: the decompression bomb ──────────────────────────────────────────────────
 
 describe("cross-SDK: a small compressed body that expands hugely is refused", () => {
+  // 30s rather than the 5s default: this inflates 16 KB to 9 MB against a REAL http server and
+  // the REAL global fetch. Node 18 in CI genuinely needs longer, and it failed as a TIMEOUT, not
+  // as a missed refusal -- the protection held, the time budget did not. Do not lower this to
+  // make CI faster; a shorter budget turns a slow machine into a false failure on a money-path
+  // guard.
   it("caps DECOMPRESSED bytes incrementally, so 16 KB of gzip cannot become 9 MB of heap", async () => {
     // The Python sibling applied its cap AFTER automatic decompression, so a 9 KB gzip response
     // produced a 9 MB allocation and defeated both the byte cap and the deadline before the
@@ -685,7 +690,7 @@ describe("cross-SDK: a small compressed body that expands hugely is refused", ()
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-  });
+  }, 30_000);
 });
 
 // ── L-onPoll — a floating callback is observable only when it outlasts the interval ───────────
