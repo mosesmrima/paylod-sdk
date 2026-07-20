@@ -1273,6 +1273,29 @@ function exact(name) {
   return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * ANSI SGR sequences, stripped before ANY parse of vitest's output.
+ *
+ * This harness reported 0/121 -- every case BROKEN-SELECTOR -- on GitHub Actions while reporting
+ * 121/121 locally, for its entire existence. The gate only runs on release, so "it passes locally"
+ * was the only signal anyone ever saw.
+ *
+ * The cause is that vitest colorizes when it detects CI, even with stdio piped, while locally a
+ * piped run has no TTY and emits none. So `Tests  1 passed` arrives as
+ * `Tests  \x1b[1m\x1b[32m1 passed`, and /Tests\s+(\d+) passed/ does not match. Zero matched tests
+ * reads as a broken selector, which is exactly the shape of a real defect -- the harness was
+ * loudly reporting a true statement about a false premise.
+ *
+ * Two independent defences, because either alone is a single point of failure: the child is told
+ * not to colorize, AND the output is stripped before parsing in case some future reporter ignores
+ * that. A parse that depends on a formatting choice is not a measurement.
+ */
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const stripAnsi = (s) => String(s).replace(ANSI_RE, "");
+
+/** Child env for every vitest invocation: no color, whatever the runner thinks it is. */
+const NO_COLOR_ENV = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0", VITEST_MIN_WORKERS: undefined };
+
 /** Number of tests a `-t` selector actually selects, against the CURRENT (unmutated) tree. */
 function selected(pattern) {
   try {
@@ -1284,8 +1307,9 @@ function selected(pattern) {
     const out = execFileSync("npx", ["vitest", "run", "--reporter=dot", "-t", exact(pattern)], {
       stdio: "pipe",
       timeout: 180_000,
+      env: NO_COLOR_ENV,
     });
-    const m = String(out).match(/Tests\s+(\d+) passed/);
+    const m = stripAnsi(out).match(/Tests\s+(\d+) passed/);
     return m ? Number(m[1]) : 0;
   } catch {
     // A selector that fails on clean source is broken in its own way; report it as unusable.
@@ -1352,6 +1376,7 @@ for (const c of SELECTED) {
     execFileSync("npx", ["vitest", "run", "--reporter=dot", "-t", exact(c.test)], {
       stdio: "pipe",
       timeout: 180_000,
+      env: NO_COLOR_ENV,
     });
     detail = "test still PASSED";
   } catch (e) {
@@ -1370,7 +1395,7 @@ for (const c of SELECTED) {
     // question: vitest reporting a nonzero count of FAILED TESTS, with no startup or unhandled
     // error alongside it. Everything else is HARNESS-ERROR — not a pass, not a fail, a verdict
     // the harness is not entitled to give.
-    const out = String(e.stdout ?? "") + String(e.stderr ?? "");
+    const out = stripAnsi(String(e.stdout ?? "") + String(e.stderr ?? ""));
     const failedTests = out.match(/Tests\s+(\d+) failed/);
     const startupError = /Error: Failed to load|Startup Error|Unhandled Error|Unhandled Rejection|Transform failed|Failed to parse|SyntaxError|No test (files )?found|Vitest caught \d+ unhandled error/i.test(
       out,
