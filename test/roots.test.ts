@@ -569,11 +569,25 @@ describe("webhook adapters — no handler detail on the wire, and a bounded body
     const paylod = new Paylod({ apiKey: KEY, webhookSecret: "whsec_x" });
     const mw = paylod.webhook(async () => {});
 
-    // A stream that would never stop if nothing capped it.
+    // Deliberately FINITE, at 3x the 1 MiB cap.
+    //
+    // This was `for (;;) yield` — an infinite stream. That reads like the stronger test, and it
+    // is strictly weaker. With the cap in place it passes either way; with the cap REMOVED the
+    // infinite version never returns, so the mutation sweep saw a timeout rather than a failed
+    // assertion and (correctly, per conformance §8.4) refused to score it CAUGHT. The protection
+    // was therefore never certified: the test proved the cap works, not that it is load-bearing.
+    //
+    // A bounded flood makes removal produce a WRONG ANSWER instead of a HANG -- the middleware
+    // drains all 3 MiB, falls through to signature verification, and fails to answer "exceeds".
+    // Keep this finite. An unbounded fixture cannot fail; it can only hang.
+    let chunksYielded = 0;
     const flood = {
       headers: {},
       [Symbol.asyncIterator]: async function* () {
-        for (;;) yield Buffer.alloc(64 * 1024, 0x61);
+        for (let i = 0; i < 48; i++) {
+          chunksYielded++;
+          yield Buffer.alloc(64 * 1024, 0x61);
+        }
       },
     };
     let code = 0;
@@ -591,5 +605,10 @@ describe("webhook adapters — no handler detail on the wire, and a bounded body
     await mw(flood as never, res as never);
     expect(code).toBe(400);
     expect(String((body as { error: string }).error)).toMatch(/exceeds/);
+
+    // The cap must STOP the read, not merely judge it after the fact. 1 MiB is 16 chunks of
+    // 64 KiB, so anything approaching 48 means the body was fully buffered and the refusal came
+    // too late to matter -- the memory was already spent.
+    expect(chunksYielded).toBeLessThan(24);
   });
 });
