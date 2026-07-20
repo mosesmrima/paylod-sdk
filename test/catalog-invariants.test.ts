@@ -13,8 +13,9 @@
  *      is how a double charge happens.
  */
 
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { ALL_ENTRIES, ERROR_CATALOG } from "../src/daraja-catalog.js";
+import { ALL_ENTRIES, ERROR_CATALOG, decodeDarajaResult } from "../src/daraja-catalog.js";
 
 // ── 1. duplicate-code guard ───────────────────────────────────────────────────────────────
 
@@ -195,5 +196,76 @@ describe("invitesAnotherAttempt — discrimination", () => {
     );
     expect(entry.retryable).toBe(false);
     expect(invitesAnotherAttempt(entry.customerMessage)).toBe(false);
+  });
+});
+
+// ── 3. THE FALLBACKS ARE IN SCOPE TOO ─────────────────────────────────────────────────────
+
+/**
+ * The sweep above walks `ALL_ENTRIES` — the CATALOG. It never looked at a fallback, and a
+ * fallback is not a catalog row: it is the value `decodeDarajaResult` returns when no row
+ * matched. So the one path where the SDK knows LEAST about what happened was the one path the
+ * requirement-3.7 invariant did not cover, and `failedFallback` sat there for ten review rounds
+ * saying "The payment didn't go through. Please try again." beside a `fix` field stating, in the
+ * same object, that we cannot prove no money moved. It was found by reading the file, not by a
+ * test — which is the same as saying nothing was checking fallbacks.
+ *
+ * Each fallback is probed through the PUBLIC decode surface, because that is the only way a
+ * caller can reach one. The probe list is then checked against the fallback functions actually
+ * declared in the source, so adding a fourth fallback fails this file until it is probed.
+ */
+describe("fallback decodes — the paths with no catalog row are held to requirement 3.7", () => {
+  const PROBES = [
+    // name              input                 rawDesc                        expected title
+    ["pendingFallback", "500.999.9999", undefined, "Payment still in progress"],
+    ["failedFallback", null, undefined, "Payment failed"],
+    ["indeterminateFallback", " 0", undefined, "Payment outcome unknown"],
+  ] as const;
+
+  it("every fallback DECLARED in the source is probed here", () => {
+    const src = readFileSync(new URL("../src/daraja-catalog.ts", import.meta.url), "utf8");
+    const declared = [...src.matchAll(/^function\s+(\w*[Ff]allback)\s*\(/gm)]
+      .map((m) => m[1]!)
+      .sort();
+    expect(declared.length).toBeGreaterThan(0);
+    expect(declared).toEqual(PROBES.map(([n]) => n).slice().sort());
+  });
+
+  it("each probe actually reaches the fallback it claims to — no probe is a no-op", () => {
+    for (const [name, input, desc, title] of PROBES) {
+      const r = decodeDarajaResult(input as never, desc as never);
+      expect(`${name}: ${r.title}`).toBe(`${name}: ${title}`);
+    }
+  });
+
+  it("no fallback invites another payment attempt", () => {
+    const offenders = PROBES.map(([name, input, desc]) => {
+      const r = decodeDarajaResult(input as never, desc as never);
+      return [name, r.customerMessage] as const;
+    })
+      .filter(([, msg]) => invitesAnotherAttempt(msg))
+      .map(([name, msg]) => `${name}: ${msg}`);
+    expect(offenders).toEqual([]);
+  });
+
+  it("every fallback is non-retryable and carries a nonblank customer message", () => {
+    for (const [, input, desc] of PROBES) {
+      const r = decodeDarajaResult(input as never, desc as never);
+      expect(r.retryable).toBe(false);
+      expect(r.customerMessage.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  /**
+   * The specific regression. `failedFallback` is reached by the single most common malformed
+   * shape there is — `resultCode` absent entirely — so this string is the one a real customer
+   * was most likely to be shown.
+   */
+  it("the absent-code decode does not tell the customer to pay again", () => {
+    const r = decodeDarajaResult(null as never);
+    expect(r.customerMessage).not.toContain("try again");
+    expect(r.customerMessage).toBe(
+      "We couldn't confirm this payment yet. Please wait while it settles — do not start a new payment.",
+    );
   });
 });

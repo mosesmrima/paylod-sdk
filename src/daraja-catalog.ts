@@ -381,7 +381,17 @@ function failedFallback(code: string, rawDesc?: unknown): DecodedError {
       "in the catalog, so we cannot prove no money moved.",
     category: "mpesa_system",
     retryable: false,
-    customerMessage: "The payment didn't go through. Please try again.",
+    // REQUIREMENT 3.7. This read "The payment didn't go through. Please try again." beside a
+    // `fix` that states, in the same object, that we CANNOT PROVE NO MONEY MOVED. A fallback is
+    // the path where this SDK knows the least about what happened, so it is the last place that
+    // may invite a second charge — and the absent-`resultCode` shape, the most common malformed
+    // response there is, lands right here. Phrased WITHOUT "try", "retry" or "pay again" in any
+    // form, including the negated form: the catalog-wide no-retry-invitation check is a substring
+    // rule, and a rule that has to tell "please try again" from "do not try again" is one careless
+    // edit away from letting the first one through.
+    customerMessage:
+      "We couldn't confirm this payment yet. Please wait while it settles — do not start a new " +
+      "payment.",
   };
 }
 
@@ -413,8 +423,12 @@ function indeterminateFallback(raw: string, rawDesc?: unknown): DecodedError {
       "again on the strength of this response — we cannot prove no money moved.",
     category: "mpesa_system",
     retryable: false,
+    // Same phrasing rule as `failedFallback`: this used to read "do not retry", which is safe
+    // advice written in the exact words the no-retry-invitation check looks for. Saying the safe
+    // thing in words the check cannot misread costs nothing.
     customerMessage:
-      "We couldn't confirm this payment yet. Please wait — do not retry — while it settles.",
+      "We couldn't confirm this payment yet. Please wait while it settles — do not start a new " +
+      "payment.",
   };
 }
 

@@ -1209,6 +1209,47 @@ const CASES = [
       "let warnedOnceDist = false;\nfunction warnUnsafeGeneratedIdempotencyKey(what: string): void {\n  if (warnedOnceDist) return;\n  warnedOnceDist = true;\n  console.warn(",
     test: "warns on EVERY unprotected call in the BUILT artifact, not just in source",
   },
+  {
+    id: "S37-fallback",
+    what: "the unknown-code fallback invites another payment attempt again",
+    // `src/daraja-catalog.ts` is a GENERATED copy; the canonical edit lives in the monorepo at
+    // supabase/functions/_shared/daraja/daraja-catalog.ts. The mutation is applied to the copy
+    // because that is what the tests import, and the harness works on a throwaway tree.
+    file: "src/daraja-catalog.ts",
+    find:
+      "    customerMessage:\n" +
+      "      \"We couldn't confirm this payment yet. Please wait while it settles — do not start a new \" +\n" +
+      "      \"payment.\",\n" +
+      "  };\n" +
+      "}\n" +
+      "\n" +
+      "/**\n" +
+      " * The code arrived in a form Daraja does not emit",
+    replace:
+      "    customerMessage: \"The payment didn't go through. Please try again.\",\n" +
+      "  };\n" +
+      "}\n" +
+      "\n" +
+      "/**\n" +
+      " * The code arrived in a form Daraja does not emit",
+    test: "no fallback invites another payment attempt",
+  },
+  {
+    id: "S37-fallback-coverage",
+    what: "a fallback that nobody probes stops being noticed -- the defect was invisible, not merely present",
+    file: "src/daraja-catalog.ts",
+    // The mutation ADDS a fallback that no probe points at -- the exact shape of the defect,
+    // which was not "one bad string" but "a decode path nothing was looking at". It compiles and
+    // changes no behaviour, so only the coverage guard can notice it.
+    find: "function pendingFallback(code: string): DecodedError {",
+    replace:
+      "function unprobedFallback(code: string): DecodedError {\n" +
+      "  return pendingFallback(code);\n" +
+      "}\n" +
+      "void unprobedFallback;\n" +
+      "function pendingFallback(code: string): DecodedError {",
+    test: "every fallback DECLARED in the source is probed here",
+  },
 ];
 
 const results = [];
